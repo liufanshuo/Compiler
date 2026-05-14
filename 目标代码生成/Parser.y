@@ -37,7 +37,7 @@ extern int yylineno;
     TypeSpec type_spec;
 }
 
-%token CONSTTK INTTK VOIDTK
+%token CONSTTK INTTK FLOATTK VOIDTK
 %token IFTK ELSETK WHILETK BREAKTK CONTINUETK RETURNTK
 %token GETINTTK PRINTFTK
 %token LEQ GEQ EQL NEQ LSS GRE
@@ -45,7 +45,7 @@ extern int yylineno;
 %token PLUS MINU MULT DIV MOD
 %token ASSIGN
 %token LPARENT RPARENT LBRACK RBRACK LBRACE RBRACE COMMA SEMICN
-%token <str> IDENFR INTCON STRCON
+%token <str> IDENFR INTCON FLOATCONTK STRCON
 
 %type <top_items> CompUnit
 %type <top_item> CompUnitItem GlobalIntItem VoidFuncDef
@@ -100,21 +100,21 @@ CompUnitItem
     ;
 
 GlobalIntItem
-    : INTTK IDENFR LPARENT RPARENT Block
+    : BType IDENFR LPARENT RPARENT Block
         {
             ParamList list = {0};
-            $$ = make_top_func(make_func(TYPE_INT, $2, list, $5));
+            $$ = make_top_func(make_func($1, $2, list, $5));
         }
-    | INTTK IDENFR LPARENT FuncFParams RPARENT Block
-        { $$ = make_top_func(make_func(TYPE_INT, $2, $4, $6)); }
-    | INTTK IDENFR VarDefDims GlobalVarInitOpt GlobalVarMore SEMICN
+    | BType IDENFR LPARENT FuncFParams RPARENT Block
+        { $$ = make_top_func(make_func($1, $2, $4, $6)); }
+    | BType IDENFR VarDefDims GlobalVarInitOpt GlobalVarMore SEMICN
         {
             DeclItemList list = {0};
             decl_item_list_push(&list, make_decl_item($2, $3, $4));
             for (int i = 0; i < $5.count; ++i) {
                 decl_item_list_push(&list, $5.items[i]);
             }
-            $$ = make_top_decl(make_decl(false, list));
+            $$ = make_top_decl(make_decl($1, false, list));
         }
     ;
 
@@ -145,7 +145,7 @@ Decl
 
 ConstDecl
     : CONSTTK BType ConstDefList SEMICN
-        { $$ = make_decl(true, $3); }
+        { $$ = make_decl($2, true, $3); }
     ;
 
 ConstDefList
@@ -164,6 +164,7 @@ ConstDefList
 
 BType
     : INTTK { $$ = TYPE_INT; }
+    | FLOATTK { $$ = TYPE_FLOAT; }
     ;
 
 ConstDef
@@ -224,7 +225,7 @@ VoidFuncDef
 
 VarDecl
     : BType VarDefList SEMICN
-        { $$ = make_decl(false, $2); }
+        { $$ = make_decl($1, false, $2); }
     ;
 
 VarDefList
@@ -304,7 +305,7 @@ FuncFParamsList
 
 FuncFParam
     : BType IDENFR FuncFParamSuffix
-        { $$ = make_param($2, $3.count > 0 || $3.capacity == -1, $3); }
+        { $$ = make_param($1, $2, $3.count > 0 || $3.capacity == -1, $3); }
     ;
 
 FuncFParamSuffix
@@ -426,6 +427,7 @@ PrimaryExp
 
 Number
     : INTCON { $$ = make_number_expr(parse_int_literal($1)); }
+    | FLOATCONTK { $$ = make_float_number_expr(parse_int_literal($1)); }
     ;
 
 UnaryExp

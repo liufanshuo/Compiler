@@ -62,42 +62,44 @@ extern int yydebug;
     YYUNDEF = 257,                 /* "invalid token"  */
     CONSTTK = 258,                 /* CONSTTK  */
     INTTK = 259,                   /* INTTK  */
-    VOIDTK = 260,                  /* VOIDTK  */
-    IFTK = 261,                    /* IFTK  */
-    ELSETK = 262,                  /* ELSETK  */
-    WHILETK = 263,                 /* WHILETK  */
-    BREAKTK = 264,                 /* BREAKTK  */
-    CONTINUETK = 265,              /* CONTINUETK  */
-    RETURNTK = 266,                /* RETURNTK  */
-    GETINTTK = 267,                /* GETINTTK  */
-    PRINTFTK = 268,                /* PRINTFTK  */
-    LEQ = 269,                     /* LEQ  */
-    GEQ = 270,                     /* GEQ  */
-    EQL = 271,                     /* EQL  */
-    NEQ = 272,                     /* NEQ  */
-    LSS = 273,                     /* LSS  */
-    GRE = 274,                     /* GRE  */
-    AND = 275,                     /* AND  */
-    OR = 276,                      /* OR  */
-    NOT = 277,                     /* NOT  */
-    PLUS = 278,                    /* PLUS  */
-    MINU = 279,                    /* MINU  */
-    MULT = 280,                    /* MULT  */
-    DIV = 281,                     /* DIV  */
-    MOD = 282,                     /* MOD  */
-    ASSIGN = 283,                  /* ASSIGN  */
-    LPARENT = 284,                 /* LPARENT  */
-    RPARENT = 285,                 /* RPARENT  */
-    LBRACK = 286,                  /* LBRACK  */
-    RBRACK = 287,                  /* RBRACK  */
-    LBRACE = 288,                  /* LBRACE  */
-    RBRACE = 289,                  /* RBRACE  */
-    COMMA = 290,                   /* COMMA  */
-    SEMICN = 291,                  /* SEMICN  */
-    IDENFR = 292,                  /* IDENFR  */
-    INTCON = 293,                  /* INTCON  */
-    STRCON = 294,                  /* STRCON  */
-    LOWER_THAN_ELSE = 295          /* LOWER_THAN_ELSE  */
+    FLOATTK = 260,                 /* FLOATTK  */
+    VOIDTK = 261,                  /* VOIDTK  */
+    IFTK = 262,                    /* IFTK  */
+    ELSETK = 263,                  /* ELSETK  */
+    WHILETK = 264,                 /* WHILETK  */
+    BREAKTK = 265,                 /* BREAKTK  */
+    CONTINUETK = 266,              /* CONTINUETK  */
+    RETURNTK = 267,                /* RETURNTK  */
+    GETINTTK = 268,                /* GETINTTK  */
+    PRINTFTK = 269,                /* PRINTFTK  */
+    LEQ = 270,                     /* LEQ  */
+    GEQ = 271,                     /* GEQ  */
+    EQL = 272,                     /* EQL  */
+    NEQ = 273,                     /* NEQ  */
+    LSS = 274,                     /* LSS  */
+    GRE = 275,                     /* GRE  */
+    AND = 276,                     /* AND  */
+    OR = 277,                      /* OR  */
+    NOT = 278,                     /* NOT  */
+    PLUS = 279,                    /* PLUS  */
+    MINU = 280,                    /* MINU  */
+    MULT = 281,                    /* MULT  */
+    DIV = 282,                     /* DIV  */
+    MOD = 283,                     /* MOD  */
+    ASSIGN = 284,                  /* ASSIGN  */
+    LPARENT = 285,                 /* LPARENT  */
+    RPARENT = 286,                 /* RPARENT  */
+    LBRACK = 287,                  /* LBRACK  */
+    RBRACK = 288,                  /* RBRACK  */
+    LBRACE = 289,                  /* LBRACE  */
+    RBRACE = 290,                  /* RBRACE  */
+    COMMA = 291,                   /* COMMA  */
+    SEMICN = 292,                  /* SEMICN  */
+    IDENFR = 293,                  /* IDENFR  */
+    INTCON = 294,                  /* INTCON  */
+    FLOATCONTK = 295,              /* FLOATCONTK  */
+    STRCON = 296,                  /* STRCON  */
+    LOWER_THAN_ELSE = 297          /* LOWER_THAN_ELSE  */
   };
   typedef enum yytokentype yytoken_kind_t;
 #endif
@@ -129,7 +131,7 @@ union YYSTYPE
     TopLevelList top_items;
     TypeSpec type_spec;
 
-#line 133 "parser.tab.h"
+#line 135 "parser.tab.h"
 
 };
 typedef union YYSTYPE YYSTYPE;

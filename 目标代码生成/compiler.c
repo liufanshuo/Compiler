@@ -7,8 +7,6 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 Program *g_program = NULL;
 
@@ -46,11 +44,13 @@ struct Symbol {
     VarInfo info;
     bool is_global;
     bool is_function;
+    TypeSpec value_type;
     bool is_const_scalar;
     int const_scalar;
     int *const_flat;
     char *llvm_name;
     char *flat_type;
+    int stack_offset;
     Symbol *next;
     Symbol *hash_next;
 };
@@ -260,6 +260,12 @@ Expr *make_number_expr(int value) {
     return expr;
 }
 
+Expr *make_float_number_expr(int value) {
+    Expr *expr = alloc_expr(EXPR_FLOAT_NUMBER);
+    expr->data.number = value;
+    return expr;
+}
+
 Expr *make_lval_expr(LVal *lval) {
     Expr *expr = alloc_expr(EXPR_LVAL);
     expr->data.lval = lval;
@@ -316,15 +322,17 @@ DeclItem *make_decl_item(char *name, IntList dims, InitVal *init) {
     return item;
 }
 
-Decl *make_decl(bool is_const, DeclItemList items) {
+Decl *make_decl(TypeSpec type, bool is_const, DeclItemList items) {
     Decl *decl = (Decl *)xmalloc(sizeof(Decl));
+    decl->type = type;
     decl->is_const = is_const;
     decl->items = items;
     return decl;
 }
 
-Param *make_param(char *name, bool is_array, IntList dims) {
+Param *make_param(TypeSpec type, char *name, bool is_array, IntList dims) {
     Param *param = (Param *)xmalloc(sizeof(Param));
+    param->type = type;
     param->name = name;
     param->is_array = is_array;
     param->dims = dims;
@@ -678,6 +686,7 @@ void gen_cond(IRGen *gen, Expr *expr, const char *true_label, const char *false_
 int eval_const_ast_expr(Expr *expr) {
     switch (expr->kind) {
         case EXPR_NUMBER:
+        case EXPR_FLOAT_NUMBER:
             return expr->data.number;
         case EXPR_LVAL:
             if (expr->data.lval->indices.count == 0) {
@@ -739,6 +748,7 @@ static int eval_const_lval(IRGen *gen, LVal *lval) {
 static int eval_const_expr(IRGen *gen, Expr *expr) {
     switch (expr->kind) {
         case EXPR_NUMBER:
+        case EXPR_FLOAT_NUMBER:
             return expr->data.number;
         case EXPR_LVAL:
             return eval_const_lval(gen, expr->data.lval);
@@ -859,6 +869,81 @@ static int *const_init_to_flat(IRGen *gen, InitVal *init, const int *dims, int d
     for (int i = 0; i < total; ++i) {
         if (slots[i] != NULL) {
             flat[i] = eval_const_expr(gen, slots[i]);
+        }
+    }
+    free(slots);
+    return flat;
+}
+
+static int float_bits_from_host(float value) {
+    int bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static float host_float_from_bits(int bits) {
+    float value = 0.0f;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static int eval_const_float_bits(IRGen *gen, Expr *expr) {
+    switch (expr->kind) {
+        case EXPR_FLOAT_NUMBER:
+            return expr->data.number;
+        case EXPR_NUMBER:
+            return float_bits_from_host((float)expr->data.number);
+        case EXPR_LVAL:
+            return float_bits_from_host((float)eval_const_lval(gen, expr->data.lval));
+        case EXPR_UNARY: {
+            int bits = eval_const_float_bits(gen, expr->data.unary.operand);
+            float v = host_float_from_bits(bits);
+            if (expr->data.unary.op == UNARY_MINUS) {
+                return float_bits_from_host(-v);
+            }
+            if (expr->data.unary.op == UNARY_NOT) {
+                return float_bits_from_host(!v);
+            }
+            return bits;
+        }
+        case EXPR_BINARY: {
+            BinaryOp op = expr->data.binary.op;
+            if (op == BIN_AND || op == BIN_OR) {
+                int lhs = eval_const_expr(gen, expr->data.binary.lhs);
+                int rhs = eval_const_expr(gen, expr->data.binary.rhs);
+                return float_bits_from_host(op == BIN_AND ? (lhs && rhs) : (lhs || rhs));
+            }
+            float lhs = host_float_from_bits(eval_const_float_bits(gen, expr->data.binary.lhs));
+            float rhs = host_float_from_bits(eval_const_float_bits(gen, expr->data.binary.rhs));
+            switch (op) {
+                case BIN_ADD: return float_bits_from_host(lhs + rhs);
+                case BIN_SUB: return float_bits_from_host(lhs - rhs);
+                case BIN_MUL: return float_bits_from_host(lhs * rhs);
+                case BIN_DIV: return float_bits_from_host(lhs / rhs);
+                case BIN_LT: return float_bits_from_host(lhs < rhs);
+                case BIN_GT: return float_bits_from_host(lhs > rhs);
+                case BIN_LE: return float_bits_from_host(lhs <= rhs);
+                case BIN_GE: return float_bits_from_host(lhs >= rhs);
+                case BIN_EQ: return float_bits_from_host(lhs == rhs);
+                case BIN_NE: return float_bits_from_host(lhs != rhs);
+                default: return float_bits_from_host(0.0f);
+            }
+        }
+        default:
+            return float_bits_from_host(0.0f);
+    }
+}
+
+static int *const_init_to_flat_typed(IRGen *gen, InitVal *init, const int *dims, int dim_count, TypeSpec type) {
+    int total = object_slot_count(dims, dim_count);
+    int *flat = (int *)xmalloc(sizeof(int) * (size_t)total);
+    for (int i = 0; i < total; ++i) {
+        flat[i] = type == TYPE_FLOAT ? float_bits_from_host(0.0f) : 0;
+    }
+    Expr **slots = init_to_expr_slots(init, dims, dim_count, total);
+    for (int i = 0; i < total; ++i) {
+        if (slots[i] != NULL) {
+            flat[i] = type == TYPE_FLOAT ? eval_const_float_bits(gen, slots[i]) : eval_const_expr(gen, slots[i]);
         }
     }
     free(slots);
@@ -1108,6 +1193,7 @@ static Value gen_short_circuit_expr(IRGen *gen, Expr *expr) {
 Value gen_expr(IRGen *gen, Expr *expr) {
     switch (expr->kind) {
         case EXPR_NUMBER:
+        case EXPR_FLOAT_NUMBER:
             return make_value(str_printf("%d", expr->data.number), 0, NULL, false, false);
         case EXPR_LVAL:
             return gen_lval_expr(gen, expr->data.lval);
@@ -1434,6 +1520,7 @@ static void gen_decl(IRGen *gen, Decl *decl, bool is_global) {
         DeclItem *item = decl->items.items[i];
         Symbol *sym = scope_add_symbol(gen, item->name);
         sym->is_global = is_global;
+        sym->value_type = decl->type;
         sym->info.dim_count = item->dims.count;
         sym->info.dims = copy_dims(item->dims.data, item->dims.count);
         sym->info.total_slots = object_slot_count(item->dims.data, item->dims.count);
@@ -1514,6 +1601,7 @@ static void gen_function(IRGen *gen, FuncDef *func) {
         Param *param = func->params.items[i];
         Symbol *sym = scope_add_symbol(gen, param->name);
         sym->info.is_const = false;
+        sym->value_type = param->type;
         sym->info.dim_count = param->dims.count;
         sym->info.dims = copy_dims(param->dims.data, param->dims.count);
         sym->info.is_param_array = param->is_array;
@@ -1613,252 +1701,877 @@ static const char *parse_input_path(int argc, char **argv) {
     return input;
 }
 
-static int compile_ir_to_riscv_asm(const char *ir_path, const char *asm_path) {
-    pid_t pid = fork();
-    if (pid < 0) {
-        return 1;
-    }
-    if (pid == 0) {
-        char *const args[] = {
-            "clang",
-            "-S",
-            "-x", "ir",
-            "-target", "riscv64-unknown-linux-gnu",
-            "-march=rv64gc",
-            "-mabi=lp64d",
-            "-mcmodel=medany",
-            "-fno-addrsig",
-            "-Wno-gnu-folding-constant",
-            "-w",
-            "-ffp-contract=off",
-            "-fno-builtin",
-            "-ftrivial-auto-var-init=zero",
-            "-fwrapv",
-            "-O0",
-            "-o", (char *)asm_path,
-            (char *)ir_path,
-            NULL
-        };
-        execvp("clang", args);
-        _exit(127);
-    }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        return 1;
-    }
-    return !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+typedef struct {
+    FILE *out;
+    StrBuf globals;
+    StrBuf functions;
+    StrBuf *current_allocas;
+    StrBuf *current_body;
+    Scope *scopes;
+    FunctionSymbol *functions_meta;
+    int ir_global_id;
+    int ir_function_id;
+    int temp_id;
+    int ir_label_id;
+    TypeSpec ir_current_ret_type;
+    bool ir_current_block_terminated;
+    StringList ir_break_labels;
+    StringList ir_continue_labels;
+    StrBuf data;
+    StrBuf text;
+    StrBuf body;
+    int global_id;
+    int function_id;
+    int label_id;
+    int next_stack_offset;
+    int frame_size;
+    TypeSpec current_ret_type;
+    char *return_label;
+    bool current_block_terminated;
+    StringList break_labels;
+    StringList continue_labels;
+} AsmGen;
+
+typedef struct {
+    int dim_count;
+    int *dims;
+    bool is_pointer;
+    bool is_param_array;
+} AsmValue;
+
+static int align_to(int value, int align) {
+    return (value + align - 1) / align * align;
 }
 
-static int copy_sysy_source_as_c(FILE *in, FILE *out) {
-    int c = 0;
-    while ((c = fgetc(in)) != EOF) {
-        if (c == '"') {
-            fputc(c, out);
-            while ((c = fgetc(in)) != EOF) {
-                fputc(c, out);
-                if (c == '\\') {
-                    int next = fgetc(in);
-                    if (next == EOF) {
-                        break;
-                    }
-                    fputc(next, out);
-                } else if (c == '"') {
-                    break;
+static void asm_emit(AsmGen *gen, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    sb_vappendf(&gen->body, fmt, ap);
+    va_end(ap);
+}
+
+static char *asm_new_label(AsmGen *gen, const char *prefix) {
+    return str_printf(".L_%s_%d", prefix, gen->label_id++);
+}
+
+static void asm_mark_label(AsmGen *gen, const char *label) {
+    asm_emit(gen, "%s:\n", label);
+    gen->current_block_terminated = false;
+}
+
+static void asm_load_imm(AsmGen *gen, const char *reg, int value) {
+    asm_emit(gen, "  li %s, %d\n", reg, value);
+}
+
+static bool asm_fits_imm12(int value) {
+    return value >= -2048 && value <= 2047;
+}
+
+static void asm_emit_add_imm(AsmGen *gen, const char *dst, const char *base, int imm) {
+    if (asm_fits_imm12(imm)) {
+        asm_emit(gen, "  addi %s, %s, %d\n", dst, base, imm);
+        return;
+    }
+    asm_emit(gen, "  li t6, %d\n", imm);
+    asm_emit(gen, "  add %s, %s, t6\n", dst, base);
+}
+
+static void asm_emit_mem(AsmGen *gen, const char *op, const char *reg, int offset, const char *base) {
+    if (asm_fits_imm12(offset)) {
+        asm_emit(gen, "  %s %s, %d(%s)\n", op, reg, offset, base);
+        return;
+    }
+    asm_emit(gen, "  li t6, %d\n", offset);
+    asm_emit(gen, "  add t6, %s, t6\n", base);
+    asm_emit(gen, "  %s %s, 0(t6)\n", op, reg);
+}
+
+static void sb_emit_add_imm(StrBuf *sb, const char *dst, const char *base, int imm) {
+    if (asm_fits_imm12(imm)) {
+        sb_appendf(sb, "  addi %s, %s, %d\n", dst, base, imm);
+        return;
+    }
+    sb_appendf(sb, "  li t6, %d\n", imm);
+    sb_appendf(sb, "  add %s, %s, t6\n", dst, base);
+}
+
+static void sb_emit_mem(StrBuf *sb, const char *op, const char *reg, int offset, const char *base) {
+    if (asm_fits_imm12(offset)) {
+        sb_appendf(sb, "  %s %s, %d(%s)\n", op, reg, offset, base);
+        return;
+    }
+    sb_appendf(sb, "  li t6, %d\n", offset);
+    sb_appendf(sb, "  add t6, %s, t6\n", base);
+    sb_appendf(sb, "  %s %s, 0(t6)\n", op, reg);
+}
+
+static void asm_push_a0(AsmGen *gen) {
+    asm_emit(gen, "  addi sp, sp, -16\n");
+    asm_emit(gen, "  sd a0, 8(sp)\n");
+}
+
+static void asm_pop_to(AsmGen *gen, const char *reg) {
+    asm_emit(gen, "  ld %s, 8(sp)\n", reg);
+    asm_emit(gen, "  addi sp, sp, 16\n");
+}
+
+static void asm_load_symbol_addr(AsmGen *gen, Symbol *sym, const char *reg) {
+    if (sym->is_global) {
+        asm_emit(gen, "  la %s, %s\n", reg, sym->llvm_name);
+    } else {
+        asm_emit_add_imm(gen, reg, "s0", sym->stack_offset);
+    }
+}
+
+static AsmValue asm_make_value(int dim_count, int *dims, bool is_pointer, bool is_param_array) {
+    AsmValue v;
+    v.dim_count = dim_count;
+    v.dims = dims;
+    v.is_pointer = is_pointer;
+    v.is_param_array = is_param_array;
+    return v;
+}
+
+static void asm_gen_expr(AsmGen *gen, Expr *expr);
+static void asm_gen_cond(AsmGen *gen, Expr *expr, const char *true_label, const char *false_label);
+static TypeSpec asm_expr_type(AsmGen *gen, Expr *expr);
+
+static int asm_alloc_stack(AsmGen *gen, int bytes) {
+    bytes = align_to(bytes, 4);
+    gen->next_stack_offset -= bytes;
+    return gen->next_stack_offset;
+}
+
+static FunctionSymbol *asm_add_function_meta(AsmGen *gen, FuncDef *func) {
+    FunctionSymbol *meta = (FunctionSymbol *)xmalloc(sizeof(FunctionSymbol));
+    meta->name = xstrdup(func->name);
+    meta->llvm_name = strcmp(func->name, "main") == 0 ? xstrdup("main") : str_printf("f%d", gen->function_id++);
+    meta->ret_type = func->ret_type;
+    meta->params = func->params;
+    meta->next = gen->functions_meta;
+    gen->functions_meta = meta;
+    unsigned idx = hash_string(func->name) % 512;
+    meta->hash_next = g_function_buckets[idx];
+    g_function_buckets[idx] = meta;
+    return meta;
+}
+
+static const char *asm_function_name(AsmGen *gen, const char *name) {
+    FunctionSymbol *meta = lookup_function_meta((IRGen *)gen, name);
+    return meta != NULL ? meta->llvm_name : name;
+}
+
+static void asm_emit_load(AsmGen *gen, const char *reg, int offset, const char *base) {
+    asm_emit_mem(gen, "lw", reg, offset, base);
+}
+
+static void asm_emit_store(AsmGen *gen, const char *reg, int offset, const char *base) {
+    asm_emit_mem(gen, "sw", reg, offset, base);
+}
+
+static void asm_scale_index(AsmGen *gen, int stride) {
+    if (stride != 1) {
+        asm_emit(gen, "  li t0, %d\n", stride);
+        asm_emit(gen, "  mul a0, a0, t0\n");
+    }
+}
+
+static AsmValue asm_lval_address(AsmGen *gen, LVal *lval) {
+    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
+    if (sym == NULL) {
+        asm_load_imm(gen, "a0", 0);
+        return asm_make_value(0, NULL, false, false);
+    }
+    if (sym->info.is_param_array) {
+        asm_emit_mem(gen, "ld", "t1", sym->stack_offset, "s0");
+    } else {
+        asm_load_symbol_addr(gen, sym, "t1");
+    }
+    for (int i = 0; i < lval->indices.count; ++i) {
+        asm_push_a0(gen);
+        asm_emit(gen, "  mv a0, t1\n");
+        asm_push_a0(gen);
+        asm_gen_expr(gen, lval->indices.items[i]);
+        int stride = sym->info.is_param_array
+                         ? product_dims(sym->info.dims, i, sym->info.dim_count)
+                         : product_dims(sym->info.dims, i + 1, sym->info.dim_count);
+        asm_scale_index(gen, stride * 4);
+        asm_emit(gen, "  mv t0, a0\n");
+        asm_pop_to(gen, "t1");
+        asm_pop_to(gen, "a0");
+        asm_emit(gen, "  add t1, t1, t0\n");
+    }
+    asm_emit(gen, "  mv a0, t1\n");
+    int remain = sym->info.dim_count - lval->indices.count;
+    if (remain < 0) {
+        remain = 0;
+    }
+    return asm_make_value(remain, sym->info.dims + lval->indices.count, true, sym->info.is_param_array);
+}
+
+static AsmValue asm_gen_lval_expr(AsmGen *gen, LVal *lval) {
+    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
+    if (sym != NULL && sym->is_const_scalar && lval->indices.count == 0) {
+        asm_load_imm(gen, "a0", sym->const_scalar);
+        return asm_make_value(0, NULL, false, false);
+    }
+    if (sym != NULL && sym->info.is_param_array && lval->indices.count == 0) {
+        asm_emit_mem(gen, "ld", "a0", sym->stack_offset, "s0");
+        return asm_make_value(sym->info.dim_count, sym->info.dims, true, true);
+    }
+    AsmValue addr = asm_lval_address(gen, lval);
+    if (addr.dim_count == 0) {
+        asm_emit_load(gen, "a0", 0, "a0");
+        return asm_make_value(0, NULL, false, false);
+    }
+    if (addr.dim_count == 1) {
+        return asm_make_value(0, NULL, true, true);
+    }
+    return asm_make_value(addr.dim_count - 1, addr.dims + 1, true, true);
+}
+
+static TypeSpec asm_lval_type(AsmGen *gen, LVal *lval) {
+    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
+    return sym != NULL ? sym->value_type : TYPE_INT;
+}
+
+static TypeSpec asm_expr_type(AsmGen *gen, Expr *expr) {
+    if (expr == NULL) {
+        return TYPE_INT;
+    }
+    switch (expr->kind) {
+        case EXPR_FLOAT_NUMBER:
+            return TYPE_FLOAT;
+        case EXPR_LVAL:
+            return asm_lval_type(gen, expr->data.lval);
+        case EXPR_CALL: {
+            if (strcmp(expr->data.call.name, "getfloat") == 0) {
+                return TYPE_FLOAT;
+            }
+            FunctionSymbol *meta = lookup_function_meta((IRGen *)gen, expr->data.call.name);
+            return meta != NULL ? meta->ret_type : TYPE_INT;
+        }
+        case EXPR_UNARY:
+            return expr->data.unary.op == UNARY_NOT ? TYPE_INT : asm_expr_type(gen, expr->data.unary.operand);
+        case EXPR_BINARY: {
+            BinaryOp op = expr->data.binary.op;
+            if (op == BIN_LT || op == BIN_GT || op == BIN_LE || op == BIN_GE ||
+                op == BIN_EQ || op == BIN_NE || op == BIN_AND || op == BIN_OR) {
+                return TYPE_INT;
+            }
+            return (asm_expr_type(gen, expr->data.binary.lhs) == TYPE_FLOAT ||
+                    asm_expr_type(gen, expr->data.binary.rhs) == TYPE_FLOAT) ? TYPE_FLOAT : TYPE_INT;
+        }
+        default:
+            return TYPE_INT;
+    }
+}
+
+static void asm_gen_float_to_freg(AsmGen *gen, Expr *expr, const char *freg) {
+    TypeSpec type = asm_expr_type(gen, expr);
+    asm_gen_expr(gen, expr);
+    if (type == TYPE_FLOAT) {
+        asm_emit(gen, "  fmv.w.x %s, a0\n", freg);
+    } else {
+        asm_emit(gen, "  fcvt.s.w %s, a0\n", freg);
+    }
+}
+
+static void asm_convert_a0(AsmGen *gen, TypeSpec from, TypeSpec to) {
+    if (from == to) {
+        return;
+    }
+    if (from == TYPE_INT && to == TYPE_FLOAT) {
+        asm_emit(gen, "  fcvt.s.w ft0, a0\n");
+        asm_emit(gen, "  fmv.x.w a0, ft0\n");
+        return;
+    }
+    if (from == TYPE_FLOAT && to == TYPE_INT) {
+        asm_emit(gen, "  fmv.w.x ft0, a0\n");
+        asm_emit(gen, "  fcvt.w.s a0, ft0, rtz\n");
+        return;
+    }
+}
+
+static void asm_gen_float_binary(AsmGen *gen, BinaryOp op, Expr *lhs, Expr *rhs) {
+    asm_gen_float_to_freg(gen, lhs, "ft0");
+    asm_emit(gen, "  addi sp, sp, -16\n");
+    asm_emit(gen, "  fsw ft0, 12(sp)\n");
+    asm_gen_float_to_freg(gen, rhs, "ft1");
+    asm_emit(gen, "  flw ft0, 12(sp)\n");
+    asm_emit(gen, "  addi sp, sp, 16\n");
+    switch (op) {
+        case BIN_ADD:
+            asm_emit(gen, "  fadd.s ft0, ft0, ft1\n");
+            asm_emit(gen, "  fmv.x.w a0, ft0\n");
+            return;
+        case BIN_SUB:
+            asm_emit(gen, "  fsub.s ft0, ft0, ft1\n");
+            asm_emit(gen, "  fmv.x.w a0, ft0\n");
+            return;
+        case BIN_MUL:
+            asm_emit(gen, "  fmul.s ft0, ft0, ft1\n");
+            asm_emit(gen, "  fmv.x.w a0, ft0\n");
+            return;
+        case BIN_DIV:
+            asm_emit(gen, "  fdiv.s ft0, ft0, ft1\n");
+            asm_emit(gen, "  fmv.x.w a0, ft0\n");
+            return;
+        case BIN_LT: asm_emit(gen, "  flt.s a0, ft0, ft1\n"); return;
+        case BIN_GT: asm_emit(gen, "  flt.s a0, ft1, ft0\n"); return;
+        case BIN_LE: asm_emit(gen, "  fle.s a0, ft0, ft1\n"); return;
+        case BIN_GE: asm_emit(gen, "  fle.s a0, ft1, ft0\n"); return;
+        case BIN_EQ: asm_emit(gen, "  feq.s a0, ft0, ft1\n"); return;
+        case BIN_NE:
+            asm_emit(gen, "  feq.s a0, ft0, ft1\n");
+            asm_emit(gen, "  xori a0, a0, 1\n");
+            return;
+        default:
+            asm_load_imm(gen, "a0", 0);
+            return;
+    }
+}
+
+static void asm_call_function(AsmGen *gen, const char *name, ExprList *args, FunctionSymbol *meta) {
+    int count = args->count;
+    for (int i = 0; i < count; ++i) {
+        asm_gen_expr(gen, args->items[i]);
+        TypeSpec arg_type = asm_expr_type(gen, args->items[i]);
+        TypeSpec param_type = (meta != NULL && i < meta->params.count) ? meta->params.items[i]->type : TYPE_INT;
+        asm_convert_a0(gen, arg_type, param_type);
+        asm_push_a0(gen);
+    }
+    int call_area = align_to(count * 8, 16);
+    if (call_area > 0) {
+        asm_emit_add_imm(gen, "sp", "sp", -call_area);
+    }
+    int int_reg = 0;
+    int float_reg = 0;
+    int stack_arg = 0;
+    for (int i = 0; i < count; ++i) {
+        TypeSpec param_type = (meta != NULL && i < meta->params.count) ? meta->params.items[i]->type : TYPE_INT;
+        bool param_array = meta != NULL && i < meta->params.count && meta->params.items[i]->is_array;
+        int off = call_area + 8 + (count - 1 - i) * 16;
+        if (param_type == TYPE_FLOAT && !param_array && float_reg < 8) {
+            char *arg_reg = str_printf("fa%d", float_reg++);
+            asm_emit_mem(gen, "flw", arg_reg, off, "sp");
+            free(arg_reg);
+        } else if (param_type == TYPE_FLOAT && !param_array) {
+            asm_emit_mem(gen, "flw", "ft0", off, "sp");
+            asm_emit_mem(gen, "fsw", "ft0", stack_arg * 8, "sp");
+            stack_arg++;
+        } else if (int_reg < 8) {
+            char *arg_reg = str_printf("a%d", int_reg++);
+            asm_emit_mem(gen, "ld", arg_reg, off, "sp");
+            free(arg_reg);
+        } else {
+            asm_emit_mem(gen, "ld", "t0", off, "sp");
+            asm_emit_mem(gen, "sd", "t0", stack_arg * 8, "sp");
+            stack_arg++;
+        }
+    }
+    asm_emit(gen, "  call %s\n", name);
+    if (call_area + count * 16 > 0) {
+        asm_emit_add_imm(gen, "sp", "sp", call_area + count * 16);
+    }
+}
+
+static void asm_store_incoming_param(AsmGen *gen, Param *param, Symbol *sym,
+                                     int *int_reg, int *float_reg, int *stack_arg) {
+    bool is_float_scalar = param->type == TYPE_FLOAT && !param->is_array;
+    if (is_float_scalar && *float_reg < 8) {
+        char *arg_reg = str_printf("fa%d", (*float_reg)++);
+        asm_emit_mem(gen, "fsw", arg_reg, sym->stack_offset, "s0");
+        free(arg_reg);
+    } else if (is_float_scalar) {
+        asm_emit_mem(gen, "flw", "ft0", (*stack_arg) * 8, "s0");
+        asm_emit_mem(gen, "fsw", "ft0", sym->stack_offset, "s0");
+        (*stack_arg)++;
+    } else if (*int_reg < 8) {
+        char *arg_reg = str_printf("a%d", (*int_reg)++);
+        if (param->is_array) {
+            asm_emit_mem(gen, "sd", arg_reg, sym->stack_offset, "s0");
+        } else {
+            asm_emit_store(gen, arg_reg, sym->stack_offset, "s0");
+        }
+        free(arg_reg);
+    } else {
+        asm_emit_mem(gen, "ld", "t0", (*stack_arg) * 8, "s0");
+        if (param->is_array) {
+            asm_emit_mem(gen, "sd", "t0", sym->stack_offset, "s0");
+        } else {
+            asm_emit_store(gen, "t0", sym->stack_offset, "s0");
+        }
+        (*stack_arg)++;
+    }
+}
+
+static AsmValue asm_gen_short_circuit_expr(AsmGen *gen, Expr *expr) {
+    int slot = asm_alloc_stack(gen, 4);
+    char *true_label = asm_new_label(gen, "logic_true");
+    char *false_label = asm_new_label(gen, "logic_false");
+    char *end_label = asm_new_label(gen, "logic_end");
+    asm_emit_store(gen, "zero", slot, "s0");
+    asm_gen_cond(gen, expr, true_label, false_label);
+    asm_mark_label(gen, true_label);
+    asm_emit(gen, "  li t0, 1\n");
+    asm_emit_store(gen, "t0", slot, "s0");
+    asm_emit(gen, "  j %s\n", end_label);
+    gen->current_block_terminated = true;
+    asm_mark_label(gen, false_label);
+    asm_emit(gen, "  j %s\n", end_label);
+    gen->current_block_terminated = true;
+    asm_mark_label(gen, end_label);
+    asm_emit_load(gen, "a0", slot, "s0");
+    return asm_make_value(0, NULL, false, false);
+}
+
+static void asm_gen_expr(AsmGen *gen, Expr *expr) {
+    if (expr == NULL) {
+        asm_load_imm(gen, "a0", 0);
+        return;
+    }
+    switch (expr->kind) {
+        case EXPR_NUMBER:
+        case EXPR_FLOAT_NUMBER:
+            asm_load_imm(gen, "a0", expr->data.number);
+            return;
+        case EXPR_LVAL:
+            asm_gen_lval_expr(gen, expr->data.lval);
+            return;
+        case EXPR_GETINT:
+            asm_emit(gen, "  call getint\n");
+            return;
+        case EXPR_CALL: {
+            const char *name = expr->data.call.name;
+            if (strcmp(name, "starttime") == 0) {
+                asm_load_imm(gen, "a0", 0);
+                asm_emit(gen, "  call _sysy_starttime\n");
+                asm_load_imm(gen, "a0", 0);
+                return;
+            }
+            if (strcmp(name, "stoptime") == 0) {
+                asm_load_imm(gen, "a0", 0);
+                asm_emit(gen, "  call _sysy_stoptime\n");
+                asm_load_imm(gen, "a0", 0);
+                return;
+            }
+            if (strcmp(name, "getfloat") == 0) {
+                asm_emit(gen, "  call getfloat\n");
+                asm_emit(gen, "  fmv.x.w a0, fa0\n");
+                return;
+            }
+            if (strcmp(name, "putfloat") == 0 && expr->data.call.args.count > 0) {
+                asm_gen_expr(gen, expr->data.call.args.items[0]);
+                asm_convert_a0(gen, asm_expr_type(gen, expr->data.call.args.items[0]), TYPE_FLOAT);
+                asm_emit(gen, "  fmv.w.x fa0, a0\n");
+                asm_emit(gen, "  call putfloat\n");
+                asm_load_imm(gen, "a0", 0);
+                return;
+            }
+            FunctionSymbol *meta = lookup_function_meta((IRGen *)gen, name);
+            asm_call_function(gen, asm_function_name(gen, name), &expr->data.call.args, meta);
+            return;
+        }
+        case EXPR_UNARY:
+            if (expr->data.unary.op == UNARY_MINUS && asm_expr_type(gen, expr->data.unary.operand) == TYPE_FLOAT) {
+                asm_gen_float_to_freg(gen, expr->data.unary.operand, "ft0");
+                asm_emit(gen, "  fneg.s ft0, ft0\n");
+                asm_emit(gen, "  fmv.x.w a0, ft0\n");
+                return;
+            }
+            asm_gen_expr(gen, expr->data.unary.operand);
+            if (expr->data.unary.op == UNARY_MINUS) {
+                asm_emit(gen, "  negw a0, a0\n");
+            } else if (expr->data.unary.op == UNARY_NOT) {
+                asm_emit(gen, "  seqz a0, a0\n");
+            }
+            return;
+        case EXPR_BINARY: {
+            BinaryOp op = expr->data.binary.op;
+            if (op == BIN_AND || op == BIN_OR) {
+                asm_gen_short_circuit_expr(gen, expr);
+                return;
+            }
+            if ((asm_expr_type(gen, expr->data.binary.lhs) == TYPE_FLOAT ||
+                 asm_expr_type(gen, expr->data.binary.rhs) == TYPE_FLOAT) &&
+                op != BIN_MOD) {
+                asm_gen_float_binary(gen, op, expr->data.binary.lhs, expr->data.binary.rhs);
+                return;
+            }
+            asm_gen_expr(gen, expr->data.binary.lhs);
+            asm_push_a0(gen);
+            asm_gen_expr(gen, expr->data.binary.rhs);
+            asm_emit(gen, "  mv t1, a0\n");
+            asm_pop_to(gen, "t0");
+            switch (op) {
+                case BIN_ADD: asm_emit(gen, "  addw a0, t0, t1\n"); return;
+                case BIN_SUB: asm_emit(gen, "  subw a0, t0, t1\n"); return;
+                case BIN_MUL: asm_emit(gen, "  mulw a0, t0, t1\n"); return;
+                case BIN_DIV: asm_emit(gen, "  divw a0, t0, t1\n"); return;
+                case BIN_MOD: asm_emit(gen, "  remw a0, t0, t1\n"); return;
+                case BIN_LT: asm_emit(gen, "  slt a0, t0, t1\n"); return;
+                case BIN_GT: asm_emit(gen, "  slt a0, t1, t0\n"); return;
+                case BIN_LE:
+                    asm_emit(gen, "  slt a0, t1, t0\n");
+                    asm_emit(gen, "  xori a0, a0, 1\n");
+                    return;
+                case BIN_GE:
+                    asm_emit(gen, "  slt a0, t0, t1\n");
+                    asm_emit(gen, "  xori a0, a0, 1\n");
+                    return;
+                case BIN_EQ:
+                    asm_emit(gen, "  subw a0, t0, t1\n");
+                    asm_emit(gen, "  seqz a0, a0\n");
+                    return;
+                case BIN_NE:
+                    asm_emit(gen, "  subw a0, t0, t1\n");
+                    asm_emit(gen, "  snez a0, a0\n");
+                    return;
+                default:
+                    asm_load_imm(gen, "a0", 0);
+                    return;
+            }
+        }
+    }
+}
+
+static void asm_gen_cond(AsmGen *gen, Expr *expr, const char *true_label, const char *false_label) {
+    if (expr->kind == EXPR_BINARY && expr->data.binary.op == BIN_OR) {
+        char *mid = asm_new_label(gen, "lor_rhs");
+        asm_gen_cond(gen, expr->data.binary.lhs, true_label, mid);
+        asm_mark_label(gen, mid);
+        asm_gen_cond(gen, expr->data.binary.rhs, true_label, false_label);
+        return;
+    }
+    if (expr->kind == EXPR_BINARY && expr->data.binary.op == BIN_AND) {
+        char *mid = asm_new_label(gen, "land_rhs");
+        asm_gen_cond(gen, expr->data.binary.lhs, mid, false_label);
+        asm_mark_label(gen, mid);
+        asm_gen_cond(gen, expr->data.binary.rhs, true_label, false_label);
+        return;
+    }
+    asm_gen_expr(gen, expr);
+    asm_emit(gen, "  bnez a0, %s\n", true_label);
+    asm_emit(gen, "  j %s\n", false_label);
+    gen->current_block_terminated = true;
+}
+
+static void asm_gen_decl(AsmGen *gen, Decl *decl, bool is_global);
+static void asm_gen_stmt(AsmGen *gen, Stmt *stmt);
+
+static void asm_gen_block(AsmGen *gen, Block *block, bool new_scope) {
+    if (new_scope) {
+        push_scope((IRGen *)gen);
+    }
+    for (int i = 0; i < block->items.count; ++i) {
+        if (block->items.kinds[i] == BLOCK_ITEM_DECL) {
+            asm_gen_decl(gen, (Decl *)block->items.items[i], false);
+        } else {
+            asm_gen_stmt(gen, (Stmt *)block->items.items[i]);
+        }
+    }
+    if (new_scope) {
+        pop_scope((IRGen *)gen);
+    }
+}
+
+static void asm_gen_printf(AsmGen *gen, char *format, ExprList *args) {
+    int arg_index = 0;
+    int len = (int)strlen(format);
+    for (int i = 1; i < len - 1; ++i) {
+        if (format[i] == '%' && i + 1 < len - 1 && format[i + 1] == 'd') {
+            asm_gen_expr(gen, args->items[arg_index++]);
+            asm_emit(gen, "  call putint\n");
+            ++i;
+        } else if (format[i] == '\\' && i + 1 < len - 1) {
+            int ch = format[i + 1] == 'n' ? 10 : (format[i + 1] == 't' ? 9 : format[i + 1]);
+            asm_load_imm(gen, "a0", ch);
+            asm_emit(gen, "  call putch\n");
+            ++i;
+        } else {
+            asm_load_imm(gen, "a0", (unsigned char)format[i]);
+            asm_emit(gen, "  call putch\n");
+        }
+    }
+}
+
+static void asm_gen_stmt(AsmGen *gen, Stmt *stmt) {
+    switch (stmt->kind) {
+        case STMT_ASSIGN:
+            asm_lval_address(gen, stmt->data.assign_stmt.lval);
+            asm_push_a0(gen);
+            asm_gen_expr(gen, stmt->data.assign_stmt.expr);
+            asm_convert_a0(gen, asm_expr_type(gen, stmt->data.assign_stmt.expr),
+                           asm_lval_type(gen, stmt->data.assign_stmt.lval));
+            asm_emit(gen, "  mv t0, a0\n");
+            asm_pop_to(gen, "t1");
+            asm_emit_store(gen, "t0", 0, "t1");
+            return;
+        case STMT_EXPR:
+            asm_gen_expr(gen, stmt->data.expr_stmt);
+            return;
+        case STMT_BLOCK:
+            asm_gen_block(gen, stmt->data.block_stmt, true);
+            return;
+        case STMT_IF: {
+            char *then_label = asm_new_label(gen, "if_then");
+            char *else_label = asm_new_label(gen, "if_else");
+            char *end_label = asm_new_label(gen, "if_end");
+            asm_gen_cond(gen, stmt->data.if_stmt.cond, then_label,
+                         stmt->data.if_stmt.else_stmt ? else_label : end_label);
+            asm_mark_label(gen, then_label);
+            asm_gen_stmt(gen, stmt->data.if_stmt.then_stmt);
+            if (!gen->current_block_terminated) {
+                asm_emit(gen, "  j %s\n", end_label);
+                gen->current_block_terminated = true;
+            }
+            if (stmt->data.if_stmt.else_stmt != NULL) {
+                asm_mark_label(gen, else_label);
+                asm_gen_stmt(gen, stmt->data.if_stmt.else_stmt);
+                if (!gen->current_block_terminated) {
+                    asm_emit(gen, "  j %s\n", end_label);
+                    gen->current_block_terminated = true;
                 }
             }
+            asm_mark_label(gen, end_label);
+            return;
+        }
+        case STMT_WHILE: {
+            char *cond_label = asm_new_label(gen, "while_cond");
+            char *body_label = asm_new_label(gen, "while_body");
+            char *end_label = asm_new_label(gen, "while_end");
+            asm_emit(gen, "  j %s\n", cond_label);
+            gen->current_block_terminated = true;
+            asm_mark_label(gen, cond_label);
+            string_list_push(&gen->break_labels, end_label);
+            string_list_push(&gen->continue_labels, cond_label);
+            asm_gen_cond(gen, stmt->data.while_stmt.cond, body_label, end_label);
+            asm_mark_label(gen, body_label);
+            asm_gen_stmt(gen, stmt->data.while_stmt.body);
+            if (!gen->current_block_terminated) {
+                asm_emit(gen, "  j %s\n", cond_label);
+                gen->current_block_terminated = true;
+            }
+            gen->break_labels.count--;
+            gen->continue_labels.count--;
+            asm_mark_label(gen, end_label);
+            return;
+        }
+        case STMT_BREAK:
+            asm_emit(gen, "  j %s\n", gen->break_labels.items[gen->break_labels.count - 1]);
+            gen->current_block_terminated = true;
+            return;
+        case STMT_CONTINUE:
+            asm_emit(gen, "  j %s\n", gen->continue_labels.items[gen->continue_labels.count - 1]);
+            gen->current_block_terminated = true;
+            return;
+        case STMT_RETURN:
+            if (stmt->data.return_expr == NULL) {
+                asm_load_imm(gen, "a0", 0);
+            } else {
+                asm_gen_expr(gen, stmt->data.return_expr);
+                asm_convert_a0(gen, asm_expr_type(gen, stmt->data.return_expr), gen->current_ret_type);
+            }
+            asm_emit(gen, "  j %s\n", gen->return_label);
+            gen->current_block_terminated = true;
+            return;
+        case STMT_PRINTF:
+            asm_gen_printf(gen, stmt->data.printf_stmt.format, &stmt->data.printf_stmt.args);
+            return;
+    }
+}
+
+static void asm_zero_local(AsmGen *gen, Symbol *sym) {
+    if (sym->info.total_slots <= 8) {
+        for (int i = 0; i < sym->info.total_slots; ++i) {
+            asm_emit_store(gen, "zero", sym->stack_offset + i * 4, "s0");
+        }
+        return;
+    }
+    char *loop_label = asm_new_label(gen, "zero_loop");
+    char *end_label = asm_new_label(gen, "zero_end");
+    asm_emit_add_imm(gen, "t0", "s0", sym->stack_offset);
+    asm_emit(gen, "  li t1, %d\n", sym->info.total_slots);
+    asm_mark_label(gen, loop_label);
+    asm_emit(gen, "  beqz t1, %s\n", end_label);
+    asm_emit(gen, "  sw zero, 0(t0)\n");
+    asm_emit(gen, "  addi t0, t0, 4\n");
+    asm_emit(gen, "  addi t1, t1, -1\n");
+    asm_emit(gen, "  j %s\n", loop_label);
+    gen->current_block_terminated = true;
+    asm_mark_label(gen, end_label);
+}
+
+static void asm_emit_global_flat(StrBuf *data, const int *flat, int total) {
+    int i = 0;
+    while (i < total) {
+        if (flat[i] == 0) {
+            int start = i;
+            while (i < total && flat[i] == 0) {
+                ++i;
+            }
+            sb_appendf(data, "  .zero %d\n", (i - start) * 4);
             continue;
         }
-        if (c == '\'') {
-            fputc(c, out);
-            while ((c = fgetc(in)) != EOF) {
-                fputc(c, out);
-                if (c == '\\') {
-                    int next = fgetc(in);
-                    if (next == EOF) {
-                        break;
-                    }
-                    fputc(next, out);
-                } else if (c == '\'') {
-                    break;
+        sb_appendf(data, "  .word %d\n", flat[i]);
+        ++i;
+    }
+}
+
+static void asm_gen_decl(AsmGen *gen, Decl *decl, bool is_global) {
+    for (int i = 0; i < decl->items.count; ++i) {
+        DeclItem *item = decl->items.items[i];
+        Symbol *sym = scope_add_symbol((IRGen *)gen, item->name);
+        sym->is_global = is_global;
+        sym->value_type = decl->type;
+        sym->info.dim_count = item->dims.count;
+        sym->info.dims = copy_dims(item->dims.data, item->dims.count);
+        sym->info.total_slots = object_slot_count(item->dims.data, item->dims.count);
+        sym->info.is_const = decl->is_const;
+        sym->info.is_param_array = false;
+        sym->info.is_flat_storage = item->dims.count > 0;
+        if (item->dims.count == 0) {
+            if (decl->is_const && item->init != NULL) {
+                sym->is_const_scalar = true;
+                sym->const_scalar = eval_const_expr((IRGen *)gen, item->init->expr);
+            }
+            if (is_global) {
+                int init_val = 0;
+                if (item->init != NULL) {
+                    init_val = decl->type == TYPE_FLOAT
+                                   ? eval_const_float_bits((IRGen *)gen, item->init->expr)
+                                   : eval_const_expr((IRGen *)gen, item->init->expr);
                 }
-            }
-            continue;
-        }
-        if (c == '/') {
-            int next = fgetc(in);
-            if (next == '/') {
-                fputc(c, out);
-                fputc(next, out);
-                while ((c = fgetc(in)) != EOF) {
-                    fputc(c, out);
-                    if (c == '\n') {
-                        break;
-                    }
-                }
-                continue;
-            }
-            if (next == '*') {
-                fputc(c, out);
-                fputc(next, out);
-                int prev = 0;
-                while ((c = fgetc(in)) != EOF) {
-                    fputc(c, out);
-                    if (prev == '*' && c == '/') {
-                        break;
-                    }
-                    prev = c;
-                }
-                continue;
-            }
-            fputc(c, out);
-            if (next != EOF) {
-                ungetc(next, in);
-            }
-            continue;
-        }
-        if (isdigit(c) || c == '.') {
-            int is_number = isdigit(c);
-            if (c == '.') {
-                int next = fgetc(in);
-                if (next != EOF) {
-                    ungetc(next, in);
-                }
-                is_number = next != EOF && isdigit(next);
-            }
-            if (!is_number) {
-                fputc(c, out);
-                continue;
-            }
-            StrBuf token;
-            sb_init(&token);
-            char one[2] = {(char)c, '\0'};
-            sb_append(&token, one);
-            int prev = c;
-            while ((c = fgetc(in)) != EOF) {
-                if (isalnum(c) || c == '.' || c == '_' ||
-                    ((c == '+' || c == '-') && (prev == 'e' || prev == 'E' || prev == 'p' || prev == 'P'))) {
-                    one[0] = (char)c;
-                    sb_append(&token, one);
-                    prev = c;
-                    continue;
-                }
-                ungetc(c, in);
-                break;
-            }
-            bool is_float_literal = false;
-            for (size_t i = 0; i < token.len; ++i) {
-                if (token.data[i] == '.' || token.data[i] == 'e' || token.data[i] == 'E' ||
-                    token.data[i] == 'p' || token.data[i] == 'P') {
-                    is_float_literal = true;
-                    break;
-                }
-            }
-            while (token.len > 0) {
-                char last = token.data[token.len - 1];
-                if (is_float_literal) {
-                    if (last != 'f' && last != 'F' && last != 'l' && last != 'L') {
-                        break;
-                    }
+                sym->llvm_name = str_printf("g%d", gen->global_id++);
+                sb_appendf(&gen->data, "  .globl %s\n%s:\n  .word %d\n", sym->llvm_name, sym->llvm_name, init_val);
+            } else {
+                sym->stack_offset = asm_alloc_stack(gen, 4);
+                if (item->init != NULL) {
+                    asm_gen_expr(gen, item->init->expr);
+                    asm_convert_a0(gen, asm_expr_type(gen, item->init->expr), decl->type);
+                    asm_emit_store(gen, "a0", sym->stack_offset, "s0");
                 } else {
-                    if (last != 'u' && last != 'U' && last != 'l' && last != 'L') {
-                        break;
-                    }
+                    asm_emit_store(gen, "zero", sym->stack_offset, "s0");
                 }
-                token.data[--token.len] = '\0';
             }
-            if (is_float_literal) {
-                sb_append(&token, "f");
+        } else {
+            if (decl->is_const && item->init != NULL) {
+                sym->const_flat = const_init_to_flat((IRGen *)gen, item->init, item->dims.data, item->dims.count);
             }
-            fputs(token.data ? token.data : "", out);
-            continue;
+            if (is_global) {
+                sym->llvm_name = str_printf("g%d", gen->global_id++);
+                int *flat = item->init != NULL
+                                ? const_init_to_flat_typed((IRGen *)gen, item->init, item->dims.data, item->dims.count, decl->type)
+                                : NULL;
+                sb_appendf(&gen->data, "  .globl %s\n%s:\n", sym->llvm_name, sym->llvm_name);
+                if (flat == NULL) {
+                    sb_appendf(&gen->data, "  .zero %d\n", sym->info.total_slots * 4);
+                } else {
+                    asm_emit_global_flat(&gen->data, flat, sym->info.total_slots);
+                }
+            } else {
+                sym->stack_offset = asm_alloc_stack(gen, sym->info.total_slots * 4);
+                asm_zero_local(gen, sym);
+                if (item->init != NULL) {
+                    Expr **slots = init_to_expr_slots(item->init, item->dims.data, item->dims.count, sym->info.total_slots);
+                    for (int j = 0; j < sym->info.total_slots; ++j) {
+                        if (slots[j] != NULL) {
+                            asm_gen_expr(gen, slots[j]);
+                            asm_convert_a0(gen, asm_expr_type(gen, slots[j]), decl->type);
+                            asm_emit_store(gen, "a0", sym->stack_offset + j * 4, "s0");
+                        }
+                    }
+                    free(slots);
+                }
+            }
         }
-        fputc(c, out);
     }
-    return ferror(in) || ferror(out);
 }
 
-static int write_sysy_c_translation_unit(const char *input_path, const char *c_path) {
-    FILE *in = fopen(input_path, "r");
-    if (in == NULL) {
-        return 1;
-    }
-    FILE *out = fopen(c_path, "w");
-    if (out == NULL) {
-        fclose(in);
-        return 1;
+static void asm_gen_function(AsmGen *gen, FuncDef *func) {
+    StrBuf saved_body = gen->body;
+    sb_init(&gen->body);
+    gen->next_stack_offset = -24;
+    gen->return_label = asm_new_label(gen, "return");
+    gen->current_ret_type = func->ret_type;
+    gen->current_block_terminated = false;
+    push_scope((IRGen *)gen);
+
+    int int_reg = 0;
+    int float_reg = 0;
+    int stack_arg = 0;
+    for (int i = 0; i < func->params.count; ++i) {
+        Param *param = func->params.items[i];
+        Symbol *sym = scope_add_symbol((IRGen *)gen, param->name);
+        sym->info.is_const = false;
+        sym->value_type = param->type;
+        sym->info.dim_count = param->dims.count;
+        sym->info.dims = copy_dims(param->dims.data, param->dims.count);
+        sym->info.total_slots = param->is_array ? 1 : 1;
+        sym->info.is_param_array = param->is_array;
+        sym->stack_offset = asm_alloc_stack(gen, 8);
+        asm_store_incoming_param(gen, param, sym, &int_reg, &float_reg, &stack_arg);
     }
 
-    fputs("int getint(void);\n", out);
-    fputs("int getch(void);\n", out);
-    fputs("int getarray(int a[]);\n", out);
-    fputs("float getfloat(void);\n", out);
-    fputs("int getfarray(float a[]);\n", out);
-    fputs("void putint(int a);\n", out);
-    fputs("void putch(int a);\n", out);
-    fputs("void putarray(int n, int a[]);\n", out);
-    fputs("void putfloat(float a);\n", out);
-    fputs("void putfarray(int n, float a[]);\n", out);
-    fputs("void putf(char a[], ...);\n", out);
-    fputs("int printf(const char *fmt, ...);\n", out);
-    fputs("void _sysy_starttime(int line);\n", out);
-    fputs("void _sysy_stoptime(int line);\n", out);
-    fputs("#define starttime() _sysy_starttime(__LINE__)\n", out);
-    fputs("#define stoptime() _sysy_stoptime(__LINE__)\n\n", out);
+    asm_gen_block(gen, func->block, false);
+    if (!gen->current_block_terminated) {
+        asm_load_imm(gen, "a0", 0);
+        asm_emit(gen, "  j %s\n", gen->return_label);
+    }
+    asm_mark_label(gen, gen->return_label);
+    gen->frame_size = align_to(-gen->next_stack_offset + 16, 16);
 
-    int failed = copy_sysy_source_as_c(in, out);
-    fclose(in);
-    fclose(out);
-    return failed;
+    const char *name = asm_function_name(gen, func->name);
+    sb_appendf(&gen->text, "  .globl %s\n%s:\n", name, name);
+    sb_emit_add_imm(&gen->text, "sp", "sp", -gen->frame_size);
+    sb_emit_mem(&gen->text, "sd", "ra", gen->frame_size - 8, "sp");
+    sb_emit_mem(&gen->text, "sd", "s0", gen->frame_size - 16, "sp");
+    sb_emit_add_imm(&gen->text, "s0", "sp", gen->frame_size);
+    sb_append(&gen->text, gen->body.data ? gen->body.data : "");
+    sb_emit_mem(&gen->text, "ld", "ra", gen->frame_size - 8, "sp");
+    sb_emit_mem(&gen->text, "ld", "s0", gen->frame_size - 16, "sp");
+    sb_emit_add_imm(&gen->text, "sp", "sp", gen->frame_size);
+    sb_append(&gen->text, "  ret\n\n");
+
+    pop_scope((IRGen *)gen);
+    gen->body = saved_body;
 }
 
-static int compile_sysy_source_to_riscv_asm(const char *input_path, const char *asm_path) {
-    char c_template[] = "/tmp/sysy-src-XXXXXX";
-    int c_fd = mkstemp(c_template);
-    if (c_fd < 0) {
-        return 1;
+static void generate_program_asm(Program *program, FILE *out) {
+    AsmGen gen;
+    memset(&gen, 0, sizeof(gen));
+    sb_init(&gen.data);
+    sb_init(&gen.text);
+    sb_init(&gen.body);
+    memset(g_function_buckets, 0, sizeof(g_function_buckets));
+    push_scope((IRGen *)&gen);
+    for (int i = 0; i < program->items.count; ++i) {
+        TopLevelItem *item = program->items.items[i];
+        if (item->kind == TOP_LEVEL_FUNC) {
+            asm_add_function_meta(&gen, item->data.func);
+        }
     }
-    close(c_fd);
-    if (write_sysy_c_translation_unit(input_path, c_template) != 0) {
-        unlink(c_template);
-        return 1;
+    for (int i = 0; i < program->items.count; ++i) {
+        TopLevelItem *item = program->items.items[i];
+        if (item->kind == TOP_LEVEL_DECL) {
+            asm_gen_decl(&gen, item->data.decl, true);
+        }
     }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        unlink(c_template);
-        return 1;
+    for (int i = 0; i < program->items.count; ++i) {
+        TopLevelItem *item = program->items.items[i];
+        if (item->kind == TOP_LEVEL_FUNC) {
+            asm_gen_function(&gen, item->data.func);
+        }
     }
-    if (pid == 0) {
-        char *const args[] = {
-            "clang",
-            "-S",
-            "-x", "c",
-            "-target", "riscv64-unknown-linux-gnu",
-            "-march=rv64gc",
-            "-mabi=lp64d",
-            "-mcmodel=medany",
-            "-fno-addrsig",
-            "-Wno-gnu-folding-constant",
-            "-w",
-            "-ffp-contract=off",
-            "-fno-builtin",
-            "-ftrivial-auto-var-init=zero",
-            "-fwrapv",
-            "-O0",
-            "-o", (char *)asm_path,
-            c_template,
-            NULL
-        };
-        execvp("clang", args);
-        _exit(127);
+    fputs("  .attribute arch, \"rv64i2p1_m2p0_a2p1_f2p2_d2p2_c2p0\"\n", out);
+    fputs("  .option nopic\n", out);
+    if (gen.data.len > 0) {
+        fputs("  .data\n", out);
+        fputs(gen.data.data, out);
     }
-    int status = 0;
-    int wait_failed = waitpid(pid, &status, 0) < 0;
-    unlink(c_template);
-    if (wait_failed) {
-        return 1;
-    }
-    return !(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    fputs("  .text\n", out);
+    fputs(gen.text.data ? gen.text.data : "", out);
 }
 
 int main(int argc, char **argv) {
@@ -1867,8 +2580,6 @@ int main(int argc, char **argv) {
     if (input_path == NULL) {
         return 1;
     }
-    return compile_sysy_source_to_riscv_asm(input_path, output_path);
-#if 0
     yyin = fopen(input_path, "r");
     if (yyin == NULL) {
         return 1;
@@ -1877,24 +2588,13 @@ int main(int argc, char **argv) {
         fclose(yyin);
         return 1;
     }
-    char ir_template[] = "/tmp/sysy-ir-XXXXXX";
-    int ir_fd = mkstemp(ir_template);
-    if (ir_fd < 0) {
-        fclose(yyin);
-        return 1;
-    }
-    FILE *out = fdopen(ir_fd, "w");
+    FILE *out = fopen(output_path, "w");
     if (out == NULL) {
-        close(ir_fd);
-        unlink(ir_template);
         fclose(yyin);
         return 1;
     }
-    generate_program_ir(g_program, out);
+    generate_program_asm(g_program, out);
     fclose(out);
     fclose(yyin);
-    int rc = compile_ir_to_riscv_asm(ir_template, output_path);
-    unlink(ir_template);
-    return rc;
-#endif
+    return 0;
 }

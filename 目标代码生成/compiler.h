@@ -6,6 +6,7 @@
 
 typedef enum {
     TYPE_INT,
+    TYPE_FLOAT,
     TYPE_VOID
 } TypeSpec;
 
@@ -65,6 +66,7 @@ typedef struct DeclItemList {
 } DeclItemList;
 
 typedef struct Param {
+    TypeSpec type;
     char *name;
     bool is_array;
     IntList dims;
@@ -94,6 +96,7 @@ typedef struct TopLevelList {
 
 typedef enum {
     EXPR_NUMBER,
+    EXPR_FLOAT_NUMBER,
     EXPR_LVAL,
     EXPR_CALL,
     EXPR_GETINT,
@@ -156,6 +159,7 @@ typedef struct InitVal {
 } InitVal;
 
 typedef struct Decl {
+    TypeSpec type;
     bool is_const;
     DeclItemList items;
 } Decl;
@@ -241,6 +245,7 @@ void block_item_list_push(BlockItemList *list, int kind, void *item);
 
 LVal *make_lval(char *name, ExprList indices);
 Expr *make_number_expr(int value);
+Expr *make_float_number_expr(int value);
 Expr *make_lval_expr(LVal *lval);
 Expr *make_call_expr(char *name, ExprList args);
 Expr *make_getint_expr(void);
@@ -249,8 +254,8 @@ Expr *make_binary_expr(BinaryOp op, Expr *lhs, Expr *rhs);
 InitVal *make_expr_init(Expr *expr);
 InitVal *make_list_init(InitValList children);
 DeclItem *make_decl_item(char *name, IntList dims, InitVal *init);
-Decl *make_decl(bool is_const, DeclItemList items);
-Param *make_param(char *name, bool is_array, IntList dims);
+Decl *make_decl(TypeSpec type, bool is_const, DeclItemList items);
+Param *make_param(TypeSpec type, char *name, bool is_array, IntList dims);
 Stmt *make_assign_stmt(LVal *lval, Expr *expr);
 Stmt *make_expr_stmt(Expr *expr);
 Stmt *make_block_stmt(Block *block);
