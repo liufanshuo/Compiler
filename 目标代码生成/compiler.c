@@ -1967,6 +1967,39 @@ static TypeSpec asm_expr_type(AsmGen *gen, Expr *expr) {
     }
 }
 
+static bool asm_expr_is_pointer_value(AsmGen *gen, Expr *expr) {
+    if (expr == NULL || expr->kind != EXPR_LVAL) {
+        return false;
+    }
+    LVal *lval = expr->data.lval;
+    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
+    if (sym == NULL) {
+        return false;
+    }
+    return sym->info.is_param_array || lval->indices.count < sym->info.dim_count;
+}
+
+static TypeSpec asm_call_param_type(const char *name, FunctionSymbol *meta, int index) {
+    if (meta != NULL && index < meta->params.count) {
+        return meta->params.items[index]->type;
+    }
+    if ((strcmp(name, "getfarray") == 0 && index == 0) ||
+        (strcmp(name, "putfarray") == 0 && index == 1)) {
+        return TYPE_FLOAT;
+    }
+    return TYPE_INT;
+}
+
+static bool asm_call_param_is_array(const char *name, FunctionSymbol *meta, int index) {
+    if (meta != NULL && index < meta->params.count) {
+        return meta->params.items[index]->is_array;
+    }
+    return (strcmp(name, "getarray") == 0 && index == 0) ||
+           (strcmp(name, "getfarray") == 0 && index == 0) ||
+           (strcmp(name, "putarray") == 0 && index == 1) ||
+           (strcmp(name, "putfarray") == 0 && index == 1);
+}
+
 static void asm_gen_float_to_freg(AsmGen *gen, Expr *expr, const char *freg) {
     TypeSpec type = asm_expr_type(gen, expr);
     asm_gen_expr(gen, expr);
@@ -2037,8 +2070,11 @@ static void asm_call_function(AsmGen *gen, const char *name, ExprList *args, Fun
     for (int i = 0; i < count; ++i) {
         asm_gen_expr(gen, args->items[i]);
         TypeSpec arg_type = asm_expr_type(gen, args->items[i]);
-        TypeSpec param_type = (meta != NULL && i < meta->params.count) ? meta->params.items[i]->type : TYPE_INT;
-        asm_convert_a0(gen, arg_type, param_type);
+        TypeSpec param_type = asm_call_param_type(name, meta, i);
+        bool param_array = asm_call_param_is_array(name, meta, i);
+        if (!param_array && !asm_expr_is_pointer_value(gen, args->items[i])) {
+            asm_convert_a0(gen, arg_type, param_type);
+        }
         asm_push_a0(gen);
     }
     int call_area = align_to(count * 8, 16);
@@ -2049,8 +2085,8 @@ static void asm_call_function(AsmGen *gen, const char *name, ExprList *args, Fun
     int float_reg = 0;
     int stack_arg = 0;
     for (int i = 0; i < count; ++i) {
-        TypeSpec param_type = (meta != NULL && i < meta->params.count) ? meta->params.items[i]->type : TYPE_INT;
-        bool param_array = meta != NULL && i < meta->params.count && meta->params.items[i]->is_array;
+        TypeSpec param_type = asm_call_param_type(name, meta, i);
+        bool param_array = asm_call_param_is_array(name, meta, i) || asm_expr_is_pointer_value(gen, args->items[i]);
         int off = call_area + 8 + (count - 1 - i) * 16;
         if (param_type == TYPE_FLOAT && !param_array && float_reg < 8) {
             char *arg_reg = str_printf("fa%d", float_reg++);
@@ -2171,6 +2207,9 @@ static void asm_gen_expr(AsmGen *gen, Expr *expr) {
             }
             FunctionSymbol *meta = lookup_function_meta((IRGen *)gen, name);
             asm_call_function(gen, asm_function_name(gen, name), &expr->data.call.args, meta);
+            if (meta != NULL && meta->ret_type == TYPE_FLOAT) {
+                asm_emit(gen, "  fmv.x.w a0, fa0\n");
+            }
             return;
         }
         case EXPR_UNARY:
@@ -2373,6 +2412,9 @@ static void asm_gen_stmt(AsmGen *gen, Stmt *stmt) {
                 asm_gen_expr(gen, stmt->data.return_expr);
                 asm_convert_a0(gen, asm_expr_type(gen, stmt->data.return_expr), gen->current_ret_type);
             }
+            if (gen->current_ret_type == TYPE_FLOAT) {
+                asm_emit(gen, "  fmv.w.x fa0, a0\n");
+            }
             asm_emit(gen, "  j %s\n", gen->return_label);
             gen->current_block_terminated = true;
             return;
@@ -2517,6 +2559,9 @@ static void asm_gen_function(AsmGen *gen, FuncDef *func) {
     asm_gen_block(gen, func->block, false);
     if (!gen->current_block_terminated) {
         asm_load_imm(gen, "a0", 0);
+        if (gen->current_ret_type == TYPE_FLOAT) {
+            asm_emit(gen, "  fmv.w.x fa0, a0\n");
+        }
         asm_emit(gen, "  j %s\n", gen->return_label);
     }
     asm_mark_label(gen, gen->return_label);
