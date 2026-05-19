@@ -232,6 +232,8 @@ char *str_printf(const char *fmt, ...);
 int parse_int_literal(const char *text);
 int eval_const_ast_expr(Expr *expr);
 void register_const_binding(const char *name, int value);
+void parse_const_scope_push(void);
+void parse_const_scope_pop(void);
 
 void int_list_push(IntList *list, int value);
 void string_list_push(StringList *list, char *value);

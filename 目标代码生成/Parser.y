@@ -326,8 +326,16 @@ FuncFParamArrayDims
     ;
 
 Block
-    : LBRACE BlockItemList RBRACE
-        { $$ = make_block($2); }
+    : BlockBegin BlockItemList RBRACE
+        {
+            parse_const_scope_pop();
+            $$ = make_block($2);
+        }
+    ;
+
+BlockBegin
+    : LBRACE
+        { parse_const_scope_push(); }
     ;
 
 BlockItemList

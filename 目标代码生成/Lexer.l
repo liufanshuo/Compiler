@@ -43,6 +43,7 @@ STRCONR     \"([^\"\\\n]|\\.)*\"
 "return"            { return RETURNTK; }
 "getint"            { return GETINTTK; }
 "printf"            { return PRINTFTK; }
+"putf"              { return PRINTFTK; }
 
 "<="                { return LEQ; }
 ">="                { return GEQ; }
