@@ -1835,6 +1835,7 @@ typedef struct {
     StringList ir_break_labels;
     StringList ir_continue_labels;
     StrBuf data;
+    StrBuf bss;
     StrBuf text;
     StrBuf body;
     int global_id;
@@ -2843,11 +2844,12 @@ static void asm_gen_decl(AsmGen *gen, Decl *decl, bool is_global) {
                 int *flat = item->init != NULL
                                 ? const_init_to_flat_typed((IRGen *)gen, item->init, item->dims.data, item->dims.count, decl->type)
                                 : NULL;
-                sb_appendf(&gen->data, "  .globl %s\n  .align 2\n%s:\n",
-                           sym->llvm_name, sym->llvm_name);
                 if (flat == NULL) {
-                    sb_appendf(&gen->data, "  .zero %d\n", sym->info.total_slots * 4);
+                    sb_appendf(&gen->bss, "  .globl %s\n  .align 2\n%s:\n  .zero %d\n",
+                               sym->llvm_name, sym->llvm_name, sym->info.total_slots * 4);
                 } else {
+                    sb_appendf(&gen->data, "  .globl %s\n  .align 2\n%s:\n",
+                               sym->llvm_name, sym->llvm_name);
                     asm_emit_global_flat(&gen->data, flat, sym->info.total_slots);
                 }
             } else {
@@ -2925,6 +2927,7 @@ static void generate_program_asm(Program *program, FILE *out) {
     AsmGen gen;
     memset(&gen, 0, sizeof(gen));
     sb_init(&gen.data);
+    sb_init(&gen.bss);
     sb_init(&gen.text);
     sb_init(&gen.body);
     memset(g_function_buckets, 0, sizeof(g_function_buckets));
@@ -2953,6 +2956,10 @@ static void generate_program_asm(Program *program, FILE *out) {
     if (gen.data.len > 0) {
         fputs("  .data\n", out);
         fputs(gen.data.data, out);
+    }
+    if (gen.bss.len > 0) {
+        fputs("  .bss\n", out);
+        fputs(gen.bss.data, out);
     }
     fputs("  .text\n", out);
     fputs(gen.text.data ? gen.text.data : "", out);
