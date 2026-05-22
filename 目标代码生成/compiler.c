@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <ctype.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1885,13 +1886,72 @@ static bool asm_fits_imm12(int value) {
     return value >= -2048 && value <= 2047;
 }
 
+static const char *asm_temp_avoiding(const char *a, const char *b) {
+    if ((a == NULL || strcmp(a, "t6") != 0) &&
+        (b == NULL || strcmp(b, "t6") != 0)) {
+        return "t6";
+    }
+    if ((a == NULL || strcmp(a, "t5") != 0) &&
+        (b == NULL || strcmp(b, "t5") != 0)) {
+        return "t5";
+    }
+    return "t4";
+}
+
+static bool asm_abs_power_of_two(int value, int *shift, int *abs_value) {
+    if (value == 0 || value == INT_MIN) {
+        return false;
+    }
+    int v = value < 0 ? -value : value;
+    if ((v & (v - 1)) != 0) {
+        return false;
+    }
+    int s = 0;
+    while ((1 << s) != v) {
+        ++s;
+    }
+    if (shift != NULL) {
+        *shift = s;
+    }
+    if (abs_value != NULL) {
+        *abs_value = v;
+    }
+    return true;
+}
+
 static void asm_emit_add_imm(AsmGen *gen, const char *dst, const char *base, int imm) {
     if (asm_fits_imm12(imm)) {
         asm_emit(gen, "  addi %s, %s, %d\n", dst, base, imm);
         return;
     }
-    asm_emit(gen, "  li t6, %d\n", imm);
-    asm_emit(gen, "  add %s, %s, t6\n", dst, base);
+    const char *tmp = asm_temp_avoiding(dst, base);
+    asm_emit(gen, "  li %s, %d\n", tmp, imm);
+    asm_emit(gen, "  add %s, %s, %s\n", dst, base, tmp);
+}
+
+static void asm_emit_addw_imm(AsmGen *gen, const char *dst, const char *src, int imm) {
+    if (imm == 0) {
+        if (strcmp(dst, src) != 0) {
+            asm_emit(gen, "  mv %s, %s\n", dst, src);
+        }
+        return;
+    }
+    if (asm_fits_imm12(imm)) {
+        asm_emit(gen, "  addiw %s, %s, %d\n", dst, src, imm);
+        return;
+    }
+    const char *tmp = asm_temp_avoiding(dst, src);
+    asm_emit(gen, "  li %s, %d\n", tmp, imm);
+    asm_emit(gen, "  addw %s, %s, %s\n", dst, src, tmp);
+}
+
+static void asm_emit_subw_imm(AsmGen *gen, const char *dst, const char *src, int imm) {
+    if (imm != INT_MIN) {
+        asm_emit_addw_imm(gen, dst, src, -imm);
+        return;
+    }
+    asm_load_imm(gen, "t6", imm);
+    asm_emit(gen, "  subw %s, %s, t6\n", dst, src);
 }
 
 static void asm_emit_mem(AsmGen *gen, const char *op, const char *reg, int offset, const char *base) {
@@ -1899,9 +1959,10 @@ static void asm_emit_mem(AsmGen *gen, const char *op, const char *reg, int offse
         asm_emit(gen, "  %s %s, %d(%s)\n", op, reg, offset, base);
         return;
     }
-    asm_emit(gen, "  li t6, %d\n", offset);
-    asm_emit(gen, "  add t6, %s, t6\n", base);
-    asm_emit(gen, "  %s %s, 0(t6)\n", op, reg);
+    const char *tmp = asm_temp_avoiding(reg, base);
+    asm_emit(gen, "  li %s, %d\n", tmp, offset);
+    asm_emit(gen, "  add %s, %s, %s\n", tmp, base, tmp);
+    asm_emit(gen, "  %s %s, 0(%s)\n", op, reg, tmp);
 }
 
 static void sb_emit_add_imm(StrBuf *sb, const char *dst, const char *base, int imm) {
@@ -1909,8 +1970,9 @@ static void sb_emit_add_imm(StrBuf *sb, const char *dst, const char *base, int i
         sb_appendf(sb, "  addi %s, %s, %d\n", dst, base, imm);
         return;
     }
-    sb_appendf(sb, "  li t6, %d\n", imm);
-    sb_appendf(sb, "  add %s, %s, t6\n", dst, base);
+    const char *tmp = asm_temp_avoiding(dst, base);
+    sb_appendf(sb, "  li %s, %d\n", tmp, imm);
+    sb_appendf(sb, "  add %s, %s, %s\n", dst, base, tmp);
 }
 
 static void sb_emit_mem(StrBuf *sb, const char *op, const char *reg, int offset, const char *base) {
@@ -1918,9 +1980,10 @@ static void sb_emit_mem(StrBuf *sb, const char *op, const char *reg, int offset,
         sb_appendf(sb, "  %s %s, %d(%s)\n", op, reg, offset, base);
         return;
     }
-    sb_appendf(sb, "  li t6, %d\n", offset);
-    sb_appendf(sb, "  add t6, %s, t6\n", base);
-    sb_appendf(sb, "  %s %s, 0(t6)\n", op, reg);
+    const char *tmp = asm_temp_avoiding(reg, base);
+    sb_appendf(sb, "  li %s, %d\n", tmp, offset);
+    sb_appendf(sb, "  add %s, %s, %s\n", tmp, base, tmp);
+    sb_appendf(sb, "  %s %s, 0(%s)\n", op, reg, tmp);
 }
 
 static void asm_push_a0(AsmGen *gen) {
@@ -1988,10 +2051,187 @@ static void asm_emit_store(AsmGen *gen, const char *reg, int offset, const char 
     asm_emit_mem(gen, "sw", reg, offset, base);
 }
 
+static void asm_emit_and_imm(AsmGen *gen, const char *dst, const char *src, int imm) {
+    if (asm_fits_imm12(imm)) {
+        asm_emit(gen, "  andi %s, %s, %d\n", dst, src, imm);
+        return;
+    }
+    const char *tmp = asm_temp_avoiding(dst, src);
+    asm_load_imm(gen, tmp, imm);
+    asm_emit(gen, "  and %s, %s, %s\n", dst, src, tmp);
+}
+
+static bool asm_emit_mul_const(AsmGen *gen, const char *dst, const char *src, int value) {
+    int shift = 0;
+    int abs_value = 0;
+    if (value == 0) {
+        asm_load_imm(gen, dst, 0);
+        return true;
+    }
+    if (value == 1) {
+        if (strcmp(dst, src) != 0) {
+            asm_emit(gen, "  mv %s, %s\n", dst, src);
+        }
+        return true;
+    }
+    if (value == -1) {
+        asm_emit(gen, "  negw %s, %s\n", dst, src);
+        return true;
+    }
+    if (asm_abs_power_of_two(value, &shift, &abs_value)) {
+        asm_emit(gen, "  slliw %s, %s, %d\n", dst, src, shift);
+        if (value < 0) {
+            asm_emit(gen, "  negw %s, %s\n", dst, dst);
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool asm_emit_div_const(AsmGen *gen, const char *dst, const char *src, int value) {
+    int shift = 0;
+    int abs_value = 0;
+    if (value == 0) {
+        return false;
+    }
+    if (value == 1) {
+        if (strcmp(dst, src) != 0) {
+            asm_emit(gen, "  mv %s, %s\n", dst, src);
+        }
+        return true;
+    }
+    if (value == -1) {
+        asm_emit(gen, "  negw %s, %s\n", dst, src);
+        return true;
+    }
+    if (!asm_abs_power_of_two(value, &shift, &abs_value)) {
+        return false;
+    }
+    asm_emit(gen, "  sraiw t6, %s, 31\n", src);
+    asm_emit_and_imm(gen, "t6", "t6", abs_value - 1);
+    asm_emit(gen, "  addw %s, %s, t6\n", dst, src);
+    asm_emit(gen, "  sraiw %s, %s, %d\n", dst, dst, shift);
+    if (value < 0) {
+        asm_emit(gen, "  negw %s, %s\n", dst, dst);
+    }
+    return true;
+}
+
+static bool asm_emit_mod_const(AsmGen *gen, const char *dst, const char *src, int value) {
+    int shift = 0;
+    int abs_value = 0;
+    if (value == 0) {
+        return false;
+    }
+    if (value == 1 || value == -1) {
+        asm_load_imm(gen, dst, 0);
+        return true;
+    }
+    if (!asm_abs_power_of_two(value, &shift, &abs_value)) {
+        return false;
+    }
+    asm_emit(gen, "  sraiw t6, %s, 31\n", src);
+    asm_emit_and_imm(gen, "t6", "t6", abs_value - 1);
+    asm_emit(gen, "  addw t6, %s, t6\n", src);
+    asm_emit(gen, "  sraiw t6, t6, %d\n", shift);
+    asm_emit(gen, "  slliw t6, t6, %d\n", shift);
+    asm_emit(gen, "  subw %s, %s, t6\n", dst, src);
+    return true;
+}
+
 static void asm_scale_index(AsmGen *gen, int stride) {
     if (stride != 1) {
-        asm_emit(gen, "  li t0, %d\n", stride);
-        asm_emit(gen, "  mul a0, a0, t0\n");
+        int shift = 0;
+        int abs_value = 0;
+        if (asm_abs_power_of_two(stride, &shift, &abs_value) && stride > 0) {
+            asm_emit(gen, "  slli a0, a0, %d\n", shift);
+        } else {
+            asm_emit(gen, "  li t0, %d\n", stride);
+            asm_emit(gen, "  mul a0, a0, t0\n");
+        }
+    }
+}
+
+static bool asm_eval_int_const_expr(AsmGen *gen, Expr *expr, int *out) {
+    if (expr == NULL) {
+        *out = 0;
+        return true;
+    }
+    switch (expr->kind) {
+        case EXPR_NUMBER:
+            *out = expr->data.number;
+            return true;
+        case EXPR_LVAL: {
+            LVal *lval = expr->data.lval;
+            Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
+            if (sym != NULL && sym->is_const_scalar && lval->indices.count == 0 &&
+                sym->value_type == TYPE_INT) {
+                *out = sym->const_scalar;
+                return true;
+            }
+            return false;
+        }
+        case EXPR_UNARY: {
+            int value = 0;
+            if (!asm_eval_int_const_expr(gen, expr->data.unary.operand, &value)) {
+                return false;
+            }
+            switch (expr->data.unary.op) {
+                case UNARY_PLUS: *out = value; return true;
+                case UNARY_MINUS: *out = -value; return true;
+                case UNARY_NOT: *out = !value; return true;
+            }
+            return false;
+        }
+        case EXPR_BINARY: {
+            BinaryOp op = expr->data.binary.op;
+            int lhs = 0;
+            int rhs = 0;
+            if (!asm_eval_int_const_expr(gen, expr->data.binary.lhs, &lhs)) {
+                return false;
+            }
+            if (op == BIN_AND) {
+                if (!lhs) {
+                    *out = 0;
+                    return true;
+                }
+                return asm_eval_int_const_expr(gen, expr->data.binary.rhs, &rhs) &&
+                       (*out = (rhs != 0), true);
+            }
+            if (op == BIN_OR) {
+                if (lhs) {
+                    *out = 1;
+                    return true;
+                }
+                return asm_eval_int_const_expr(gen, expr->data.binary.rhs, &rhs) &&
+                       (*out = (rhs != 0), true);
+            }
+            if (!asm_eval_int_const_expr(gen, expr->data.binary.rhs, &rhs)) {
+                return false;
+            }
+            if ((op == BIN_DIV || op == BIN_MOD) && rhs == 0) {
+                return false;
+            }
+            switch (op) {
+                case BIN_ADD: *out = lhs + rhs; return true;
+                case BIN_SUB: *out = lhs - rhs; return true;
+                case BIN_MUL: *out = lhs * rhs; return true;
+                case BIN_DIV: *out = lhs / rhs; return true;
+                case BIN_MOD: *out = lhs % rhs; return true;
+                case BIN_LT: *out = lhs < rhs; return true;
+                case BIN_GT: *out = lhs > rhs; return true;
+                case BIN_LE: *out = lhs <= rhs; return true;
+                case BIN_GE: *out = lhs >= rhs; return true;
+                case BIN_EQ: *out = lhs == rhs; return true;
+                case BIN_NE: *out = lhs != rhs; return true;
+                case BIN_AND:
+                case BIN_OR:
+                    return false;
+            }
+            return false;
+        }
+        default:
+            return false;
     }
 }
 
@@ -2007,18 +2247,24 @@ static AsmValue asm_lval_address(AsmGen *gen, LVal *lval) {
         asm_load_symbol_addr(gen, sym, "t1");
     }
     for (int i = 0; i < lval->indices.count; ++i) {
-        asm_push_a0(gen);
-        asm_emit(gen, "  mv a0, t1\n");
-        asm_push_a0(gen);
-        asm_gen_expr(gen, lval->indices.items[i]);
         int stride = sym->info.is_param_array
                          ? product_dims(sym->info.dims, i, sym->info.dim_count)
                          : product_dims(sym->info.dims, i + 1, sym->info.dim_count);
-        asm_scale_index(gen, stride * 4);
-        asm_emit(gen, "  mv t0, a0\n");
-        asm_pop_to(gen, "t1");
-        asm_pop_to(gen, "a0");
-        asm_emit(gen, "  add t1, t1, t0\n");
+        int index_value = 0;
+        if (asm_eval_int_const_expr(gen, lval->indices.items[i], &index_value)) {
+            int offset = index_value * stride * 4;
+            if (offset != 0) {
+                asm_emit_add_imm(gen, "t1", "t1", offset);
+            }
+        } else {
+            asm_emit(gen, "  mv a0, t1\n");
+            asm_push_a0(gen);
+            asm_gen_expr(gen, lval->indices.items[i]);
+            asm_scale_index(gen, stride * 4);
+            asm_emit(gen, "  mv t0, a0\n");
+            asm_pop_to(gen, "t1");
+            asm_emit(gen, "  add t1, t1, t0\n");
+        }
     }
     asm_emit(gen, "  mv a0, t1\n");
     int remain = (sym->info.is_param_array ? sym->info.dim_count + 1 : sym->info.dim_count)
@@ -2459,9 +2705,152 @@ static bool asm_try_inline_call(AsmGen *gen, FunctionSymbol *meta, ExprList *arg
     return true;
 }
 
+static void asm_emit_compare_const_rhs(AsmGen *gen, BinaryOp op, int rhs) {
+    switch (op) {
+        case BIN_LT:
+            if (asm_fits_imm12(rhs)) {
+                asm_emit(gen, "  slti a0, a0, %d\n", rhs);
+            } else {
+                asm_load_imm(gen, "t1", rhs);
+                asm_emit(gen, "  slt a0, a0, t1\n");
+            }
+            return;
+        case BIN_GT:
+            asm_load_imm(gen, "t1", rhs);
+            asm_emit(gen, "  slt a0, t1, a0\n");
+            return;
+        case BIN_LE:
+            asm_load_imm(gen, "t1", rhs);
+            asm_emit(gen, "  slt a0, t1, a0\n");
+            asm_emit(gen, "  xori a0, a0, 1\n");
+            return;
+        case BIN_GE:
+            if (asm_fits_imm12(rhs)) {
+                asm_emit(gen, "  slti a0, a0, %d\n", rhs);
+            } else {
+                asm_load_imm(gen, "t1", rhs);
+                asm_emit(gen, "  slt a0, a0, t1\n");
+            }
+            asm_emit(gen, "  xori a0, a0, 1\n");
+            return;
+        case BIN_EQ:
+            if (rhs == 0) {
+                asm_emit(gen, "  seqz a0, a0\n");
+            } else {
+                asm_emit_subw_imm(gen, "a0", "a0", rhs);
+                asm_emit(gen, "  seqz a0, a0\n");
+            }
+            return;
+        case BIN_NE:
+            if (rhs == 0) {
+                asm_emit(gen, "  snez a0, a0\n");
+            } else {
+                asm_emit_subw_imm(gen, "a0", "a0", rhs);
+                asm_emit(gen, "  snez a0, a0\n");
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+static bool asm_try_gen_binary_const_rhs(AsmGen *gen, BinaryOp op, Expr *lhs, int rhs) {
+    if ((op == BIN_DIV || op == BIN_MOD) && rhs == 0) {
+        return false;
+    }
+    switch (op) {
+        case BIN_ADD:
+            asm_gen_expr(gen, lhs);
+            asm_emit_addw_imm(gen, "a0", "a0", rhs);
+            return true;
+        case BIN_SUB:
+            asm_gen_expr(gen, lhs);
+            asm_emit_subw_imm(gen, "a0", "a0", rhs);
+            return true;
+        case BIN_MUL:
+            asm_gen_expr(gen, lhs);
+            if (!asm_emit_mul_const(gen, "a0", "a0", rhs)) {
+                asm_load_imm(gen, "t1", rhs);
+                asm_emit(gen, "  mulw a0, a0, t1\n");
+            }
+            return true;
+        case BIN_DIV:
+            asm_gen_expr(gen, lhs);
+            if (!asm_emit_div_const(gen, "a0", "a0", rhs)) {
+                asm_load_imm(gen, "t1", rhs);
+                asm_emit(gen, "  divw a0, a0, t1\n");
+            }
+            return true;
+        case BIN_MOD:
+            asm_gen_expr(gen, lhs);
+            if (!asm_emit_mod_const(gen, "a0", "a0", rhs)) {
+                asm_load_imm(gen, "t1", rhs);
+                asm_emit(gen, "  remw a0, a0, t1\n");
+            }
+            return true;
+        case BIN_LT:
+        case BIN_GT:
+        case BIN_LE:
+        case BIN_GE:
+        case BIN_EQ:
+        case BIN_NE:
+            asm_gen_expr(gen, lhs);
+            asm_emit_compare_const_rhs(gen, op, rhs);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool asm_try_gen_binary_const_lhs(AsmGen *gen, BinaryOp op, int lhs, Expr *rhs) {
+    switch (op) {
+        case BIN_ADD:
+            return asm_try_gen_binary_const_rhs(gen, BIN_ADD, rhs, lhs);
+        case BIN_MUL:
+            return asm_try_gen_binary_const_rhs(gen, BIN_MUL, rhs, lhs);
+        case BIN_SUB:
+            asm_gen_expr(gen, rhs);
+            asm_load_imm(gen, "t0", lhs);
+            asm_emit(gen, "  subw a0, t0, a0\n");
+            return true;
+        case BIN_LT:
+            asm_gen_expr(gen, rhs);
+            asm_load_imm(gen, "t0", lhs);
+            asm_emit(gen, "  slt a0, t0, a0\n");
+            return true;
+        case BIN_GT:
+            asm_gen_expr(gen, rhs);
+            asm_load_imm(gen, "t0", lhs);
+            asm_emit(gen, "  slt a0, a0, t0\n");
+            return true;
+        case BIN_LE:
+            asm_gen_expr(gen, rhs);
+            asm_load_imm(gen, "t0", lhs);
+            asm_emit(gen, "  slt a0, a0, t0\n");
+            asm_emit(gen, "  xori a0, a0, 1\n");
+            return true;
+        case BIN_GE:
+            asm_gen_expr(gen, rhs);
+            asm_load_imm(gen, "t0", lhs);
+            asm_emit(gen, "  slt a0, t0, a0\n");
+            asm_emit(gen, "  xori a0, a0, 1\n");
+            return true;
+        case BIN_EQ:
+        case BIN_NE:
+            return asm_try_gen_binary_const_rhs(gen, op, rhs, lhs);
+        default:
+            return false;
+    }
+}
+
 static void asm_gen_expr(AsmGen *gen, Expr *expr) {
     if (expr == NULL) {
         asm_load_imm(gen, "a0", 0);
+        return;
+    }
+    int const_value = 0;
+    if (asm_eval_int_const_expr(gen, expr, &const_value)) {
+        asm_load_imm(gen, "a0", const_value);
         return;
     }
     switch (expr->kind) {
@@ -2541,6 +2930,16 @@ static void asm_gen_expr(AsmGen *gen, Expr *expr) {
                  asm_expr_type(gen, expr->data.binary.rhs) == TYPE_FLOAT) &&
                 op != BIN_MOD) {
                 asm_gen_float_binary(gen, op, expr->data.binary.lhs, expr->data.binary.rhs);
+                return;
+            }
+            int rhs_const = 0;
+            if (asm_eval_int_const_expr(gen, expr->data.binary.rhs, &rhs_const) &&
+                asm_try_gen_binary_const_rhs(gen, op, expr->data.binary.lhs, rhs_const)) {
+                return;
+            }
+            int lhs_const = 0;
+            if (asm_eval_int_const_expr(gen, expr->data.binary.lhs, &lhs_const) &&
+                asm_try_gen_binary_const_lhs(gen, op, lhs_const, expr->data.binary.rhs)) {
                 return;
             }
             asm_gen_expr(gen, expr->data.binary.lhs);
