@@ -1920,6 +1920,12 @@ static bool asm_abs_power_of_two(int value, int *shift, int *abs_value) {
 }
 
 static void asm_emit_add_imm(AsmGen *gen, const char *dst, const char *base, int imm) {
+    if (imm == 0) {
+        if (strcmp(dst, base) != 0) {
+            asm_emit(gen, "  mv %s, %s\n", dst, base);
+        }
+        return;
+    }
     if (asm_fits_imm12(imm)) {
         asm_emit(gen, "  addi %s, %s, %d\n", dst, base, imm);
         return;
@@ -1966,6 +1972,12 @@ static void asm_emit_mem(AsmGen *gen, const char *op, const char *reg, int offse
 }
 
 static void sb_emit_add_imm(StrBuf *sb, const char *dst, const char *base, int imm) {
+    if (imm == 0) {
+        if (strcmp(dst, base) != 0) {
+            sb_appendf(sb, "  mv %s, %s\n", dst, base);
+        }
+        return;
+    }
     if (asm_fits_imm12(imm)) {
         sb_appendf(sb, "  addi %s, %s, %d\n", dst, base, imm);
         return;
@@ -3008,6 +3020,599 @@ static void asm_gen_cond(AsmGen *gen, Expr *expr, const char *true_label, const 
     gen->current_block_terminated = true;
 }
 
+typedef enum {
+    DAG_VALUE_CONST,
+    DAG_VALUE_VAR,
+    DAG_VALUE_UNARY,
+    DAG_VALUE_BINARY
+} AsmDagValueKind;
+
+typedef struct {
+    AsmDagValueKind kind;
+    int value;
+    Symbol *sym;
+    UnaryOp unary_op;
+    BinaryOp binary_op;
+    int lhs;
+    int rhs;
+    int slot;
+    int ref_count;
+    bool emitted;
+} AsmDagNode;
+
+typedef struct {
+    Symbol *sym;
+    int node;
+} AsmDagBinding;
+
+typedef struct {
+    AsmDagNode *nodes;
+    int node_count;
+    int node_capacity;
+    AsmDagBinding *env;
+    int env_count;
+    int env_capacity;
+    AsmDagBinding *targets;
+    int target_count;
+    int target_capacity;
+    bool has_duplicate;
+    bool has_overwrite;
+    bool has_const_fold;
+    bool has_const_propagation;
+} AsmDagBlock;
+
+static bool asm_dag_binary_commutative(BinaryOp op) {
+    return op == BIN_ADD || op == BIN_MUL || op == BIN_EQ || op == BIN_NE;
+}
+
+static bool asm_dag_eval_binary(BinaryOp op, int lhs, int rhs, int *out) {
+    if ((op == BIN_DIV || op == BIN_MOD) && rhs == 0) {
+        return false;
+    }
+    switch (op) {
+        case BIN_ADD: *out = lhs + rhs; return true;
+        case BIN_SUB: *out = lhs - rhs; return true;
+        case BIN_MUL: *out = lhs * rhs; return true;
+        case BIN_DIV: *out = lhs / rhs; return true;
+        case BIN_MOD: *out = lhs % rhs; return true;
+        case BIN_LT: *out = lhs < rhs; return true;
+        case BIN_GT: *out = lhs > rhs; return true;
+        case BIN_LE: *out = lhs <= rhs; return true;
+        case BIN_GE: *out = lhs >= rhs; return true;
+        case BIN_EQ: *out = lhs == rhs; return true;
+        case BIN_NE: *out = lhs != rhs; return true;
+        case BIN_AND:
+        case BIN_OR:
+            return false;
+    }
+    return false;
+}
+
+static bool asm_dag_symbol_is_local_int_scalar(Symbol *sym) {
+    return sym != NULL && !sym->is_global && !sym->info.is_param_array &&
+           sym->value_type == TYPE_INT && sym->info.dim_count == 0;
+}
+
+static Symbol *asm_dag_lval_local_int_scalar(AsmGen *gen, LVal *lval) {
+    if (lval == NULL || lval->indices.count != 0) {
+        return NULL;
+    }
+    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
+    return asm_dag_symbol_is_local_int_scalar(sym) ? sym : NULL;
+}
+
+static bool asm_dag_expr_supported(AsmGen *gen, Expr *expr) {
+    if (expr == NULL) {
+        return true;
+    }
+    if (asm_expr_type(gen, expr) != TYPE_INT) {
+        return false;
+    }
+    switch (expr->kind) {
+        case EXPR_NUMBER:
+            return true;
+        case EXPR_LVAL: {
+            Symbol *sym = lookup_symbol((IRGen *)gen, expr->data.lval->name);
+            if (sym != NULL && sym->is_const_scalar && expr->data.lval->indices.count == 0 &&
+                sym->value_type == TYPE_INT) {
+                return true;
+            }
+            return asm_dag_lval_local_int_scalar(gen, expr->data.lval) != NULL;
+        }
+        case EXPR_UNARY:
+            return asm_dag_expr_supported(gen, expr->data.unary.operand);
+        case EXPR_BINARY:
+            if (expr->data.binary.op == BIN_AND || expr->data.binary.op == BIN_OR) {
+                return false;
+            }
+            return asm_dag_expr_supported(gen, expr->data.binary.lhs) &&
+                   asm_dag_expr_supported(gen, expr->data.binary.rhs);
+        default:
+            return false;
+    }
+}
+
+static bool asm_dag_stmt_supported(AsmGen *gen, Stmt *stmt) {
+    if (stmt == NULL || stmt->kind != STMT_ASSIGN) {
+        return false;
+    }
+    if (asm_dag_lval_local_int_scalar(gen, stmt->data.assign_stmt.lval) == NULL) {
+        return false;
+    }
+    return asm_dag_expr_supported(gen, stmt->data.assign_stmt.expr);
+}
+
+static int asm_dag_find_binding(AsmDagBinding *items, int count, Symbol *sym) {
+    for (int i = 0; i < count; ++i) {
+        if (items[i].sym == sym) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void asm_dag_set_binding(AsmDagBinding **items, int *count, int *capacity,
+                                Symbol *sym, int node, bool *overwritten) {
+    int index = asm_dag_find_binding(*items, *count, sym);
+    if (index >= 0) {
+        (*items)[index].node = node;
+        if (overwritten != NULL) {
+            *overwritten = true;
+        }
+        return;
+    }
+    ensure_capacity((void **)items, capacity, sizeof(AsmDagBinding), *count + 1);
+    (*items)[*count].sym = sym;
+    (*items)[*count].node = node;
+    ++(*count);
+}
+
+static void asm_dag_init(AsmDagBlock *dag) {
+    memset(dag, 0, sizeof(*dag));
+}
+
+static void asm_dag_free(AsmDagBlock *dag) {
+    free(dag->nodes);
+    free(dag->env);
+    free(dag->targets);
+}
+
+static int asm_dag_add_node(AsmDagBlock *dag, AsmDagNode node) {
+    ensure_capacity((void **)&dag->nodes, &dag->node_capacity, sizeof(AsmDagNode), dag->node_count + 1);
+    dag->nodes[dag->node_count] = node;
+    return dag->node_count++;
+}
+
+static int asm_dag_node_const(AsmDagBlock *dag, int value) {
+    for (int i = 0; i < dag->node_count; ++i) {
+        if (dag->nodes[i].kind == DAG_VALUE_CONST && dag->nodes[i].value == value) {
+            return i;
+        }
+    }
+    AsmDagNode node;
+    memset(&node, 0, sizeof(node));
+    node.kind = DAG_VALUE_CONST;
+    node.value = value;
+    node.slot = INT_MIN;
+    return asm_dag_add_node(dag, node);
+}
+
+static int asm_dag_node_var(AsmDagBlock *dag, Symbol *sym) {
+    for (int i = 0; i < dag->node_count; ++i) {
+        if (dag->nodes[i].kind == DAG_VALUE_VAR && dag->nodes[i].sym == sym) {
+            return i;
+        }
+    }
+    AsmDagNode node;
+    memset(&node, 0, sizeof(node));
+    node.kind = DAG_VALUE_VAR;
+    node.sym = sym;
+    node.slot = INT_MIN;
+    return asm_dag_add_node(dag, node);
+}
+
+static int asm_dag_node_unary(AsmDagBlock *dag, UnaryOp op, int child) {
+    AsmDagNode *c = &dag->nodes[child];
+    if (op == UNARY_PLUS) {
+        if (c->kind == DAG_VALUE_CONST) {
+            dag->has_const_fold = true;
+        }
+        return child;
+    }
+    if (c->kind == DAG_VALUE_CONST) {
+        dag->has_const_fold = true;
+        return asm_dag_node_const(dag, op == UNARY_MINUS ? -c->value : !c->value);
+    }
+    for (int i = 0; i < dag->node_count; ++i) {
+        if (dag->nodes[i].kind == DAG_VALUE_UNARY &&
+            dag->nodes[i].unary_op == op && dag->nodes[i].lhs == child) {
+            dag->has_duplicate = true;
+            return i;
+        }
+    }
+    AsmDagNode node;
+    memset(&node, 0, sizeof(node));
+    node.kind = DAG_VALUE_UNARY;
+    node.unary_op = op;
+    node.lhs = child;
+    node.slot = INT_MIN;
+    return asm_dag_add_node(dag, node);
+}
+
+static int asm_dag_node_binary(AsmDagBlock *dag, BinaryOp op, int lhs, int rhs) {
+    AsmDagNode *l = &dag->nodes[lhs];
+    AsmDagNode *r = &dag->nodes[rhs];
+    int folded = 0;
+    if (l->kind == DAG_VALUE_CONST && r->kind == DAG_VALUE_CONST &&
+        asm_dag_eval_binary(op, l->value, r->value, &folded)) {
+        dag->has_const_fold = true;
+        return asm_dag_node_const(dag, folded);
+    }
+    if (asm_dag_binary_commutative(op) && rhs < lhs) {
+        int tmp = lhs;
+        lhs = rhs;
+        rhs = tmp;
+        l = &dag->nodes[lhs];
+        r = &dag->nodes[rhs];
+    }
+    if (op == BIN_ADD && r->kind == DAG_VALUE_CONST && r->value == 0) {
+        dag->has_const_fold = true;
+        return lhs;
+    }
+    if (op == BIN_ADD && l->kind == DAG_VALUE_CONST && l->value == 0) {
+        dag->has_const_fold = true;
+        return rhs;
+    }
+    if (op == BIN_SUB && r->kind == DAG_VALUE_CONST && r->value == 0) {
+        dag->has_const_fold = true;
+        return lhs;
+    }
+    if (op == BIN_MUL && r->kind == DAG_VALUE_CONST && r->value == 1) {
+        dag->has_const_fold = true;
+        return lhs;
+    }
+    if (op == BIN_MUL && l->kind == DAG_VALUE_CONST && l->value == 1) {
+        dag->has_const_fold = true;
+        return rhs;
+    }
+    if (op == BIN_MUL &&
+        ((r->kind == DAG_VALUE_CONST && r->value == 0) ||
+         (l->kind == DAG_VALUE_CONST && l->value == 0))) {
+        dag->has_const_fold = true;
+        return asm_dag_node_const(dag, 0);
+    }
+    if (op == BIN_DIV && r->kind == DAG_VALUE_CONST && r->value == 1) {
+        dag->has_const_fold = true;
+        return lhs;
+    }
+    if (op == BIN_MOD && r->kind == DAG_VALUE_CONST && (r->value == 1 || r->value == -1)) {
+        dag->has_const_fold = true;
+        return asm_dag_node_const(dag, 0);
+    }
+    if (lhs == rhs) {
+        if (op == BIN_EQ || op == BIN_LE || op == BIN_GE) {
+            dag->has_const_fold = true;
+            return asm_dag_node_const(dag, 1);
+        }
+        if (op == BIN_NE || op == BIN_LT || op == BIN_GT || op == BIN_SUB) {
+            dag->has_const_fold = true;
+            return asm_dag_node_const(dag, 0);
+        }
+    }
+    for (int i = 0; i < dag->node_count; ++i) {
+        if (dag->nodes[i].kind == DAG_VALUE_BINARY &&
+            dag->nodes[i].binary_op == op && dag->nodes[i].lhs == lhs && dag->nodes[i].rhs == rhs) {
+            dag->has_duplicate = true;
+            return i;
+        }
+    }
+    AsmDagNode node;
+    memset(&node, 0, sizeof(node));
+    node.kind = DAG_VALUE_BINARY;
+    node.binary_op = op;
+    node.lhs = lhs;
+    node.rhs = rhs;
+    node.slot = INT_MIN;
+    return asm_dag_add_node(dag, node);
+}
+
+static int asm_dag_build_expr(AsmGen *gen, AsmDagBlock *dag, Expr *expr) {
+    if (expr == NULL) {
+        return asm_dag_node_const(dag, 0);
+    }
+    switch (expr->kind) {
+        case EXPR_NUMBER:
+            return asm_dag_node_const(dag, expr->data.number);
+        case EXPR_LVAL: {
+            Symbol *sym = lookup_symbol((IRGen *)gen, expr->data.lval->name);
+            if (sym != NULL && sym->is_const_scalar && expr->data.lval->indices.count == 0 &&
+                sym->value_type == TYPE_INT) {
+                return asm_dag_node_const(dag, sym->const_scalar);
+            }
+            int index = asm_dag_find_binding(dag->env, dag->env_count, sym);
+            if (index >= 0) {
+                if (dag->nodes[dag->env[index].node].kind == DAG_VALUE_CONST) {
+                    dag->has_const_propagation = true;
+                }
+                return dag->env[index].node;
+            }
+            return asm_dag_node_var(dag, sym);
+        }
+        case EXPR_UNARY:
+            return asm_dag_node_unary(dag, expr->data.unary.op,
+                                      asm_dag_build_expr(gen, dag, expr->data.unary.operand));
+        case EXPR_BINARY:
+            return asm_dag_node_binary(dag, expr->data.binary.op,
+                                       asm_dag_build_expr(gen, dag, expr->data.binary.lhs),
+                                       asm_dag_build_expr(gen, dag, expr->data.binary.rhs));
+        default:
+            return asm_dag_node_const(dag, 0);
+    }
+}
+
+static void asm_dag_add_stmt(AsmGen *gen, AsmDagBlock *dag, Stmt *stmt) {
+    Symbol *target = asm_dag_lval_local_int_scalar(gen, stmt->data.assign_stmt.lval);
+    int node = asm_dag_build_expr(gen, dag, stmt->data.assign_stmt.expr);
+    asm_dag_set_binding(&dag->env, &dag->env_count, &dag->env_capacity,
+                        target, node, NULL);
+    asm_dag_set_binding(&dag->targets, &dag->target_count, &dag->target_capacity,
+                        target, node, &dag->has_overwrite);
+}
+
+static void asm_dag_count_node_refs(AsmDagBlock *dag) {
+    for (int i = 0; i < dag->node_count; ++i) {
+        dag->nodes[i].ref_count = 0;
+    }
+    for (int i = 0; i < dag->target_count; ++i) {
+        dag->nodes[dag->targets[i].node].ref_count++;
+    }
+    for (int i = 0; i < dag->node_count; ++i) {
+        AsmDagNode *node = &dag->nodes[i];
+        if (node->kind == DAG_VALUE_UNARY) {
+            dag->nodes[node->lhs].ref_count++;
+        } else if (node->kind == DAG_VALUE_BINARY) {
+            dag->nodes[node->lhs].ref_count++;
+            dag->nodes[node->rhs].ref_count++;
+        }
+    }
+}
+
+static bool asm_dag_node_depends_on_var(AsmDagBlock *dag, int id, Symbol *sym) {
+    AsmDagNode *node = &dag->nodes[id];
+    switch (node->kind) {
+        case DAG_VALUE_VAR:
+            return node->sym == sym;
+        case DAG_VALUE_UNARY:
+            return asm_dag_node_depends_on_var(dag, node->lhs, sym);
+        case DAG_VALUE_BINARY:
+            return asm_dag_node_depends_on_var(dag, node->lhs, sym) ||
+                   asm_dag_node_depends_on_var(dag, node->rhs, sym);
+        default:
+            return false;
+    }
+}
+
+static bool asm_dag_can_store_direct(AsmDagBlock *dag) {
+    if (dag->has_overwrite) {
+        return false;
+    }
+    for (int i = 0; i < dag->target_count; ++i) {
+        Symbol *target = dag->targets[i].sym;
+        for (int j = i + 1; j < dag->target_count; ++j) {
+            if (asm_dag_node_depends_on_var(dag, dag->targets[j].node, target)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void asm_dag_emit_node(AsmGen *gen, AsmDagBlock *dag, int id);
+
+static bool asm_dag_emit_binary_const_rhs(AsmGen *gen, AsmDagBlock *dag,
+                                          BinaryOp op, int lhs, int rhs) {
+    if ((op == BIN_DIV || op == BIN_MOD) && rhs == 0) {
+        return false;
+    }
+    switch (op) {
+        case BIN_ADD:
+            asm_dag_emit_node(gen, dag, lhs);
+            asm_emit_addw_imm(gen, "a0", "a0", rhs);
+            return true;
+        case BIN_SUB:
+            asm_dag_emit_node(gen, dag, lhs);
+            asm_emit_subw_imm(gen, "a0", "a0", rhs);
+            return true;
+        case BIN_MUL:
+            asm_dag_emit_node(gen, dag, lhs);
+            if (!asm_emit_mul_const(gen, "a0", "a0", rhs)) {
+                asm_load_imm(gen, "t1", rhs);
+                asm_emit(gen, "  mulw a0, a0, t1\n");
+            }
+            return true;
+        case BIN_DIV:
+            asm_dag_emit_node(gen, dag, lhs);
+            if (!asm_emit_div_const(gen, "a0", "a0", rhs)) {
+                asm_load_imm(gen, "t1", rhs);
+                asm_emit(gen, "  divw a0, a0, t1\n");
+            }
+            return true;
+        case BIN_MOD:
+            asm_dag_emit_node(gen, dag, lhs);
+            if (!asm_emit_mod_const(gen, "a0", "a0", rhs)) {
+                asm_load_imm(gen, "t1", rhs);
+                asm_emit(gen, "  remw a0, a0, t1\n");
+            }
+            return true;
+        case BIN_LT:
+        case BIN_GT:
+        case BIN_LE:
+        case BIN_GE:
+        case BIN_EQ:
+        case BIN_NE:
+            asm_dag_emit_node(gen, dag, lhs);
+            asm_emit_compare_const_rhs(gen, op, rhs);
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool asm_dag_emit_binary_const_lhs(AsmGen *gen, AsmDagBlock *dag,
+                                          BinaryOp op, int lhs, int rhs) {
+    switch (op) {
+        case BIN_ADD:
+            return asm_dag_emit_binary_const_rhs(gen, dag, BIN_ADD, rhs, lhs);
+        case BIN_MUL:
+            return asm_dag_emit_binary_const_rhs(gen, dag, BIN_MUL, rhs, lhs);
+        case BIN_SUB:
+            asm_dag_emit_node(gen, dag, rhs);
+            asm_load_imm(gen, "t0", lhs);
+            asm_emit(gen, "  subw a0, t0, a0\n");
+            return true;
+        case BIN_LT:
+            asm_dag_emit_node(gen, dag, rhs);
+            asm_load_imm(gen, "t0", lhs);
+            asm_emit(gen, "  slt a0, t0, a0\n");
+            return true;
+        case BIN_GT:
+            asm_dag_emit_node(gen, dag, rhs);
+            asm_load_imm(gen, "t0", lhs);
+            asm_emit(gen, "  slt a0, a0, t0\n");
+            return true;
+        case BIN_LE:
+            asm_dag_emit_node(gen, dag, rhs);
+            asm_load_imm(gen, "t0", lhs);
+            asm_emit(gen, "  slt a0, a0, t0\n");
+            asm_emit(gen, "  xori a0, a0, 1\n");
+            return true;
+        case BIN_GE:
+            asm_dag_emit_node(gen, dag, rhs);
+            asm_load_imm(gen, "t0", lhs);
+            asm_emit(gen, "  slt a0, t0, a0\n");
+            asm_emit(gen, "  xori a0, a0, 1\n");
+            return true;
+        case BIN_EQ:
+        case BIN_NE:
+            return asm_dag_emit_binary_const_rhs(gen, dag, op, rhs, lhs);
+        default:
+            return false;
+    }
+}
+
+static void asm_dag_emit_node(AsmGen *gen, AsmDagBlock *dag, int id) {
+    AsmDagNode *node = &dag->nodes[id];
+    if ((node->kind == DAG_VALUE_UNARY || node->kind == DAG_VALUE_BINARY) && node->emitted) {
+        asm_emit_load(gen, "a0", node->slot, "s0");
+        return;
+    }
+    switch (node->kind) {
+        case DAG_VALUE_CONST:
+            asm_load_imm(gen, "a0", node->value);
+            return;
+        case DAG_VALUE_VAR:
+            asm_emit_load(gen, "a0", node->sym->stack_offset, "s0");
+            return;
+        case DAG_VALUE_UNARY:
+            asm_dag_emit_node(gen, dag, node->lhs);
+            if (node->unary_op == UNARY_MINUS) {
+                asm_emit(gen, "  negw a0, a0\n");
+            } else if (node->unary_op == UNARY_NOT) {
+                asm_emit(gen, "  seqz a0, a0\n");
+            }
+            break;
+        case DAG_VALUE_BINARY:
+            if (dag->nodes[node->rhs].kind == DAG_VALUE_CONST &&
+                asm_dag_emit_binary_const_rhs(gen, dag, node->binary_op, node->lhs,
+                                              dag->nodes[node->rhs].value)) {
+                break;
+            }
+            if (dag->nodes[node->lhs].kind == DAG_VALUE_CONST &&
+                asm_dag_emit_binary_const_lhs(gen, dag, node->binary_op,
+                                              dag->nodes[node->lhs].value, node->rhs)) {
+                break;
+            }
+            asm_dag_emit_node(gen, dag, node->lhs);
+            asm_push_a0(gen);
+            asm_dag_emit_node(gen, dag, node->rhs);
+            asm_emit(gen, "  mv t1, a0\n");
+            asm_pop_to(gen, "t0");
+            switch (node->binary_op) {
+                case BIN_ADD: asm_emit(gen, "  addw a0, t0, t1\n"); break;
+                case BIN_SUB: asm_emit(gen, "  subw a0, t0, t1\n"); break;
+                case BIN_MUL: asm_emit(gen, "  mulw a0, t0, t1\n"); break;
+                case BIN_DIV: asm_emit(gen, "  divw a0, t0, t1\n"); break;
+                case BIN_MOD: asm_emit(gen, "  remw a0, t0, t1\n"); break;
+                case BIN_LT: asm_emit(gen, "  slt a0, t0, t1\n"); break;
+                case BIN_GT: asm_emit(gen, "  slt a0, t1, t0\n"); break;
+                case BIN_LE:
+                    asm_emit(gen, "  slt a0, t1, t0\n");
+                    asm_emit(gen, "  xori a0, a0, 1\n");
+                    break;
+                case BIN_GE:
+                    asm_emit(gen, "  slt a0, t0, t1\n");
+                    asm_emit(gen, "  xori a0, a0, 1\n");
+                    break;
+                case BIN_EQ:
+                    asm_emit(gen, "  subw a0, t0, t1\n");
+                    asm_emit(gen, "  seqz a0, a0\n");
+                    break;
+                case BIN_NE:
+                    asm_emit(gen, "  subw a0, t0, t1\n");
+                    asm_emit(gen, "  snez a0, a0\n");
+                    break;
+                default:
+                    asm_load_imm(gen, "a0", 0);
+                    break;
+            }
+            break;
+    }
+    if (node->ref_count > 1) {
+        if (node->slot == INT_MIN) {
+            node->slot = asm_alloc_stack(gen, 4);
+        }
+        asm_emit_store(gen, "a0", node->slot, "s0");
+        node->emitted = true;
+    }
+}
+
+static bool asm_try_gen_dag_block(AsmGen *gen, Stmt **stmts, int count) {
+    if (count < 2) {
+        return false;
+    }
+    AsmDagBlock dag;
+    asm_dag_init(&dag);
+    for (int i = 0; i < count; ++i) {
+        asm_dag_add_stmt(gen, &dag, stmts[i]);
+    }
+    if (!dag.has_duplicate && !dag.has_const_fold && !dag.has_const_propagation) {
+        asm_dag_free(&dag);
+        return false;
+    }
+    asm_dag_count_node_refs(&dag);
+    if (asm_dag_can_store_direct(&dag)) {
+        for (int i = 0; i < dag.target_count; ++i) {
+            asm_dag_emit_node(gen, &dag, dag.targets[i].node);
+            asm_emit_store(gen, "a0", dag.targets[i].sym->stack_offset, "s0");
+        }
+        asm_dag_free(&dag);
+        return true;
+    }
+    int *result_slots = (int *)xmalloc(sizeof(int) * (size_t)dag.target_count);
+    for (int i = 0; i < dag.target_count; ++i) {
+        asm_dag_emit_node(gen, &dag, dag.targets[i].node);
+        result_slots[i] = asm_alloc_stack(gen, 4);
+        asm_emit_store(gen, "a0", result_slots[i], "s0");
+    }
+    for (int i = 0; i < dag.target_count; ++i) {
+        asm_emit_load(gen, "a0", result_slots[i], "s0");
+        asm_emit_store(gen, "a0", dag.targets[i].sym->stack_offset, "s0");
+    }
+    free(result_slots);
+    asm_dag_free(&dag);
+    return true;
+}
+
 static void asm_gen_decl(AsmGen *gen, Decl *decl, bool is_global);
 static void asm_gen_stmt(AsmGen *gen, Stmt *stmt);
 
@@ -3015,11 +3620,35 @@ static void asm_gen_block(AsmGen *gen, Block *block, bool new_scope) {
     if (new_scope) {
         push_scope((IRGen *)gen);
     }
-    for (int i = 0; i < block->items.count; ++i) {
+    for (int i = 0; i < block->items.count;) {
         if (block->items.kinds[i] == BLOCK_ITEM_DECL) {
             asm_gen_decl(gen, (Decl *)block->items.items[i], false);
+            ++i;
         } else {
-            asm_gen_stmt(gen, (Stmt *)block->items.items[i]);
+            Stmt *stmt = (Stmt *)block->items.items[i];
+            if (asm_dag_stmt_supported(gen, stmt)) {
+                int start = i;
+                while (i < block->items.count && block->items.kinds[i] == BLOCK_ITEM_STMT &&
+                       asm_dag_stmt_supported(gen, (Stmt *)block->items.items[i])) {
+                    ++i;
+                }
+                int count = i - start;
+                Stmt **stmts = (Stmt **)xmalloc(sizeof(Stmt *) * (size_t)count);
+                for (int j = 0; j < count; ++j) {
+                    stmts[j] = (Stmt *)block->items.items[start + j];
+                }
+                if (asm_try_gen_dag_block(gen, stmts, count)) {
+                    free(stmts);
+                    continue;
+                }
+                free(stmts);
+                for (int j = start; j < i; ++j) {
+                    asm_gen_stmt(gen, (Stmt *)block->items.items[j]);
+                }
+                continue;
+            }
+            asm_gen_stmt(gen, stmt);
+            ++i;
         }
     }
     if (new_scope) {
