@@ -2526,22 +2526,17 @@ static void asm_store_incoming_param(AsmGen *gen, Param *param, Symbol *sym,
 }
 
 static AsmValue asm_gen_short_circuit_expr(AsmGen *gen, Expr *expr) {
-    int slot = asm_alloc_stack(gen, 4);
     char *true_label = asm_new_label(gen, "logic_true");
     char *false_label = asm_new_label(gen, "logic_false");
     char *end_label = asm_new_label(gen, "logic_end");
-    asm_emit_store(gen, "zero", slot, "s0");
     asm_gen_cond(gen, expr, true_label, false_label);
     asm_mark_label(gen, true_label);
-    asm_emit(gen, "  li t0, 1\n");
-    asm_emit_store(gen, "t0", slot, "s0");
+    asm_load_imm(gen, "a0", 1);
     asm_emit(gen, "  j %s\n", end_label);
     gen->current_block_terminated = true;
     asm_mark_label(gen, false_label);
-    asm_emit(gen, "  j %s\n", end_label);
-    gen->current_block_terminated = true;
+    asm_load_imm(gen, "a0", 0);
     asm_mark_label(gen, end_label);
-    asm_emit_load(gen, "a0", slot, "s0");
     return asm_make_value(0, NULL, false, false);
 }
 
@@ -2980,6 +2975,12 @@ static void asm_gen_expr(AsmGen *gen, Expr *expr) {
 }
 
 static void asm_gen_cond(AsmGen *gen, Expr *expr, const char *true_label, const char *false_label) {
+    int const_value = 0;
+    if (asm_eval_int_const_expr(gen, expr, &const_value)) {
+        asm_emit(gen, "  j %s\n", const_value ? true_label : false_label);
+        gen->current_block_terminated = true;
+        return;
+    }
     if (expr->kind == EXPR_BINARY && expr->data.binary.op == BIN_OR) {
         char *mid = asm_new_label(gen, "lor_rhs");
         asm_gen_cond(gen, expr->data.binary.lhs, true_label, mid);
@@ -3114,8 +3115,6 @@ static void asm_gen_stmt(AsmGen *gen, Stmt *stmt) {
             char *cond_label = asm_new_label(gen, "while_cond");
             char *body_label = asm_new_label(gen, "while_body");
             char *end_label = asm_new_label(gen, "while_end");
-            asm_emit(gen, "  j %s\n", cond_label);
-            gen->current_block_terminated = true;
             asm_mark_label(gen, cond_label);
             string_list_push(&gen->break_labels, end_label);
             string_list_push(&gen->continue_labels, cond_label);
