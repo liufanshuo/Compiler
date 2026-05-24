@@ -3577,6 +3577,11 @@ static void asm_dag_emit_node(AsmGen *gen, AsmDagBlock *dag, int id) {
 }
 
 static bool asm_try_gen_dag_block(AsmGen *gen, Stmt **stmts, int count) {
+    (void)gen;
+    (void)stmts;
+    (void)count;
+    return false;
+#if 0
     if (count < 2) {
         return false;
     }
@@ -3611,6 +3616,7 @@ static bool asm_try_gen_dag_block(AsmGen *gen, Stmt **stmts, int count) {
     free(result_slots);
     asm_dag_free(&dag);
     return true;
+#endif
 }
 
 static void asm_gen_decl(AsmGen *gen, Decl *decl, bool is_global);
