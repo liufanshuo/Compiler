@@ -2367,6 +2367,28 @@ static bool asm_expr_is_pointer_value(AsmGen *gen, Expr *expr) {
     return lval->indices.count < sym->info.dim_count;
 }
 
+static Symbol *asm_scalar_lval_target(AsmGen *gen, LVal *lval) {
+    if (lval == NULL || lval->indices.count != 0) {
+        return NULL;
+    }
+    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
+    if (sym == NULL || sym->is_function || sym->info.is_param_array ||
+        sym->info.dim_count != 0) {
+        return NULL;
+    }
+    return sym;
+}
+
+static void asm_store_scalar_reg(AsmGen *gen, Symbol *sym, const char *reg) {
+    if (sym->is_global) {
+        const char *tmp = asm_temp_avoiding(reg, NULL);
+        asm_emit(gen, "  lla %s, %s\n", tmp, sym->llvm_name);
+        asm_emit_store(gen, reg, 0, tmp);
+    } else {
+        asm_emit_store(gen, reg, sym->stack_offset, "s0");
+    }
+}
+
 static TypeSpec asm_call_param_type(const char *name, FunctionSymbol *meta, int index) {
     if (meta != NULL && index < meta->params.count) {
         return meta->params.items[index]->type;
@@ -3707,7 +3729,15 @@ static void asm_gen_printf(AsmGen *gen, char *format, ExprList *args) {
 
 static void asm_gen_stmt(AsmGen *gen, Stmt *stmt) {
     switch (stmt->kind) {
-        case STMT_ASSIGN:
+        case STMT_ASSIGN: {
+            Symbol *scalar = asm_scalar_lval_target(gen, stmt->data.assign_stmt.lval);
+            if (scalar != NULL) {
+                asm_gen_expr(gen, stmt->data.assign_stmt.expr);
+                asm_convert_a0(gen, asm_expr_type(gen, stmt->data.assign_stmt.expr),
+                               scalar->value_type);
+                asm_store_scalar_reg(gen, scalar, "a0");
+                return;
+            }
             asm_lval_address(gen, stmt->data.assign_stmt.lval);
             asm_push_a0(gen);
             asm_gen_expr(gen, stmt->data.assign_stmt.expr);
@@ -3717,6 +3747,7 @@ static void asm_gen_stmt(AsmGen *gen, Stmt *stmt) {
             asm_pop_to(gen, "t1");
             asm_emit_store(gen, "t0", 0, "t1");
             return;
+        }
         case STMT_EXPR:
             asm_gen_expr(gen, stmt->data.expr_stmt);
             return;
