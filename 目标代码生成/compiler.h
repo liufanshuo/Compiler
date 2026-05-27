@@ -217,6 +217,317 @@ typedef struct Program {
     TopLevelList items;
 } Program;
 
+/* Forward declarations for mutually-referential IR structs. */
+typedef struct IRType IRType;
+typedef struct IRValue IRValue;
+typedef struct IRUseList IRUseList;
+typedef struct IRValueList IRValueList;
+typedef struct IRInitializer IRInitializer;
+typedef struct IRInitializerList IRInitializerList;
+typedef struct IRGlobal IRGlobal;
+typedef struct IRGlobalList IRGlobalList;
+typedef struct IRParameter IRParameter;
+typedef struct IRParameterList IRParameterList;
+typedef struct IRBasicBlock IRBasicBlock;
+typedef struct IRBasicBlockList IRBasicBlockList;
+typedef struct IRInstruction IRInstruction;
+typedef struct IRFunction IRFunction;
+typedef struct IRFunctionList IRFunctionList;
+typedef struct IRModule IRModule;
+
+typedef enum {
+    IR_TYPE_VOID,
+    IR_TYPE_I1,
+    IR_TYPE_I32,
+    IR_TYPE_FLOAT,
+    IR_TYPE_POINTER,
+    IR_TYPE_ARRAY,
+    IR_TYPE_FUNCTION
+} IRTypeKind;
+
+struct IRType {
+    IRTypeKind kind;
+    TypeSpec sysy_type;
+    union {
+        struct {
+            IRType *pointee;
+        } pointer;
+        struct {
+            int length;
+            IRType *element;
+        } array;
+        struct {
+            IRType *ret;
+            IRType **params;
+            int param_count;
+            bool is_variadic;
+        } function;
+    } data;
+};
+
+typedef enum {
+    IR_VALUE_NONE,
+    IR_VALUE_CONST_INT,
+    IR_VALUE_CONST_FLOAT,
+    IR_VALUE_CONST_ZERO,
+    IR_VALUE_LOCAL,
+    IR_VALUE_GLOBAL,
+    IR_VALUE_PARAM,
+    IR_VALUE_FUNCTION,
+    IR_VALUE_INSTRUCTION,
+    IR_VALUE_BASIC_BLOCK
+} IRValueKind;
+
+struct IRValue {
+    IRValueKind kind;
+    IRType *type;
+    TypeSpec base_type;
+    int ptr_level;
+    char *name;
+    union {
+        int int_value;
+        int float_bits;
+        IRGlobal *global;
+        IRParameter *param;
+        IRFunction *function;
+        IRInstruction *instruction;
+        IRBasicBlock *basic_block;
+    } data;
+};
+
+struct IRUseList {
+    IRValue **items;
+    int count;
+    int capacity;
+};
+
+struct IRValueList {
+    IRValue **items;
+    int count;
+    int capacity;
+};
+
+typedef enum {
+    IR_INIT_ZERO,
+    IR_INIT_INT,
+    IR_INIT_FLOAT,
+    IR_INIT_ARRAY,
+    IR_INIT_STRING
+} IRInitializerKind;
+
+struct IRInitializer {
+    IRInitializerKind kind;
+    IRType *type;
+    union {
+        int int_value;
+        int float_bits;
+        struct {
+            IRInitializer **items;
+            int count;
+            int capacity;
+        } array;
+        struct {
+            char *bytes;
+            int length;
+        } string;
+    } data;
+};
+
+struct IRInitializerList {
+    IRInitializer **items;
+    int count;
+    int capacity;
+};
+
+struct IRGlobal {
+    char *name;
+    IRType *type;
+    TypeSpec elem_type;
+    bool is_const;
+    bool is_external;
+    IRInitializer *initializer;
+    IRGlobal *next;
+};
+
+struct IRGlobalList {
+    IRGlobal **items;
+    int count;
+    int capacity;
+};
+
+struct IRParameter {
+    char *name;
+    IRType *type;
+    TypeSpec sysy_type;
+    bool is_array;
+    IntList dims;
+    IRValue value;
+};
+
+struct IRParameterList {
+    IRParameter **items;
+    int count;
+    int capacity;
+};
+
+typedef enum {
+    IR_INST_ALLOCA,
+    IR_INST_LOAD,
+    IR_INST_STORE,
+    IR_INST_ADD,
+    IR_INST_SUB,
+    IR_INST_MUL,
+    IR_INST_SDIV,
+    IR_INST_SREM,
+    IR_INST_FADD,
+    IR_INST_FSUB,
+    IR_INST_FMUL,
+    IR_INST_FDIV,
+    IR_INST_ICMP,
+    IR_INST_FCMP,
+    IR_INST_ZEXT,
+    IR_INST_SITOFP,
+    IR_INST_FPTOSI,
+    IR_INST_BR,
+    IR_INST_RET,
+    IR_INST_CALL,
+    IR_INST_GETELEMENTPTR,
+    IR_INST_BITCAST
+} IRInstructionKind;
+
+typedef enum {
+    IR_ICMP_EQ,
+    IR_ICMP_NE,
+    IR_ICMP_SLT,
+    IR_ICMP_SLE,
+    IR_ICMP_SGT,
+    IR_ICMP_SGE
+} IRIcmpPredicate;
+
+typedef enum {
+    IR_FCMP_OEQ,
+    IR_FCMP_ONE,
+    IR_FCMP_OLT,
+    IR_FCMP_OLE,
+    IR_FCMP_OGT,
+    IR_FCMP_OGE
+} IRFcmpPredicate;
+
+struct IRInstruction {
+    IRInstructionKind kind;
+    IRType *result_type;
+    IRValue result;
+    IRBasicBlock *parent;
+    IRInstruction *prev;
+    IRInstruction *next;
+    union {
+        struct {
+            IRType *allocated_type;
+            int alignment;
+        } alloca_inst;
+        struct {
+            IRValue *ptr;
+            IRType *value_type;
+            int alignment;
+        } load_inst;
+        struct {
+            IRValue *value;
+            IRValue *ptr;
+            int alignment;
+        } store_inst;
+        struct {
+            IRValue *lhs;
+            IRValue *rhs;
+        } binary_inst;
+        struct {
+            IRIcmpPredicate pred;
+            IRValue *lhs;
+            IRValue *rhs;
+        } icmp_inst;
+        struct {
+            IRFcmpPredicate pred;
+            IRValue *lhs;
+            IRValue *rhs;
+        } fcmp_inst;
+        struct {
+            IRValue *value;
+            IRType *to_type;
+        } cast_inst;
+        struct {
+            bool is_conditional;
+            IRValue *condition;
+            IRBasicBlock *true_block;
+            IRBasicBlock *false_block;
+        } br_inst;
+        struct {
+            IRValue *value;
+        } ret_inst;
+        struct {
+            IRFunction *callee;
+            IRType *ret_type;
+            IRValueList args;
+        } call_inst;
+        struct {
+            IRValue *base_ptr;
+            IRType *source_element_type;
+            IRValueList indices;
+            bool inbounds;
+        } gep_inst;
+        struct {
+            IRValue *value;
+            IRType *to_type;
+        } bitcast_inst;
+    } data;
+};
+
+struct IRBasicBlock {
+    char *name;
+    IRFunction *parent;
+    IRInstruction *first_inst;
+    IRInstruction *last_inst;
+    IRBasicBlock **preds;
+    int pred_count;
+    int pred_capacity;
+    IRBasicBlock **succs;
+    int succ_count;
+    int succ_capacity;
+    IRBasicBlock *next;
+};
+
+struct IRBasicBlockList {
+    IRBasicBlock **items;
+    int count;
+    int capacity;
+};
+
+struct IRFunction {
+    char *name;
+    IRType *type;
+    IRType *ret_type;
+    TypeSpec sysy_ret_type;
+    IRParameterList params;
+    IRBasicBlockList blocks;
+    IRBasicBlock *entry;
+    bool is_external;
+    IRFunction *next;
+};
+
+struct IRFunctionList {
+    IRFunction **items;
+    int count;
+    int capacity;
+};
+
+struct IRModule {
+    char *name;
+    IRGlobalList globals;
+    IRFunctionList functions;
+    IRType *void_type;
+    IRType *i1_type;
+    IRType *i32_type;
+    IRType *float_type;
+};
+
 enum {
     BLOCK_ITEM_DECL = 1,
     BLOCK_ITEM_STMT = 2,
@@ -273,6 +584,9 @@ TopLevelItem *make_top_decl(Decl *decl);
 TopLevelItem *make_top_func(FuncDef *func);
 Program *make_program(TopLevelList items);
 
+IRModule *ast_to_ir(Program *program);
+void emit_riscv_from_ir(IRModule *module, FILE *out);
 void generate_program_ir(Program *program, FILE *out);
+void generate_program_mid_ir(Program *program, FILE *out);
 
 #endif
