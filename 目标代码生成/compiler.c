@@ -1984,6 +1984,8 @@ struct MemSymbol {
     int *const_flat;
     IRValue *addr;
     IRType *object_type;
+    bool is_inline_value;
+    MemValue inline_value;
     MemSymbol *next;
 };
 
@@ -1998,6 +2000,7 @@ struct MemFunctionMeta {
     TypeSpec ret_type;
     ParamList params;
     bool has_sysy_params;
+    FuncDef *ast_func;
     MemFunctionMeta *next;
 };
 
@@ -2017,6 +2020,7 @@ typedef struct {
     IRBasicBlock **continue_blocks;
     int continue_count;
     int continue_capacity;
+    int inline_depth;
 } MemIRGen;
 
 static void mem_value_list_push(IRValueList *list, IRValue *value) {
@@ -2435,6 +2439,7 @@ static MemFunctionMeta *mem_add_function_meta(MemIRGen *gen, const char *name, I
     meta->ret_type = ret_type;
     meta->params = params;
     meta->has_sysy_params = has_sysy_params;
+    meta->ast_func = NULL;
     meta->next = gen->functions;
     gen->functions = meta;
     return meta;
@@ -2455,21 +2460,69 @@ static void mem_add_runtime_function(MemIRGen *gen, const char *name, TypeSpec r
     mem_add_function_meta(gen, name, function, ret_type, empty, false);
 }
 
+static Param *mem_runtime_param(TypeSpec type, bool is_array) {
+    IntList dims = {0};
+    return make_param(type, xstrdup("_"), is_array, dims);
+}
+
+static void mem_add_runtime_function_with_params(MemIRGen *gen, const char *name,
+                                                 TypeSpec ret_type, ParamList params) {
+    IRFunction *function = mem_create_function(gen, name, ret_type, params, true, true, false);
+    mem_add_function_meta(gen, name, function, ret_type, params, true);
+}
+
 static void mem_add_runtime_functions(MemIRGen *gen) {
-    mem_add_runtime_function(gen, "getint", TYPE_INT);
-    mem_add_runtime_function(gen, "getch", TYPE_INT);
-    mem_add_runtime_function(gen, "getfloat", TYPE_FLOAT);
-    mem_add_runtime_function(gen, "getarray", TYPE_INT);
-    mem_add_runtime_function(gen, "getfarray", TYPE_INT);
-    mem_add_runtime_function(gen, "putint", TYPE_VOID);
-    mem_add_runtime_function(gen, "putch", TYPE_VOID);
-    mem_add_runtime_function(gen, "putarray", TYPE_VOID);
-    mem_add_runtime_function(gen, "putfloat", TYPE_VOID);
-    mem_add_runtime_function(gen, "putfarray", TYPE_VOID);
+    ParamList empty = {0};
+    mem_add_runtime_function_with_params(gen, "getint", TYPE_INT, empty);
+    mem_add_runtime_function_with_params(gen, "getch", TYPE_INT, empty);
+    mem_add_runtime_function_with_params(gen, "getfloat", TYPE_FLOAT, empty);
+
+    ParamList getarray_params = {0};
+    param_list_push(&getarray_params, mem_runtime_param(TYPE_INT, true));
+    mem_add_runtime_function_with_params(gen, "getarray", TYPE_INT, getarray_params);
+
+    ParamList getfarray_params = {0};
+    param_list_push(&getfarray_params, mem_runtime_param(TYPE_FLOAT, true));
+    mem_add_runtime_function_with_params(gen, "getfarray", TYPE_INT, getfarray_params);
+
+    ParamList putint_params = {0};
+    param_list_push(&putint_params, mem_runtime_param(TYPE_INT, false));
+    mem_add_runtime_function_with_params(gen, "putint", TYPE_VOID, putint_params);
+
+    ParamList putch_params = {0};
+    param_list_push(&putch_params, mem_runtime_param(TYPE_INT, false));
+    mem_add_runtime_function_with_params(gen, "putch", TYPE_VOID, putch_params);
+
+    ParamList putarray_params = {0};
+    param_list_push(&putarray_params, mem_runtime_param(TYPE_INT, false));
+    param_list_push(&putarray_params, mem_runtime_param(TYPE_INT, true));
+    mem_add_runtime_function_with_params(gen, "putarray", TYPE_VOID, putarray_params);
+
+    ParamList putfloat_params = {0};
+    param_list_push(&putfloat_params, mem_runtime_param(TYPE_FLOAT, false));
+    mem_add_runtime_function_with_params(gen, "putfloat", TYPE_VOID, putfloat_params);
+
+    ParamList putfarray_params = {0};
+    param_list_push(&putfarray_params, mem_runtime_param(TYPE_INT, false));
+    param_list_push(&putfarray_params, mem_runtime_param(TYPE_FLOAT, true));
+    mem_add_runtime_function_with_params(gen, "putfarray", TYPE_VOID, putfarray_params);
+
     mem_add_runtime_function(gen, "putf", TYPE_VOID);
     mem_add_runtime_function(gen, "_sysy_starttime", TYPE_VOID);
     mem_add_runtime_function(gen, "_sysy_stoptime", TYPE_VOID);
     mem_add_runtime_function(gen, "memset", TYPE_INT);
+}
+
+static bool mem_runtime_param_is_float_scalar(const char *name, int index) {
+    return strcmp(name, "putfloat") == 0 && index == 0;
+}
+
+static bool mem_runtime_param_is_pointer(const char *name, int index) {
+    return (strcmp(name, "getarray") == 0 && index == 0) ||
+           (strcmp(name, "getfarray") == 0 && index == 0) ||
+           (strcmp(name, "putarray") == 0 && index == 1) ||
+           (strcmp(name, "putfarray") == 0 && index == 1) ||
+           (strcmp(name, "memset") == 0 && index == 0);
 }
 
 static MemValue mem_make_value(IRValue *value, TypeSpec type, int dim_count, int *dims,
@@ -2836,6 +2889,9 @@ static MemAddress mem_lval_address(MemIRGen *gen, LVal *lval) {
 
 static MemValue mem_lval_expr(MemIRGen *gen, LVal *lval) {
     MemSymbol *sym = mem_lookup_symbol(gen, lval->name);
+    if (sym != NULL && sym->is_inline_value && lval->indices.count == 0) {
+        return sym->inline_value;
+    }
     if (sym != NULL && sym->is_const_scalar && lval->indices.count == 0) {
         if (sym->value_type == TYPE_FLOAT) {
             return mem_make_value(mem_const_float(gen, sym->const_scalar), TYPE_FLOAT, 0, NULL, false, false);
@@ -2879,6 +2935,180 @@ static MemValue mem_short_circuit_value(MemIRGen *gen, Expr *expr) {
     return mem_make_value(loaded, TYPE_INT, 0, NULL, false, false);
 }
 
+static Expr *mem_simple_return_expr(FuncDef *func) {
+    if (func == NULL || func->ret_type == TYPE_VOID || func->block == NULL ||
+        func->block->items.count != 1 ||
+        func->block->items.kinds[0] != BLOCK_ITEM_STMT) {
+        return NULL;
+    }
+    Stmt *stmt = (Stmt *)func->block->items.items[0];
+    if (stmt == NULL || stmt->kind != STMT_RETURN || stmt->data.return_expr == NULL) {
+        return NULL;
+    }
+    return stmt->data.return_expr;
+}
+
+static Expr *mem_stmt_direct_return_expr(Stmt *stmt) {
+    if (stmt == NULL) {
+        return NULL;
+    }
+    if (stmt->kind == STMT_RETURN) {
+        return stmt->data.return_expr;
+    }
+    if (stmt->kind == STMT_BLOCK &&
+        stmt->data.block_stmt != NULL &&
+        stmt->data.block_stmt->items.count == 1 &&
+        stmt->data.block_stmt->items.kinds[0] == BLOCK_ITEM_STMT) {
+        return mem_stmt_direct_return_expr((Stmt *)stmt->data.block_stmt->items.items[0]);
+    }
+    return NULL;
+}
+
+static Stmt *mem_simple_if_return_stmt(FuncDef *func) {
+    if (func == NULL || func->ret_type == TYPE_VOID || func->block == NULL ||
+        func->block->items.count != 1 ||
+        func->block->items.kinds[0] != BLOCK_ITEM_STMT) {
+        return NULL;
+    }
+    Stmt *stmt = (Stmt *)func->block->items.items[0];
+    if (stmt == NULL || stmt->kind != STMT_IF || stmt->data.if_stmt.else_stmt == NULL ||
+        mem_stmt_direct_return_expr(stmt->data.if_stmt.then_stmt) == NULL ||
+        mem_stmt_direct_return_expr(stmt->data.if_stmt.else_stmt) == NULL) {
+        return NULL;
+    }
+    return stmt;
+}
+
+static bool mem_decl_has_only_scalar_items(Decl *decl) {
+    if (decl == NULL) {
+        return false;
+    }
+    for (int i = 0; i < decl->items.count; ++i) {
+        DeclItem *item = decl->items.items[i];
+        if (item == NULL || item->dims.count != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static Expr *mem_straightline_return_expr(FuncDef *func) {
+    if (func == NULL || func->ret_type == TYPE_VOID || func->block == NULL ||
+        func->block->items.count < 2 || func->block->items.count > 8) {
+        return NULL;
+    }
+    int last = func->block->items.count - 1;
+    for (int i = 0; i < last; ++i) {
+        if (func->block->items.kinds[i] != BLOCK_ITEM_DECL ||
+            !mem_decl_has_only_scalar_items((Decl *)func->block->items.items[i])) {
+            return NULL;
+        }
+    }
+    if (func->block->items.kinds[last] != BLOCK_ITEM_STMT) {
+        return NULL;
+    }
+    return mem_stmt_direct_return_expr((Stmt *)func->block->items.items[last]);
+}
+
+static bool mem_can_inline_call(MemIRGen *gen, MemFunctionMeta *meta, ExprList *args) {
+    if (gen == NULL || meta == NULL || meta->ast_func == NULL || meta->function == NULL ||
+        meta->function->is_external || meta->ret_type == TYPE_VOID ||
+        meta->ast_func == NULL || args->count != meta->params.count ||
+        gen->inline_depth >= 16) {
+        return false;
+    }
+    if (gen->current_function == meta->function) {
+        return false;
+    }
+    return mem_simple_return_expr(meta->ast_func) != NULL ||
+           mem_simple_if_return_stmt(meta->ast_func) != NULL ||
+           mem_straightline_return_expr(meta->ast_func) != NULL;
+}
+
+static MemValue mem_inline_if_return_value(MemIRGen *gen, MemFunctionMeta *meta, Stmt *stmt) {
+    IRType *ret_type = mem_scalar_type(gen->module, meta->ret_type);
+    IRValue *slot = mem_emit_alloca(gen, ret_type);
+    IRBasicBlock *then_block = mem_create_block(gen, mem_new_label(gen, "inline_then"));
+    IRBasicBlock *else_block = mem_create_block(gen, mem_new_label(gen, "inline_else"));
+    IRBasicBlock *end_block = mem_create_block(gen, mem_new_label(gen, "inline_end"));
+    mem_gen_cond(gen, stmt->data.if_stmt.cond, then_block, else_block);
+    mem_position_at(gen, then_block);
+    MemValue then_value = mem_gen_expr(gen, mem_stmt_direct_return_expr(stmt->data.if_stmt.then_stmt));
+    mem_emit_store(gen, mem_ensure_type(gen, then_value, meta->ret_type), slot);
+    mem_emit_br(gen, NULL, end_block, NULL);
+    mem_position_at(gen, else_block);
+    MemValue else_value = mem_gen_expr(gen, mem_stmt_direct_return_expr(stmt->data.if_stmt.else_stmt));
+    mem_emit_store(gen, mem_ensure_type(gen, else_value, meta->ret_type), slot);
+    mem_emit_br(gen, NULL, end_block, NULL);
+    mem_position_at(gen, end_block);
+    IRValue *loaded = mem_emit_load(gen, ret_type, slot);
+    return mem_make_value(loaded, meta->ret_type, 0, NULL, false, false);
+}
+
+static MemValue mem_try_inline_call(MemIRGen *gen, MemFunctionMeta *meta, ExprList *args, bool *inlined) {
+    *inlined = false;
+    if (!mem_can_inline_call(gen, meta, args)) {
+        return mem_make_value(mem_const_int(gen, 0), TYPE_INT, 0, NULL, false, false);
+    }
+    MemValue *arg_values = NULL;
+    if (args->count > 0) {
+        arg_values = (MemValue *)xmalloc(sizeof(MemValue) * args->count);
+    }
+    for (int i = 0; i < args->count; ++i) {
+        Param *param = meta->params.items[i];
+        if (param->is_array) {
+            IRValue *ptr = mem_array_arg_as(gen, args->items[i], param);
+            int dim_count = param->dims.count;
+            int *dims = copy_dims(param->dims.data, dim_count);
+            arg_values[i] = mem_make_value(ptr, param->type, dim_count, dims, true, true);
+        } else {
+            MemValue raw = mem_gen_expr(gen, args->items[i]);
+            IRValue *value = mem_ensure_type(gen, raw, param->type);
+            arg_values[i] = mem_make_value(value, param->type, 0, NULL, false, false);
+        }
+    }
+
+    mem_push_scope(gen);
+    for (int i = 0; i < meta->params.count; ++i) {
+        Param *param = meta->params.items[i];
+        MemSymbol *sym = mem_add_symbol(gen, param->name);
+        sym->value_type = param->type;
+        sym->dim_count = param->dims.count;
+        sym->dims = copy_dims(param->dims.data, param->dims.count);
+        sym->total_slots = 1;
+        sym->is_param_array = param->is_array;
+        sym->is_inline_value = true;
+        sym->inline_value = arg_values[i];
+        if (param->is_array) {
+            sym->addr = arg_values[i].value;
+            sym->object_type = arg_values[i].value != NULL && arg_values[i].value->type != NULL &&
+                               arg_values[i].value->type->kind == IR_TYPE_POINTER
+                                   ? arg_values[i].value->type->data.pointer.pointee
+                                   : mem_scalar_type(gen->module, param->type);
+        }
+    }
+    gen->inline_depth++;
+    Expr *return_expr = mem_simple_return_expr(meta->ast_func);
+    Stmt *if_return = mem_simple_if_return_stmt(meta->ast_func);
+    Expr *straightline_return = mem_straightline_return_expr(meta->ast_func);
+    MemValue result;
+    if (return_expr != NULL) {
+        result = mem_gen_expr(gen, return_expr);
+    } else if (if_return != NULL) {
+        result = mem_inline_if_return_value(gen, meta, if_return);
+    } else {
+        int last = meta->ast_func->block->items.count - 1;
+        for (int i = 0; i < last; ++i) {
+            mem_gen_decl(gen, (Decl *)meta->ast_func->block->items.items[i], false);
+        }
+        result = mem_gen_expr(gen, straightline_return);
+    }
+    gen->inline_depth--;
+    mem_pop_scope(gen);
+    *inlined = true;
+    return result;
+}
+
 static MemValue mem_gen_call(MemIRGen *gen, const char *name, ExprList *args) {
     const char *callee_name = name;
     if (strcmp(name, "starttime") == 0) {
@@ -2887,6 +3117,14 @@ static MemValue mem_gen_call(MemIRGen *gen, const char *name, ExprList *args) {
         callee_name = "_sysy_stoptime";
     }
     MemFunctionMeta *meta = mem_lookup_function(gen, callee_name);
+    bool inlined = false;
+    MemValue inline_result = mem_try_inline_call(gen, meta, args, &inlined);
+    if (inlined) {
+        return mem_make_value(mem_ensure_type(gen, inline_result,
+                                              meta != NULL ? meta->ret_type : inline_result.type),
+                              meta != NULL ? meta->ret_type : inline_result.type,
+                              0, NULL, false, false);
+    }
     IRValueList ir_args = {0};
     if (meta != NULL && meta->has_sysy_params) {
         for (int i = 0; i < args->count; ++i) {
@@ -3188,14 +3426,39 @@ static int *mem_init_to_flat(MemIRGen *gen, InitVal *init, const int *dims, int 
 }
 
 static void mem_zero_local_array(MemIRGen *gen, MemSymbol *sym) {
-    for (int i = 0; i < sym->total_slots; ++i) {
-        IRValueList indices = {0};
-        mem_value_list_push(&indices, mem_const_int(gen, 0));
-        mem_value_list_push(&indices, mem_const_int(gen, i));
-        IRValue *ptr = mem_emit_gep(gen, sym->addr, sym->object_type, indices,
-                                    mem_scalar_type(gen->module, sym->value_type), true);
-        mem_emit_store(gen, mem_const_zero(gen, mem_scalar_type(gen->module, sym->value_type)), ptr);
+    if (sym->total_slots <= 0) {
+        return;
     }
+    MemFunctionMeta *memset_meta = mem_lookup_function(gen, "memset");
+    if (memset_meta != NULL) {
+        IRValueList args = {0};
+        mem_value_list_push(&args, sym->addr);
+        mem_value_list_push(&args, mem_const_int(gen, 0));
+        mem_value_list_push(&args, mem_const_int(gen, sym->total_slots * 4));
+        mem_emit_call(gen, memset_meta->function, memset_meta->function->ret_type, args);
+        return;
+    }
+    IRValue *index_slot = mem_emit_alloca(gen, gen->module->i32_type);
+    mem_emit_store(gen, mem_const_int(gen, 0), index_slot);
+    IRBasicBlock *cond_block = mem_create_block(gen, mem_new_label(gen, "zero_cond"));
+    IRBasicBlock *body_block = mem_create_block(gen, mem_new_label(gen, "zero_body"));
+    IRBasicBlock *end_block = mem_create_block(gen, mem_new_label(gen, "zero_end"));
+    mem_emit_br(gen, NULL, cond_block, NULL);
+    mem_position_at(gen, cond_block);
+    IRValue *index = mem_emit_load(gen, gen->module->i32_type, index_slot);
+    IRValue *in_range = mem_emit_icmp(gen, IR_ICMP_SLT, index, mem_const_int(gen, sym->total_slots));
+    mem_emit_br(gen, in_range, body_block, end_block);
+    mem_position_at(gen, body_block);
+    IRValueList indices = {0};
+    mem_value_list_push(&indices, mem_const_int(gen, 0));
+    mem_value_list_push(&indices, index);
+    IRValue *ptr = mem_emit_gep(gen, sym->addr, sym->object_type, indices,
+                                mem_scalar_type(gen->module, sym->value_type), true);
+    mem_emit_store(gen, mem_const_zero(gen, mem_scalar_type(gen->module, sym->value_type)), ptr);
+    IRValue *next = mem_emit_binary(gen, IR_INST_ADD, gen->module->i32_type, index, mem_const_int(gen, 1));
+    mem_emit_store(gen, next, index_slot);
+    mem_emit_br(gen, NULL, cond_block, NULL);
+    mem_position_at(gen, end_block);
 }
 
 static void mem_init_local_array(MemIRGen *gen, MemSymbol *sym, InitVal *init) {
@@ -3339,7 +3602,9 @@ IRModule *ast_to_ir(Program *program) {
             FuncDef *func = item->data.func;
             IRFunction *ir_func = mem_create_function(&gen, func->name, func->ret_type,
                                                       func->params, true, false, false);
-            mem_add_function_meta(&gen, func->name, ir_func, func->ret_type, func->params, true);
+            MemFunctionMeta *meta = mem_add_function_meta(&gen, func->name, ir_func,
+                                                          func->ret_type, func->params, true);
+            meta->ast_func = func;
         }
     }
     for (int i = 0; i < program->items.count; ++i) {
@@ -3355,6 +3620,311 @@ IRModule *ast_to_ir(Program *program) {
         }
     }
     return gen.module;
+}
+
+static const char *mem_dump_inst_name(IRInstructionKind kind) {
+    switch (kind) {
+        case IR_INST_ALLOCA: return "alloca";
+        case IR_INST_LOAD: return "load";
+        case IR_INST_STORE: return "store";
+        case IR_INST_ADD: return "add";
+        case IR_INST_SUB: return "sub";
+        case IR_INST_MUL: return "mul";
+        case IR_INST_SDIV: return "sdiv";
+        case IR_INST_SREM: return "srem";
+        case IR_INST_FADD: return "fadd";
+        case IR_INST_FSUB: return "fsub";
+        case IR_INST_FMUL: return "fmul";
+        case IR_INST_FDIV: return "fdiv";
+        case IR_INST_ICMP: return "icmp";
+        case IR_INST_FCMP: return "fcmp";
+        case IR_INST_ZEXT: return "zext";
+        case IR_INST_SITOFP: return "sitofp";
+        case IR_INST_FPTOSI: return "fptosi";
+        case IR_INST_BR: return "br";
+        case IR_INST_RET: return "ret";
+        case IR_INST_CALL: return "call";
+        case IR_INST_GETELEMENTPTR: return "gep";
+        case IR_INST_BITCAST: return "bitcast";
+    }
+    return "inst";
+}
+
+static const char *mem_dump_icmp_name(IRIcmpPredicate pred) {
+    switch (pred) {
+        case IR_ICMP_EQ: return "eq";
+        case IR_ICMP_NE: return "ne";
+        case IR_ICMP_SLT: return "slt";
+        case IR_ICMP_SLE: return "sle";
+        case IR_ICMP_SGT: return "sgt";
+        case IR_ICMP_SGE: return "sge";
+    }
+    return "icmp";
+}
+
+static const char *mem_dump_fcmp_name(IRFcmpPredicate pred) {
+    switch (pred) {
+        case IR_FCMP_OEQ: return "oeq";
+        case IR_FCMP_ONE: return "one";
+        case IR_FCMP_OLT: return "olt";
+        case IR_FCMP_OLE: return "ole";
+        case IR_FCMP_OGT: return "ogt";
+        case IR_FCMP_OGE: return "oge";
+    }
+    return "fcmp";
+}
+
+static void mem_dump_type(FILE *out, IRType *type) {
+    if (type == NULL) {
+        fputs("<null>", out);
+        return;
+    }
+    switch (type->kind) {
+        case IR_TYPE_VOID:
+            fputs("void", out);
+            return;
+        case IR_TYPE_I1:
+            fputs("i1", out);
+            return;
+        case IR_TYPE_I32:
+            fputs("i32", out);
+            return;
+        case IR_TYPE_FLOAT:
+            fputs("float", out);
+            return;
+        case IR_TYPE_POINTER:
+            mem_dump_type(out, type->data.pointer.pointee);
+            fputc('*', out);
+            return;
+        case IR_TYPE_ARRAY:
+            fprintf(out, "[%d x ", type->data.array.length);
+            mem_dump_type(out, type->data.array.element);
+            fputc(']', out);
+            return;
+        case IR_TYPE_FUNCTION:
+            mem_dump_type(out, type->data.function.ret);
+            fputs(" (", out);
+            for (int i = 0; i < type->data.function.param_count; ++i) {
+                if (i > 0) {
+                    fputs(", ", out);
+                }
+                mem_dump_type(out, type->data.function.params[i]);
+            }
+            if (type->data.function.is_variadic) {
+                fputs(type->data.function.param_count > 0 ? ", ..." : "...", out);
+            }
+            fputc(')', out);
+            return;
+    }
+}
+
+static void mem_dump_value(FILE *out, IRValue *value) {
+    if (value == NULL) {
+        fputs("void", out);
+        return;
+    }
+    switch (value->kind) {
+        case IR_VALUE_CONST_INT:
+            fprintf(out, "%d", value->data.int_value);
+            return;
+        case IR_VALUE_CONST_FLOAT:
+            fprintf(out, "0x%08x", (unsigned)value->data.float_bits);
+            return;
+        case IR_VALUE_CONST_ZERO:
+            fputs("zero", out);
+            return;
+        case IR_VALUE_GLOBAL:
+        case IR_VALUE_PARAM:
+        case IR_VALUE_FUNCTION:
+        case IR_VALUE_INSTRUCTION:
+            fputs(value->name ? value->name : "<unnamed>", out);
+            return;
+        case IR_VALUE_BASIC_BLOCK:
+            fputs(value->data.basic_block != NULL ? value->data.basic_block->name : "<block>", out);
+            return;
+        case IR_VALUE_NONE:
+        case IR_VALUE_LOCAL:
+            fputs(value->name ? value->name : "<value>", out);
+            return;
+    }
+}
+
+static void mem_dump_initializer(FILE *out, IRInitializer *init) {
+    if (init == NULL) {
+        fputs("zero", out);
+        return;
+    }
+    switch (init->kind) {
+        case IR_INIT_ZERO:
+            fputs("zero", out);
+            return;
+        case IR_INIT_INT:
+            fprintf(out, "%d", init->data.int_value);
+            return;
+        case IR_INIT_FLOAT:
+            fprintf(out, "0x%08x", (unsigned)init->data.float_bits);
+            return;
+        case IR_INIT_STRING:
+            fprintf(out, "string[%d]", init->data.string.length);
+            return;
+        case IR_INIT_ARRAY:
+            fprintf(out, "array[%d]", init->data.array.count);
+            return;
+    }
+}
+
+static void mem_dump_instruction(FILE *out, IRInstruction *inst) {
+    fputs("  ", out);
+    if (inst->result_type != NULL && inst->result_type->kind != IR_TYPE_VOID) {
+        mem_dump_value(out, &inst->result);
+        fputs(" = ", out);
+    }
+    fputs(mem_dump_inst_name(inst->kind), out);
+    switch (inst->kind) {
+        case IR_INST_ALLOCA:
+            fputc(' ', out);
+            mem_dump_type(out, inst->data.alloca_inst.allocated_type);
+            break;
+        case IR_INST_LOAD:
+            fputc(' ', out);
+            mem_dump_type(out, inst->data.load_inst.value_type);
+            fputs(", ", out);
+            mem_dump_value(out, inst->data.load_inst.ptr);
+            break;
+        case IR_INST_STORE:
+            fputc(' ', out);
+            mem_dump_value(out, inst->data.store_inst.value);
+            fputs(", ", out);
+            mem_dump_value(out, inst->data.store_inst.ptr);
+            break;
+        case IR_INST_ADD:
+        case IR_INST_SUB:
+        case IR_INST_MUL:
+        case IR_INST_SDIV:
+        case IR_INST_SREM:
+        case IR_INST_FADD:
+        case IR_INST_FSUB:
+        case IR_INST_FMUL:
+        case IR_INST_FDIV:
+            fputc(' ', out);
+            mem_dump_value(out, inst->data.binary_inst.lhs);
+            fputs(", ", out);
+            mem_dump_value(out, inst->data.binary_inst.rhs);
+            break;
+        case IR_INST_ICMP:
+            fprintf(out, " %s ", mem_dump_icmp_name(inst->data.icmp_inst.pred));
+            mem_dump_value(out, inst->data.icmp_inst.lhs);
+            fputs(", ", out);
+            mem_dump_value(out, inst->data.icmp_inst.rhs);
+            break;
+        case IR_INST_FCMP:
+            fprintf(out, " %s ", mem_dump_fcmp_name(inst->data.fcmp_inst.pred));
+            mem_dump_value(out, inst->data.fcmp_inst.lhs);
+            fputs(", ", out);
+            mem_dump_value(out, inst->data.fcmp_inst.rhs);
+            break;
+        case IR_INST_ZEXT:
+        case IR_INST_SITOFP:
+        case IR_INST_FPTOSI:
+            fputc(' ', out);
+            mem_dump_value(out, inst->data.cast_inst.value);
+            fputs(" to ", out);
+            mem_dump_type(out, inst->data.cast_inst.to_type);
+            break;
+        case IR_INST_BR:
+            if (inst->data.br_inst.is_conditional) {
+                fputc(' ', out);
+                mem_dump_value(out, inst->data.br_inst.condition);
+                fprintf(out, ", %s, %s",
+                        inst->data.br_inst.true_block->name,
+                        inst->data.br_inst.false_block->name);
+            } else {
+                fprintf(out, " %s", inst->data.br_inst.true_block->name);
+            }
+            break;
+        case IR_INST_RET:
+            if (inst->data.ret_inst.value != NULL) {
+                fputc(' ', out);
+                mem_dump_value(out, inst->data.ret_inst.value);
+            }
+            break;
+        case IR_INST_CALL:
+            fprintf(out, " %s(", inst->data.call_inst.callee != NULL
+                                  ? inst->data.call_inst.callee->name : "<unknown>");
+            for (int i = 0; i < inst->data.call_inst.args.count; ++i) {
+                if (i > 0) {
+                    fputs(", ", out);
+                }
+                mem_dump_value(out, inst->data.call_inst.args.items[i]);
+            }
+            fputc(')', out);
+            break;
+        case IR_INST_GETELEMENTPTR:
+            fputc(' ', out);
+            mem_dump_value(out, inst->data.gep_inst.base_ptr);
+            for (int i = 0; i < inst->data.gep_inst.indices.count; ++i) {
+                fputc('[', out);
+                mem_dump_value(out, inst->data.gep_inst.indices.items[i]);
+                fputc(']', out);
+            }
+            break;
+        case IR_INST_BITCAST:
+            fputc(' ', out);
+            mem_dump_value(out, inst->data.bitcast_inst.value);
+            fputs(" to ", out);
+            mem_dump_type(out, inst->data.bitcast_inst.to_type);
+            break;
+    }
+    fputc('\n', out);
+}
+
+static void dump_mem_ir(IRModule *module, FILE *out) {
+    fprintf(out, "module %s\n\n", module->name);
+    for (int i = 0; i < module->globals.count; ++i) {
+        IRGlobal *global = module->globals.items[i];
+        fputs("global ", out);
+        mem_dump_type(out, global->type);
+        fprintf(out, " %s", global->name);
+        if (global->is_external) {
+            fputs(" external", out);
+        } else {
+            fputs(" = ", out);
+            mem_dump_initializer(out, global->initializer);
+        }
+        fputc('\n', out);
+    }
+    fputc('\n', out);
+    for (int i = 0; i < module->functions.count; ++i) {
+        IRFunction *function = module->functions.items[i];
+        fputs(function->is_external ? "declare " : "func ", out);
+        mem_dump_type(out, function->ret_type);
+        fprintf(out, " %s(", function->name);
+        for (int j = 0; j < function->params.count; ++j) {
+            IRParameter *param = function->params.items[j];
+            if (j > 0) {
+                fputs(", ", out);
+            }
+            mem_dump_type(out, param->type);
+            fprintf(out, " %s", param->name);
+        }
+        fputs(")\n", out);
+        if (!function->is_external) {
+            for (int bi = 0; bi < function->blocks.count; ++bi) {
+                IRBasicBlock *block = function->blocks.items[bi];
+                fprintf(out, "%s:\n", block->name);
+                for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+                    mem_dump_instruction(out, inst);
+                }
+            }
+            fputs("endfunc\n", out);
+        }
+        fputc('\n', out);
+    }
+}
+
+static void generate_program_mem_ir(Program *program, FILE *out) {
+    IRModule *module = ast_to_ir(program);
+    dump_mem_ir(module, out);
 }
 
 void generate_program_ir(Program *program, FILE *out) {
@@ -3837,2324 +4407,8 @@ static const char *parse_input_path(int argc, char **argv) {
     return input;
 }
 
-typedef struct {
-    FILE *out;
-    StrBuf globals;
-    StrBuf functions;
-    StrBuf *current_allocas;
-    StrBuf *current_body;
-    Scope *scopes;
-    FunctionSymbol *functions_meta;
-    int ir_global_id;
-    int ir_function_id;
-    int temp_id;
-    int ir_label_id;
-    TypeSpec ir_current_ret_type;
-    bool ir_current_block_terminated;
-    StringList ir_break_labels;
-    StringList ir_continue_labels;
-    StrBuf data;
-    StrBuf bss;
-    StrBuf text;
-    StrBuf body;
-    int global_id;
-    int function_id;
-    int label_id;
-    int next_stack_offset;
-    int frame_size;
-    TypeSpec current_ret_type;
-    char *return_label;
-    bool current_block_terminated;
-    StringList break_labels;
-    StringList continue_labels;
-} AsmGen;
-
-typedef struct {
-    int dim_count;
-    int *dims;
-    bool is_pointer;
-    bool is_param_array;
-} AsmValue;
-
 static int align_to(int value, int align) {
     return (value + align - 1) / align * align;
-}
-
-static void asm_emit(AsmGen *gen, const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    sb_vappendf(&gen->body, fmt, ap);
-    va_end(ap);
-}
-
-static char *asm_new_label(AsmGen *gen, const char *prefix) {
-    return str_printf(".L_%s_%d", prefix, gen->label_id++);
-}
-
-static void asm_mark_label(AsmGen *gen, const char *label) {
-    asm_emit(gen, "%s:\n", label);
-    gen->current_block_terminated = false;
-}
-
-static void asm_load_imm(AsmGen *gen, const char *reg, int value) {
-    asm_emit(gen, "  li %s, %d\n", reg, value);
-}
-
-static bool asm_fits_imm12(int value) {
-    return value >= -2048 && value <= 2047;
-}
-
-static const char *asm_temp_avoiding(const char *a, const char *b) {
-    if ((a == NULL || strcmp(a, "t6") != 0) &&
-        (b == NULL || strcmp(b, "t6") != 0)) {
-        return "t6";
-    }
-    if ((a == NULL || strcmp(a, "t5") != 0) &&
-        (b == NULL || strcmp(b, "t5") != 0)) {
-        return "t5";
-    }
-    return "t4";
-}
-
-static bool asm_abs_power_of_two(int value, int *shift, int *abs_value) {
-    if (value == 0 || value == INT_MIN) {
-        return false;
-    }
-    int v = value < 0 ? -value : value;
-    if ((v & (v - 1)) != 0) {
-        return false;
-    }
-    int s = 0;
-    while ((1 << s) != v) {
-        ++s;
-    }
-    if (shift != NULL) {
-        *shift = s;
-    }
-    if (abs_value != NULL) {
-        *abs_value = v;
-    }
-    return true;
-}
-
-static void asm_emit_add_imm(AsmGen *gen, const char *dst, const char *base, int imm) {
-    if (imm == 0) {
-        if (strcmp(dst, base) != 0) {
-            asm_emit(gen, "  mv %s, %s\n", dst, base);
-        }
-        return;
-    }
-    if (asm_fits_imm12(imm)) {
-        asm_emit(gen, "  addi %s, %s, %d\n", dst, base, imm);
-        return;
-    }
-    const char *tmp = asm_temp_avoiding(dst, base);
-    asm_emit(gen, "  li %s, %d\n", tmp, imm);
-    asm_emit(gen, "  add %s, %s, %s\n", dst, base, tmp);
-}
-
-static void asm_emit_addw_imm(AsmGen *gen, const char *dst, const char *src, int imm) {
-    if (imm == 0) {
-        if (strcmp(dst, src) != 0) {
-            asm_emit(gen, "  mv %s, %s\n", dst, src);
-        }
-        return;
-    }
-    if (asm_fits_imm12(imm)) {
-        asm_emit(gen, "  addiw %s, %s, %d\n", dst, src, imm);
-        return;
-    }
-    const char *tmp = asm_temp_avoiding(dst, src);
-    asm_emit(gen, "  li %s, %d\n", tmp, imm);
-    asm_emit(gen, "  addw %s, %s, %s\n", dst, src, tmp);
-}
-
-static void asm_emit_subw_imm(AsmGen *gen, const char *dst, const char *src, int imm) {
-    if (imm != INT_MIN) {
-        asm_emit_addw_imm(gen, dst, src, -imm);
-        return;
-    }
-    asm_load_imm(gen, "t6", imm);
-    asm_emit(gen, "  subw %s, %s, t6\n", dst, src);
-}
-
-static void asm_emit_mem(AsmGen *gen, const char *op, const char *reg, int offset, const char *base) {
-    if (asm_fits_imm12(offset)) {
-        asm_emit(gen, "  %s %s, %d(%s)\n", op, reg, offset, base);
-        return;
-    }
-    const char *tmp = asm_temp_avoiding(reg, base);
-    asm_emit(gen, "  li %s, %d\n", tmp, offset);
-    asm_emit(gen, "  add %s, %s, %s\n", tmp, base, tmp);
-    asm_emit(gen, "  %s %s, 0(%s)\n", op, reg, tmp);
-}
-
-static void sb_emit_add_imm(StrBuf *sb, const char *dst, const char *base, int imm) {
-    if (imm == 0) {
-        if (strcmp(dst, base) != 0) {
-            sb_appendf(sb, "  mv %s, %s\n", dst, base);
-        }
-        return;
-    }
-    if (asm_fits_imm12(imm)) {
-        sb_appendf(sb, "  addi %s, %s, %d\n", dst, base, imm);
-        return;
-    }
-    const char *tmp = asm_temp_avoiding(dst, base);
-    sb_appendf(sb, "  li %s, %d\n", tmp, imm);
-    sb_appendf(sb, "  add %s, %s, %s\n", dst, base, tmp);
-}
-
-static void sb_emit_mem(StrBuf *sb, const char *op, const char *reg, int offset, const char *base) {
-    if (asm_fits_imm12(offset)) {
-        sb_appendf(sb, "  %s %s, %d(%s)\n", op, reg, offset, base);
-        return;
-    }
-    const char *tmp = asm_temp_avoiding(reg, base);
-    sb_appendf(sb, "  li %s, %d\n", tmp, offset);
-    sb_appendf(sb, "  add %s, %s, %s\n", tmp, base, tmp);
-    sb_appendf(sb, "  %s %s, 0(%s)\n", op, reg, tmp);
-}
-
-static void asm_push_a0(AsmGen *gen) {
-    asm_emit(gen, "  addi sp, sp, -16\n");
-    asm_emit(gen, "  sd a0, 8(sp)\n");
-}
-
-static void asm_pop_to(AsmGen *gen, const char *reg) {
-    asm_emit(gen, "  ld %s, 8(sp)\n", reg);
-    asm_emit(gen, "  addi sp, sp, 16\n");
-}
-
-static void asm_load_symbol_addr(AsmGen *gen, Symbol *sym, const char *reg) {
-    if (sym->is_global) {
-        asm_emit(gen, "  lla %s, %s\n", reg, sym->llvm_name);
-    } else {
-        asm_emit_add_imm(gen, reg, "s0", sym->stack_offset);
-    }
-}
-
-static AsmValue asm_make_value(int dim_count, int *dims, bool is_pointer, bool is_param_array) {
-    AsmValue v;
-    v.dim_count = dim_count;
-    v.dims = dims;
-    v.is_pointer = is_pointer;
-    v.is_param_array = is_param_array;
-    return v;
-}
-
-static void asm_gen_expr(AsmGen *gen, Expr *expr);
-static void asm_gen_cond(AsmGen *gen, Expr *expr, const char *true_label, const char *false_label);
-static TypeSpec asm_expr_type(AsmGen *gen, Expr *expr);
-
-static int asm_alloc_stack(AsmGen *gen, int bytes) {
-    bytes = align_to(bytes, 4);
-    gen->next_stack_offset -= bytes;
-    return gen->next_stack_offset;
-}
-
-static FunctionSymbol *asm_add_function_meta(AsmGen *gen, FuncDef *func) {
-    FunctionSymbol *meta = (FunctionSymbol *)xmalloc(sizeof(FunctionSymbol));
-    meta->name = xstrdup(func->name);
-    meta->llvm_name = strcmp(func->name, "main") == 0 ? xstrdup("main") : str_printf("f%d", gen->function_id++);
-    meta->ret_type = func->ret_type;
-    meta->params = func->params;
-    meta->func = func;
-    meta->next = gen->functions_meta;
-    gen->functions_meta = meta;
-    unsigned idx = hash_string(func->name) % 512;
-    meta->hash_next = g_function_buckets[idx];
-    g_function_buckets[idx] = meta;
-    return meta;
-}
-
-static const char *asm_function_name(AsmGen *gen, const char *name) {
-    FunctionSymbol *meta = lookup_function_meta((IRGen *)gen, name);
-    return meta != NULL ? meta->llvm_name : name;
-}
-
-static void asm_emit_load(AsmGen *gen, const char *reg, int offset, const char *base) {
-    asm_emit_mem(gen, "lw", reg, offset, base);
-}
-
-static void asm_emit_store(AsmGen *gen, const char *reg, int offset, const char *base) {
-    asm_emit_mem(gen, "sw", reg, offset, base);
-}
-
-static void asm_emit_and_imm(AsmGen *gen, const char *dst, const char *src, int imm) {
-    if (asm_fits_imm12(imm)) {
-        asm_emit(gen, "  andi %s, %s, %d\n", dst, src, imm);
-        return;
-    }
-    const char *tmp = asm_temp_avoiding(dst, src);
-    asm_load_imm(gen, tmp, imm);
-    asm_emit(gen, "  and %s, %s, %s\n", dst, src, tmp);
-}
-
-static bool asm_emit_mul_const(AsmGen *gen, const char *dst, const char *src, int value) {
-    int shift = 0;
-    int abs_value = 0;
-    if (value == 0) {
-        asm_load_imm(gen, dst, 0);
-        return true;
-    }
-    if (value == 1) {
-        if (strcmp(dst, src) != 0) {
-            asm_emit(gen, "  mv %s, %s\n", dst, src);
-        }
-        return true;
-    }
-    if (value == -1) {
-        asm_emit(gen, "  negw %s, %s\n", dst, src);
-        return true;
-    }
-    if (asm_abs_power_of_two(value, &shift, &abs_value)) {
-        asm_emit(gen, "  slliw %s, %s, %d\n", dst, src, shift);
-        if (value < 0) {
-            asm_emit(gen, "  negw %s, %s\n", dst, dst);
-        }
-        return true;
-    }
-    return false;
-}
-
-static bool asm_emit_div_const(AsmGen *gen, const char *dst, const char *src, int value) {
-    int shift = 0;
-    int abs_value = 0;
-    if (value == 0) {
-        return false;
-    }
-    if (value == 1) {
-        if (strcmp(dst, src) != 0) {
-            asm_emit(gen, "  mv %s, %s\n", dst, src);
-        }
-        return true;
-    }
-    if (value == -1) {
-        asm_emit(gen, "  negw %s, %s\n", dst, src);
-        return true;
-    }
-    if (!asm_abs_power_of_two(value, &shift, &abs_value)) {
-        return false;
-    }
-    asm_emit(gen, "  sraiw t6, %s, 31\n", src);
-    asm_emit_and_imm(gen, "t6", "t6", abs_value - 1);
-    asm_emit(gen, "  addw %s, %s, t6\n", dst, src);
-    asm_emit(gen, "  sraiw %s, %s, %d\n", dst, dst, shift);
-    if (value < 0) {
-        asm_emit(gen, "  negw %s, %s\n", dst, dst);
-    }
-    return true;
-}
-
-static bool asm_emit_mod_const(AsmGen *gen, const char *dst, const char *src, int value) {
-    int shift = 0;
-    int abs_value = 0;
-    if (value == 0) {
-        return false;
-    }
-    if (value == 1 || value == -1) {
-        asm_load_imm(gen, dst, 0);
-        return true;
-    }
-    if (!asm_abs_power_of_two(value, &shift, &abs_value)) {
-        return false;
-    }
-    asm_emit(gen, "  sraiw t6, %s, 31\n", src);
-    asm_emit_and_imm(gen, "t6", "t6", abs_value - 1);
-    asm_emit(gen, "  addw t6, %s, t6\n", src);
-    asm_emit(gen, "  sraiw t6, t6, %d\n", shift);
-    asm_emit(gen, "  slliw t6, t6, %d\n", shift);
-    asm_emit(gen, "  subw %s, %s, t6\n", dst, src);
-    return true;
-}
-
-static void asm_scale_index(AsmGen *gen, int stride) {
-    if (stride != 1) {
-        int shift = 0;
-        int abs_value = 0;
-        if (asm_abs_power_of_two(stride, &shift, &abs_value) && stride > 0) {
-            asm_emit(gen, "  slli a0, a0, %d\n", shift);
-        } else {
-            asm_emit(gen, "  li t0, %d\n", stride);
-            asm_emit(gen, "  mul a0, a0, t0\n");
-        }
-    }
-}
-
-static bool asm_eval_int_const_expr(AsmGen *gen, Expr *expr, int *out) {
-    if (expr == NULL) {
-        *out = 0;
-        return true;
-    }
-    switch (expr->kind) {
-        case EXPR_NUMBER:
-            *out = expr->data.number;
-            return true;
-        case EXPR_LVAL: {
-            LVal *lval = expr->data.lval;
-            Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
-            if (sym != NULL && sym->is_const_scalar && lval->indices.count == 0 &&
-                sym->value_type == TYPE_INT) {
-                *out = sym->const_scalar;
-                return true;
-            }
-            return false;
-        }
-        case EXPR_UNARY: {
-            int value = 0;
-            if (!asm_eval_int_const_expr(gen, expr->data.unary.operand, &value)) {
-                return false;
-            }
-            switch (expr->data.unary.op) {
-                case UNARY_PLUS: *out = value; return true;
-                case UNARY_MINUS: *out = -value; return true;
-                case UNARY_NOT: *out = !value; return true;
-            }
-            return false;
-        }
-        case EXPR_BINARY: {
-            BinaryOp op = expr->data.binary.op;
-            int lhs = 0;
-            int rhs = 0;
-            if (!asm_eval_int_const_expr(gen, expr->data.binary.lhs, &lhs)) {
-                return false;
-            }
-            if (op == BIN_AND) {
-                if (!lhs) {
-                    *out = 0;
-                    return true;
-                }
-                return asm_eval_int_const_expr(gen, expr->data.binary.rhs, &rhs) &&
-                       (*out = (rhs != 0), true);
-            }
-            if (op == BIN_OR) {
-                if (lhs) {
-                    *out = 1;
-                    return true;
-                }
-                return asm_eval_int_const_expr(gen, expr->data.binary.rhs, &rhs) &&
-                       (*out = (rhs != 0), true);
-            }
-            if (!asm_eval_int_const_expr(gen, expr->data.binary.rhs, &rhs)) {
-                return false;
-            }
-            if ((op == BIN_DIV || op == BIN_MOD) && rhs == 0) {
-                return false;
-            }
-            switch (op) {
-                case BIN_ADD: *out = lhs + rhs; return true;
-                case BIN_SUB: *out = lhs - rhs; return true;
-                case BIN_MUL: *out = lhs * rhs; return true;
-                case BIN_DIV: *out = lhs / rhs; return true;
-                case BIN_MOD: *out = lhs % rhs; return true;
-                case BIN_LT: *out = lhs < rhs; return true;
-                case BIN_GT: *out = lhs > rhs; return true;
-                case BIN_LE: *out = lhs <= rhs; return true;
-                case BIN_GE: *out = lhs >= rhs; return true;
-                case BIN_EQ: *out = lhs == rhs; return true;
-                case BIN_NE: *out = lhs != rhs; return true;
-                case BIN_AND:
-                case BIN_OR:
-                    return false;
-            }
-            return false;
-        }
-        default:
-            return false;
-    }
-}
-
-static AsmValue asm_lval_address(AsmGen *gen, LVal *lval) {
-    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
-    if (sym == NULL) {
-        asm_load_imm(gen, "a0", 0);
-        return asm_make_value(0, NULL, false, false);
-    }
-    if (sym->info.is_param_array) {
-        asm_emit_mem(gen, "ld", "t1", sym->stack_offset, "s0");
-    } else {
-        asm_load_symbol_addr(gen, sym, "t1");
-    }
-    for (int i = 0; i < lval->indices.count; ++i) {
-        int stride = sym->info.is_param_array
-                         ? product_dims(sym->info.dims, i, sym->info.dim_count)
-                         : product_dims(sym->info.dims, i + 1, sym->info.dim_count);
-        int index_value = 0;
-        if (asm_eval_int_const_expr(gen, lval->indices.items[i], &index_value)) {
-            int offset = index_value * stride * 4;
-            if (offset != 0) {
-                asm_emit_add_imm(gen, "t1", "t1", offset);
-            }
-        } else {
-            asm_emit(gen, "  mv a0, t1\n");
-            asm_push_a0(gen);
-            asm_gen_expr(gen, lval->indices.items[i]);
-            asm_scale_index(gen, stride * 4);
-            asm_emit(gen, "  mv t0, a0\n");
-            asm_pop_to(gen, "t1");
-            asm_emit(gen, "  add t1, t1, t0\n");
-        }
-    }
-    asm_emit(gen, "  mv a0, t1\n");
-    int remain = (sym->info.is_param_array ? sym->info.dim_count + 1 : sym->info.dim_count)
-                 - lval->indices.count;
-    if (remain < 0) {
-        remain = 0;
-    }
-    int dim_offset = sym->info.is_param_array ? lval->indices.count - 1 : lval->indices.count;
-    if (dim_offset < 0) {
-        dim_offset = 0;
-    }
-    if (dim_offset > sym->info.dim_count) {
-        dim_offset = sym->info.dim_count;
-    }
-    return asm_make_value(remain, sym->info.dims + dim_offset, true, sym->info.is_param_array);
-}
-
-static AsmValue asm_gen_lval_expr(AsmGen *gen, LVal *lval) {
-    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
-    if (sym != NULL && sym->is_const_scalar && lval->indices.count == 0) {
-        asm_load_imm(gen, "a0", sym->const_scalar);
-        return asm_make_value(0, NULL, false, false);
-    }
-    if (sym != NULL && sym->info.is_param_array && lval->indices.count == 0) {
-        asm_emit_mem(gen, "ld", "a0", sym->stack_offset, "s0");
-        return asm_make_value(sym->info.dim_count, sym->info.dims, true, true);
-    }
-    AsmValue addr = asm_lval_address(gen, lval);
-    if (addr.dim_count == 0) {
-        asm_emit_load(gen, "a0", 0, "a0");
-        return asm_make_value(0, NULL, false, false);
-    }
-    if (addr.dim_count == 1) {
-        return asm_make_value(0, NULL, true, true);
-    }
-    return asm_make_value(addr.dim_count - 1, addr.dims + 1, true, true);
-}
-
-static TypeSpec asm_lval_type(AsmGen *gen, LVal *lval) {
-    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
-    return sym != NULL ? sym->value_type : TYPE_INT;
-}
-
-static TypeSpec asm_runtime_return_type(const char *name) {
-    if (strcmp(name, "getfloat") == 0) {
-        return TYPE_FLOAT;
-    }
-    if (strcmp(name, "putint") == 0 || strcmp(name, "putch") == 0 ||
-        strcmp(name, "putarray") == 0 || strcmp(name, "putfloat") == 0 ||
-        strcmp(name, "putfarray") == 0 || strcmp(name, "_sysy_starttime") == 0 ||
-        strcmp(name, "_sysy_stoptime") == 0) {
-        return TYPE_VOID;
-    }
-    return TYPE_INT;
-}
-
-static TypeSpec asm_call_return_type(const char *name, FunctionSymbol *meta) {
-    return meta != NULL ? meta->ret_type : asm_runtime_return_type(name);
-}
-
-static TypeSpec asm_expr_type(AsmGen *gen, Expr *expr) {
-    if (expr == NULL) {
-        return TYPE_INT;
-    }
-    switch (expr->kind) {
-        case EXPR_FLOAT_NUMBER:
-            return TYPE_FLOAT;
-        case EXPR_LVAL:
-            return asm_lval_type(gen, expr->data.lval);
-        case EXPR_CALL: {
-            FunctionSymbol *meta = lookup_function_meta((IRGen *)gen, expr->data.call.name);
-            return asm_call_return_type(expr->data.call.name, meta);
-        }
-        case EXPR_UNARY:
-            return expr->data.unary.op == UNARY_NOT ? TYPE_INT : asm_expr_type(gen, expr->data.unary.operand);
-        case EXPR_BINARY: {
-            BinaryOp op = expr->data.binary.op;
-            if (op == BIN_LT || op == BIN_GT || op == BIN_LE || op == BIN_GE ||
-                op == BIN_EQ || op == BIN_NE || op == BIN_AND || op == BIN_OR) {
-                return TYPE_INT;
-            }
-            return (asm_expr_type(gen, expr->data.binary.lhs) == TYPE_FLOAT ||
-                    asm_expr_type(gen, expr->data.binary.rhs) == TYPE_FLOAT) ? TYPE_FLOAT : TYPE_INT;
-        }
-        default:
-            return TYPE_INT;
-    }
-}
-
-static bool asm_expr_is_pointer_value(AsmGen *gen, Expr *expr) {
-    if (expr == NULL || expr->kind != EXPR_LVAL) {
-        return false;
-    }
-    LVal *lval = expr->data.lval;
-    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
-    if (sym == NULL) {
-        return false;
-    }
-    if (sym->info.is_param_array) {
-        return lval->indices.count < sym->info.dim_count + 1;
-    }
-    return lval->indices.count < sym->info.dim_count;
-}
-
-static Symbol *asm_scalar_lval_target(AsmGen *gen, LVal *lval) {
-    if (lval == NULL || lval->indices.count != 0) {
-        return NULL;
-    }
-    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
-    if (sym == NULL || sym->is_function || sym->info.is_param_array ||
-        sym->info.dim_count != 0) {
-        return NULL;
-    }
-    return sym;
-}
-
-static void asm_store_scalar_reg(AsmGen *gen, Symbol *sym, const char *reg) {
-    if (sym->is_global) {
-        const char *tmp = asm_temp_avoiding(reg, NULL);
-        asm_emit(gen, "  lla %s, %s\n", tmp, sym->llvm_name);
-        asm_emit_store(gen, reg, 0, tmp);
-    } else {
-        asm_emit_store(gen, reg, sym->stack_offset, "s0");
-    }
-}
-
-static TypeSpec asm_call_param_type(const char *name, FunctionSymbol *meta, int index) {
-    if (meta != NULL && index < meta->params.count) {
-        return meta->params.items[index]->type;
-    }
-    if ((strcmp(name, "getfarray") == 0 && index == 0) ||
-        (strcmp(name, "putfarray") == 0 && index == 1)) {
-        return TYPE_FLOAT;
-    }
-    return TYPE_INT;
-}
-
-static bool asm_call_param_is_array(const char *name, FunctionSymbol *meta, int index) {
-    if (meta != NULL && index < meta->params.count) {
-        return meta->params.items[index]->is_array;
-    }
-    return (strcmp(name, "getarray") == 0 && index == 0) ||
-           (strcmp(name, "getfarray") == 0 && index == 0) ||
-           (strcmp(name, "putarray") == 0 && index == 1) ||
-           (strcmp(name, "putfarray") == 0 && index == 1);
-}
-
-static bool asm_call_param_uses_float_reg(const char *name, FunctionSymbol *meta, int index, bool arg_is_pointer) {
-    return asm_call_param_type(name, meta, index) == TYPE_FLOAT &&
-           !asm_call_param_is_array(name, meta, index) &&
-           !arg_is_pointer;
-}
-
-static int asm_count_outgoing_stack_slots(AsmGen *gen, const char *name, ExprList *args, FunctionSymbol *meta) {
-    int int_reg = 0;
-    int float_reg = 0;
-    int stack_slots = 0;
-    for (int i = 0; i < args->count; ++i) {
-        bool float_scalar = asm_call_param_uses_float_reg(name, meta, i,
-                                                          asm_expr_is_pointer_value(gen, args->items[i]));
-        if (float_scalar) {
-            if (float_reg < 8) {
-                ++float_reg;
-            } else {
-                ++stack_slots;
-            }
-        } else {
-            if (int_reg < 8) {
-                ++int_reg;
-            } else {
-                ++stack_slots;
-            }
-        }
-    }
-    return stack_slots;
-}
-
-static void asm_gen_float_to_freg(AsmGen *gen, Expr *expr, const char *freg) {
-    TypeSpec type = asm_expr_type(gen, expr);
-    asm_gen_expr(gen, expr);
-    if (type == TYPE_FLOAT) {
-        asm_emit(gen, "  fmv.w.x %s, a0\n", freg);
-    } else {
-        asm_emit(gen, "  fcvt.s.w %s, a0\n", freg);
-    }
-}
-
-static void asm_convert_a0(AsmGen *gen, TypeSpec from, TypeSpec to) {
-    if (from == to) {
-        return;
-    }
-    if (from == TYPE_INT && to == TYPE_FLOAT) {
-        asm_emit(gen, "  fcvt.s.w ft0, a0\n");
-        asm_emit(gen, "  fmv.x.w a0, ft0\n");
-        return;
-    }
-    if (from == TYPE_FLOAT && to == TYPE_INT) {
-        asm_emit(gen, "  fmv.w.x ft0, a0\n");
-        asm_emit(gen, "  fcvt.w.s a0, ft0, rtz\n");
-        return;
-    }
-}
-
-static void asm_float_truth_to_a0(AsmGen *gen, Expr *expr) {
-    asm_gen_float_to_freg(gen, expr, "ft0");
-    asm_emit(gen, "  fmv.w.x ft1, zero\n");
-    asm_emit(gen, "  feq.s a0, ft0, ft1\n");
-    asm_emit(gen, "  xori a0, a0, 1\n");
-}
-
-static void asm_gen_float_binary(AsmGen *gen, BinaryOp op, Expr *lhs, Expr *rhs) {
-    asm_gen_float_to_freg(gen, lhs, "ft0");
-    asm_emit(gen, "  addi sp, sp, -16\n");
-    asm_emit(gen, "  fsw ft0, 12(sp)\n");
-    asm_gen_float_to_freg(gen, rhs, "ft1");
-    asm_emit(gen, "  flw ft0, 12(sp)\n");
-    asm_emit(gen, "  addi sp, sp, 16\n");
-    switch (op) {
-        case BIN_ADD:
-            asm_emit(gen, "  fadd.s ft0, ft0, ft1\n");
-            asm_emit(gen, "  fmv.x.w a0, ft0\n");
-            return;
-        case BIN_SUB:
-            asm_emit(gen, "  fsub.s ft0, ft0, ft1\n");
-            asm_emit(gen, "  fmv.x.w a0, ft0\n");
-            return;
-        case BIN_MUL:
-            asm_emit(gen, "  fmul.s ft0, ft0, ft1\n");
-            asm_emit(gen, "  fmv.x.w a0, ft0\n");
-            return;
-        case BIN_DIV:
-            asm_emit(gen, "  fdiv.s ft0, ft0, ft1\n");
-            asm_emit(gen, "  fmv.x.w a0, ft0\n");
-            return;
-        case BIN_LT: asm_emit(gen, "  flt.s a0, ft0, ft1\n"); return;
-        case BIN_GT: asm_emit(gen, "  flt.s a0, ft1, ft0\n"); return;
-        case BIN_LE: asm_emit(gen, "  fle.s a0, ft0, ft1\n"); return;
-        case BIN_GE: asm_emit(gen, "  fle.s a0, ft1, ft0\n"); return;
-        case BIN_EQ: asm_emit(gen, "  feq.s a0, ft0, ft1\n"); return;
-        case BIN_NE:
-            asm_emit(gen, "  feq.s a0, ft0, ft1\n");
-            asm_emit(gen, "  xori a0, a0, 1\n");
-            return;
-        default:
-            asm_load_imm(gen, "a0", 0);
-            return;
-    }
-}
-
-static void asm_call_function(AsmGen *gen, const char *name, ExprList *args, FunctionSymbol *meta) {
-    int count = args->count;
-    for (int i = 0; i < count; ++i) {
-        asm_gen_expr(gen, args->items[i]);
-        TypeSpec arg_type = asm_expr_type(gen, args->items[i]);
-        TypeSpec param_type = asm_call_param_type(name, meta, i);
-        bool param_array = asm_call_param_is_array(name, meta, i);
-        if (!param_array && !asm_expr_is_pointer_value(gen, args->items[i])) {
-            asm_convert_a0(gen, arg_type, param_type);
-        }
-        asm_push_a0(gen);
-    }
-    int stack_slots = asm_count_outgoing_stack_slots(gen, name, args, meta);
-    int call_area = align_to(stack_slots * 8, 16);
-    if (call_area > 0) {
-        asm_emit_add_imm(gen, "sp", "sp", -call_area);
-    }
-    int int_reg = 0;
-    int float_reg = 0;
-    int stack_arg = 0;
-    for (int i = 0; i < count; ++i) {
-        TypeSpec param_type = asm_call_param_type(name, meta, i);
-        bool param_array = asm_call_param_is_array(name, meta, i) || asm_expr_is_pointer_value(gen, args->items[i]);
-        int off = call_area + 8 + (count - 1 - i) * 16;
-        /* RV64 hard-float ABI: scalar float arguments use fa0-fa7 first;
-           integer and pointer arguments use a0-a7 first. All overflow
-           arguments occupy XLEN-sized stack slots at the caller's sp. */
-        if (param_type == TYPE_FLOAT && !param_array && float_reg < 8) {
-            char *arg_reg = str_printf("fa%d", float_reg++);
-            asm_emit_mem(gen, "flw", arg_reg, off, "sp");
-            free(arg_reg);
-        } else if (param_type == TYPE_FLOAT && !param_array) {
-            asm_emit_mem(gen, "flw", "ft0", off, "sp");
-            asm_emit_mem(gen, "fsw", "ft0", stack_arg * 8, "sp");
-            stack_arg++;
-        } else if (int_reg < 8) {
-            char *arg_reg = str_printf("a%d", int_reg++);
-            asm_emit_mem(gen, "ld", arg_reg, off, "sp");
-            free(arg_reg);
-        } else {
-            asm_emit_mem(gen, "ld", "t0", off, "sp");
-            asm_emit_mem(gen, "sd", "t0", stack_arg * 8, "sp");
-            stack_arg++;
-        }
-    }
-    asm_emit(gen, "  call %s\n", name);
-    if (call_area + count * 16 > 0) {
-        asm_emit_add_imm(gen, "sp", "sp", call_area + count * 16);
-    }
-}
-
-static void asm_store_incoming_param(AsmGen *gen, Param *param, Symbol *sym,
-                                     int *int_reg, int *float_reg, int *stack_arg) {
-    bool is_float_scalar = param->type == TYPE_FLOAT && !param->is_array;
-    if (is_float_scalar && *float_reg < 8) {
-        char *arg_reg = str_printf("fa%d", (*float_reg)++);
-        asm_emit_mem(gen, "fsw", arg_reg, sym->stack_offset, "s0");
-        free(arg_reg);
-    } else if (is_float_scalar) {
-        asm_emit_mem(gen, "flw", "ft0", (*stack_arg) * 8, "s0");
-        asm_emit_mem(gen, "fsw", "ft0", sym->stack_offset, "s0");
-        (*stack_arg)++;
-    } else if (*int_reg < 8) {
-        char *arg_reg = str_printf("a%d", (*int_reg)++);
-        if (param->is_array) {
-            asm_emit_mem(gen, "sd", arg_reg, sym->stack_offset, "s0");
-        } else {
-            asm_emit_store(gen, arg_reg, sym->stack_offset, "s0");
-        }
-        free(arg_reg);
-    } else {
-        asm_emit_mem(gen, "ld", "t0", (*stack_arg) * 8, "s0");
-        if (param->is_array) {
-            asm_emit_mem(gen, "sd", "t0", sym->stack_offset, "s0");
-        } else {
-            asm_emit_store(gen, "t0", sym->stack_offset, "s0");
-        }
-        (*stack_arg)++;
-    }
-}
-
-static AsmValue asm_gen_short_circuit_expr(AsmGen *gen, Expr *expr) {
-    char *true_label = asm_new_label(gen, "logic_true");
-    char *false_label = asm_new_label(gen, "logic_false");
-    char *end_label = asm_new_label(gen, "logic_end");
-    asm_gen_cond(gen, expr, true_label, false_label);
-    asm_mark_label(gen, true_label);
-    asm_load_imm(gen, "a0", 1);
-    asm_emit(gen, "  j %s\n", end_label);
-    gen->current_block_terminated = true;
-    asm_mark_label(gen, false_label);
-    asm_load_imm(gen, "a0", 0);
-    asm_mark_label(gen, end_label);
-    return asm_make_value(0, NULL, false, false);
-}
-
-static int asm_inline_param_index(FunctionSymbol *meta, const char *name) {
-    for (int i = 0; i < meta->params.count; ++i) {
-        if (strcmp(meta->params.items[i]->name, name) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static bool asm_inline_expr_is_simple_int(FunctionSymbol *meta, Expr *expr) {
-    if (expr == NULL) {
-        return true;
-    }
-    switch (expr->kind) {
-        case EXPR_NUMBER:
-            return true;
-        case EXPR_LVAL:
-            return expr->data.lval->indices.count == 0 &&
-                   asm_inline_param_index(meta, expr->data.lval->name) >= 0;
-        case EXPR_UNARY:
-            return asm_inline_expr_is_simple_int(meta, expr->data.unary.operand);
-        case EXPR_BINARY:
-            return expr->data.binary.op != BIN_AND &&
-                   expr->data.binary.op != BIN_OR &&
-                   asm_inline_expr_is_simple_int(meta, expr->data.binary.lhs) &&
-                   asm_inline_expr_is_simple_int(meta, expr->data.binary.rhs);
-        default:
-            return false;
-    }
-}
-
-static bool asm_arg_is_side_effect_free(Expr *expr) {
-    if (expr == NULL) {
-        return true;
-    }
-    switch (expr->kind) {
-        case EXPR_NUMBER:
-        case EXPR_FLOAT_NUMBER:
-            return true;
-        case EXPR_LVAL:
-            for (int i = 0; i < expr->data.lval->indices.count; ++i) {
-                if (!asm_arg_is_side_effect_free(expr->data.lval->indices.items[i])) {
-                    return false;
-                }
-            }
-            return true;
-        case EXPR_UNARY:
-            return asm_arg_is_side_effect_free(expr->data.unary.operand);
-        case EXPR_BINARY:
-            return asm_arg_is_side_effect_free(expr->data.binary.lhs) &&
-                   asm_arg_is_side_effect_free(expr->data.binary.rhs);
-        default:
-            return false;
-    }
-}
-
-static Expr *asm_inline_return_expr(FunctionSymbol *meta) {
-    if (meta == NULL || meta->func == NULL || meta->ret_type != TYPE_INT ||
-        meta->func->block == NULL || meta->func->block->items.count != 1 ||
-        meta->func->block->items.kinds[0] != BLOCK_ITEM_STMT) {
-        return NULL;
-    }
-    for (int i = 0; i < meta->params.count; ++i) {
-        Param *param = meta->params.items[i];
-        if (param->type != TYPE_INT || param->is_array) {
-            return NULL;
-        }
-    }
-    Stmt *stmt = (Stmt *)meta->func->block->items.items[0];
-    if (stmt->kind != STMT_RETURN || stmt->data.return_expr == NULL) {
-        return NULL;
-    }
-    if (!asm_inline_expr_is_simple_int(meta, stmt->data.return_expr)) {
-        return NULL;
-    }
-    return stmt->data.return_expr;
-}
-
-static void asm_gen_inline_int_expr(AsmGen *gen, Expr *expr, FunctionSymbol *meta, ExprList *args) {
-    if (expr == NULL) {
-        asm_load_imm(gen, "a0", 0);
-        return;
-    }
-    switch (expr->kind) {
-        case EXPR_NUMBER:
-            asm_load_imm(gen, "a0", expr->data.number);
-            return;
-        case EXPR_LVAL: {
-            int index = asm_inline_param_index(meta, expr->data.lval->name);
-            if (index >= 0 && index < args->count) {
-                asm_gen_expr(gen, args->items[index]);
-                return;
-            }
-            asm_load_imm(gen, "a0", 0);
-            return;
-        }
-        case EXPR_UNARY:
-            asm_gen_inline_int_expr(gen, expr->data.unary.operand, meta, args);
-            if (expr->data.unary.op == UNARY_MINUS) {
-                asm_emit(gen, "  negw a0, a0\n");
-            } else if (expr->data.unary.op == UNARY_NOT) {
-                asm_emit(gen, "  seqz a0, a0\n");
-            }
-            return;
-        case EXPR_BINARY: {
-            BinaryOp op = expr->data.binary.op;
-            asm_gen_inline_int_expr(gen, expr->data.binary.lhs, meta, args);
-            asm_push_a0(gen);
-            asm_gen_inline_int_expr(gen, expr->data.binary.rhs, meta, args);
-            asm_emit(gen, "  mv t1, a0\n");
-            asm_pop_to(gen, "t0");
-            switch (op) {
-                case BIN_ADD: asm_emit(gen, "  addw a0, t0, t1\n"); return;
-                case BIN_SUB: asm_emit(gen, "  subw a0, t0, t1\n"); return;
-                case BIN_MUL: asm_emit(gen, "  mulw a0, t0, t1\n"); return;
-                case BIN_DIV: asm_emit(gen, "  divw a0, t0, t1\n"); return;
-                case BIN_MOD: asm_emit(gen, "  remw a0, t0, t1\n"); return;
-                case BIN_LT: asm_emit(gen, "  slt a0, t0, t1\n"); return;
-                case BIN_GT: asm_emit(gen, "  slt a0, t1, t0\n"); return;
-                case BIN_LE:
-                    asm_emit(gen, "  slt a0, t1, t0\n");
-                    asm_emit(gen, "  xori a0, a0, 1\n");
-                    return;
-                case BIN_GE:
-                    asm_emit(gen, "  slt a0, t0, t1\n");
-                    asm_emit(gen, "  xori a0, a0, 1\n");
-                    return;
-                case BIN_EQ:
-                    asm_emit(gen, "  subw a0, t0, t1\n");
-                    asm_emit(gen, "  seqz a0, a0\n");
-                    return;
-                case BIN_NE:
-                    asm_emit(gen, "  subw a0, t0, t1\n");
-                    asm_emit(gen, "  snez a0, a0\n");
-                    return;
-                default:
-                    asm_load_imm(gen, "a0", 0);
-                    return;
-            }
-        }
-        default:
-            asm_load_imm(gen, "a0", 0);
-            return;
-    }
-}
-
-static bool asm_try_inline_call(AsmGen *gen, FunctionSymbol *meta, ExprList *args) {
-    Expr *ret = asm_inline_return_expr(meta);
-    if (ret == NULL || args->count != meta->params.count) {
-        return false;
-    }
-    for (int i = 0; i < args->count; ++i) {
-        if (!asm_arg_is_side_effect_free(args->items[i])) {
-            return false;
-        }
-    }
-    asm_gen_inline_int_expr(gen, ret, meta, args);
-    return true;
-}
-
-static void asm_emit_compare_const_rhs(AsmGen *gen, BinaryOp op, int rhs) {
-    switch (op) {
-        case BIN_LT:
-            if (asm_fits_imm12(rhs)) {
-                asm_emit(gen, "  slti a0, a0, %d\n", rhs);
-            } else {
-                asm_load_imm(gen, "t1", rhs);
-                asm_emit(gen, "  slt a0, a0, t1\n");
-            }
-            return;
-        case BIN_GT:
-            asm_load_imm(gen, "t1", rhs);
-            asm_emit(gen, "  slt a0, t1, a0\n");
-            return;
-        case BIN_LE:
-            asm_load_imm(gen, "t1", rhs);
-            asm_emit(gen, "  slt a0, t1, a0\n");
-            asm_emit(gen, "  xori a0, a0, 1\n");
-            return;
-        case BIN_GE:
-            if (asm_fits_imm12(rhs)) {
-                asm_emit(gen, "  slti a0, a0, %d\n", rhs);
-            } else {
-                asm_load_imm(gen, "t1", rhs);
-                asm_emit(gen, "  slt a0, a0, t1\n");
-            }
-            asm_emit(gen, "  xori a0, a0, 1\n");
-            return;
-        case BIN_EQ:
-            if (rhs == 0) {
-                asm_emit(gen, "  seqz a0, a0\n");
-            } else {
-                asm_emit_subw_imm(gen, "a0", "a0", rhs);
-                asm_emit(gen, "  seqz a0, a0\n");
-            }
-            return;
-        case BIN_NE:
-            if (rhs == 0) {
-                asm_emit(gen, "  snez a0, a0\n");
-            } else {
-                asm_emit_subw_imm(gen, "a0", "a0", rhs);
-                asm_emit(gen, "  snez a0, a0\n");
-            }
-            return;
-        default:
-            return;
-    }
-}
-
-static bool asm_try_gen_binary_const_rhs(AsmGen *gen, BinaryOp op, Expr *lhs, int rhs) {
-    if ((op == BIN_DIV || op == BIN_MOD) && rhs == 0) {
-        return false;
-    }
-    switch (op) {
-        case BIN_ADD:
-            asm_gen_expr(gen, lhs);
-            asm_emit_addw_imm(gen, "a0", "a0", rhs);
-            return true;
-        case BIN_SUB:
-            asm_gen_expr(gen, lhs);
-            asm_emit_subw_imm(gen, "a0", "a0", rhs);
-            return true;
-        case BIN_MUL:
-            asm_gen_expr(gen, lhs);
-            if (!asm_emit_mul_const(gen, "a0", "a0", rhs)) {
-                asm_load_imm(gen, "t1", rhs);
-                asm_emit(gen, "  mulw a0, a0, t1\n");
-            }
-            return true;
-        case BIN_DIV:
-            asm_gen_expr(gen, lhs);
-            if (!asm_emit_div_const(gen, "a0", "a0", rhs)) {
-                asm_load_imm(gen, "t1", rhs);
-                asm_emit(gen, "  divw a0, a0, t1\n");
-            }
-            return true;
-        case BIN_MOD:
-            asm_gen_expr(gen, lhs);
-            if (!asm_emit_mod_const(gen, "a0", "a0", rhs)) {
-                asm_load_imm(gen, "t1", rhs);
-                asm_emit(gen, "  remw a0, a0, t1\n");
-            }
-            return true;
-        case BIN_LT:
-        case BIN_GT:
-        case BIN_LE:
-        case BIN_GE:
-        case BIN_EQ:
-        case BIN_NE:
-            asm_gen_expr(gen, lhs);
-            asm_emit_compare_const_rhs(gen, op, rhs);
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool asm_try_gen_binary_const_lhs(AsmGen *gen, BinaryOp op, int lhs, Expr *rhs) {
-    switch (op) {
-        case BIN_ADD:
-            return asm_try_gen_binary_const_rhs(gen, BIN_ADD, rhs, lhs);
-        case BIN_MUL:
-            return asm_try_gen_binary_const_rhs(gen, BIN_MUL, rhs, lhs);
-        case BIN_SUB:
-            asm_gen_expr(gen, rhs);
-            asm_load_imm(gen, "t0", lhs);
-            asm_emit(gen, "  subw a0, t0, a0\n");
-            return true;
-        case BIN_LT:
-            asm_gen_expr(gen, rhs);
-            asm_load_imm(gen, "t0", lhs);
-            asm_emit(gen, "  slt a0, t0, a0\n");
-            return true;
-        case BIN_GT:
-            asm_gen_expr(gen, rhs);
-            asm_load_imm(gen, "t0", lhs);
-            asm_emit(gen, "  slt a0, a0, t0\n");
-            return true;
-        case BIN_LE:
-            asm_gen_expr(gen, rhs);
-            asm_load_imm(gen, "t0", lhs);
-            asm_emit(gen, "  slt a0, a0, t0\n");
-            asm_emit(gen, "  xori a0, a0, 1\n");
-            return true;
-        case BIN_GE:
-            asm_gen_expr(gen, rhs);
-            asm_load_imm(gen, "t0", lhs);
-            asm_emit(gen, "  slt a0, t0, a0\n");
-            asm_emit(gen, "  xori a0, a0, 1\n");
-            return true;
-        case BIN_EQ:
-        case BIN_NE:
-            return asm_try_gen_binary_const_rhs(gen, op, rhs, lhs);
-        default:
-            return false;
-    }
-}
-
-static bool asm_try_load_simple_int_expr_to_reg(AsmGen *gen, Expr *expr, const char *reg) {
-    if (expr == NULL || asm_expr_type(gen, expr) != TYPE_INT) {
-        return false;
-    }
-    switch (expr->kind) {
-        case EXPR_NUMBER:
-            asm_load_imm(gen, reg, expr->data.number);
-            return true;
-        case EXPR_LVAL: {
-            LVal *lval = expr->data.lval;
-            if (lval->indices.count != 0) {
-                return false;
-            }
-            Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
-            if (sym == NULL || sym->value_type != TYPE_INT) {
-                return false;
-            }
-            if (sym->is_const_scalar) {
-                asm_load_imm(gen, reg, sym->const_scalar);
-                return true;
-            }
-            if (sym->is_function || sym->info.is_param_array || sym->info.dim_count != 0) {
-                return false;
-            }
-            if (sym->is_global) {
-                const char *tmp = asm_temp_avoiding(reg, NULL);
-                asm_emit(gen, "  lla %s, %s\n", tmp, sym->llvm_name);
-                asm_emit_load(gen, reg, 0, tmp);
-            } else {
-                asm_emit_load(gen, reg, sym->stack_offset, "s0");
-            }
-            return true;
-        }
-        case EXPR_UNARY:
-            if (!asm_try_load_simple_int_expr_to_reg(gen, expr->data.unary.operand, reg)) {
-                return false;
-            }
-            if (expr->data.unary.op == UNARY_MINUS) {
-                asm_emit(gen, "  negw %s, %s\n", reg, reg);
-            } else if (expr->data.unary.op == UNARY_NOT) {
-                asm_emit(gen, "  seqz %s, %s\n", reg, reg);
-            }
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool asm_can_load_simple_int_expr(AsmGen *gen, Expr *expr) {
-    if (expr == NULL || asm_expr_type(gen, expr) != TYPE_INT) {
-        return false;
-    }
-    switch (expr->kind) {
-        case EXPR_NUMBER:
-            return true;
-        case EXPR_LVAL: {
-            LVal *lval = expr->data.lval;
-            if (lval->indices.count != 0) {
-                return false;
-            }
-            Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
-            if (sym == NULL || sym->value_type != TYPE_INT) {
-                return false;
-            }
-            if (sym->is_const_scalar) {
-                return true;
-            }
-            return !sym->is_function && !sym->info.is_param_array && sym->info.dim_count == 0;
-        }
-        case EXPR_UNARY:
-            return asm_can_load_simple_int_expr(gen, expr->data.unary.operand);
-        default:
-            return false;
-    }
-}
-
-static void asm_emit_binary_regs_to_a0(AsmGen *gen, BinaryOp op,
-                                       const char *lhs_reg, const char *rhs_reg) {
-    switch (op) {
-        case BIN_ADD: asm_emit(gen, "  addw a0, %s, %s\n", lhs_reg, rhs_reg); return;
-        case BIN_SUB: asm_emit(gen, "  subw a0, %s, %s\n", lhs_reg, rhs_reg); return;
-        case BIN_MUL: asm_emit(gen, "  mulw a0, %s, %s\n", lhs_reg, rhs_reg); return;
-        case BIN_DIV: asm_emit(gen, "  divw a0, %s, %s\n", lhs_reg, rhs_reg); return;
-        case BIN_MOD: asm_emit(gen, "  remw a0, %s, %s\n", lhs_reg, rhs_reg); return;
-        case BIN_LT: asm_emit(gen, "  slt a0, %s, %s\n", lhs_reg, rhs_reg); return;
-        case BIN_GT: asm_emit(gen, "  slt a0, %s, %s\n", rhs_reg, lhs_reg); return;
-        case BIN_LE:
-            asm_emit(gen, "  slt a0, %s, %s\n", rhs_reg, lhs_reg);
-            asm_emit(gen, "  xori a0, a0, 1\n");
-            return;
-        case BIN_GE:
-            asm_emit(gen, "  slt a0, %s, %s\n", lhs_reg, rhs_reg);
-            asm_emit(gen, "  xori a0, a0, 1\n");
-            return;
-        case BIN_EQ:
-            asm_emit(gen, "  subw a0, %s, %s\n", lhs_reg, rhs_reg);
-            asm_emit(gen, "  seqz a0, a0\n");
-            return;
-        case BIN_NE:
-            asm_emit(gen, "  subw a0, %s, %s\n", lhs_reg, rhs_reg);
-            asm_emit(gen, "  snez a0, a0\n");
-            return;
-        default:
-            asm_load_imm(gen, "a0", 0);
-            return;
-    }
-}
-
-static bool asm_try_gen_binary_no_stack(AsmGen *gen, BinaryOp op, Expr *lhs, Expr *rhs) {
-    if (asm_can_load_simple_int_expr(gen, rhs)) {
-        asm_gen_expr(gen, lhs);
-        asm_emit(gen, "  mv t0, a0\n");
-        asm_try_load_simple_int_expr_to_reg(gen, rhs, "t1");
-        asm_emit_binary_regs_to_a0(gen, op, "t0", "t1");
-        return true;
-    }
-    if (asm_arg_is_side_effect_free(rhs) &&
-        asm_can_load_simple_int_expr(gen, lhs)) {
-        asm_gen_expr(gen, rhs);
-        asm_emit(gen, "  mv t1, a0\n");
-        asm_try_load_simple_int_expr_to_reg(gen, lhs, "t0");
-        asm_emit_binary_regs_to_a0(gen, op, "t0", "t1");
-        return true;
-    }
-    return false;
-}
-
-static void asm_gen_expr(AsmGen *gen, Expr *expr) {
-    if (expr == NULL) {
-        asm_load_imm(gen, "a0", 0);
-        return;
-    }
-    int const_value = 0;
-    if (asm_eval_int_const_expr(gen, expr, &const_value)) {
-        asm_load_imm(gen, "a0", const_value);
-        return;
-    }
-    switch (expr->kind) {
-        case EXPR_NUMBER:
-        case EXPR_FLOAT_NUMBER:
-            asm_load_imm(gen, "a0", expr->data.number);
-            return;
-        case EXPR_LVAL:
-            asm_gen_lval_expr(gen, expr->data.lval);
-            return;
-        case EXPR_GETINT:
-            asm_emit(gen, "  call getint\n");
-            return;
-        case EXPR_CALL: {
-            const char *name = expr->data.call.name;
-            if (strcmp(name, "starttime") == 0) {
-                asm_load_imm(gen, "a0", 0);
-                asm_emit(gen, "  call _sysy_starttime\n");
-                asm_load_imm(gen, "a0", 0);
-                return;
-            }
-            if (strcmp(name, "stoptime") == 0) {
-                asm_load_imm(gen, "a0", 0);
-                asm_emit(gen, "  call _sysy_stoptime\n");
-                asm_load_imm(gen, "a0", 0);
-                return;
-            }
-            if (strcmp(name, "getfloat") == 0) {
-                asm_emit(gen, "  call getfloat\n");
-                asm_emit(gen, "  fmv.x.w a0, fa0\n");
-                return;
-            }
-            if (strcmp(name, "putfloat") == 0 && expr->data.call.args.count > 0) {
-                asm_gen_expr(gen, expr->data.call.args.items[0]);
-                asm_convert_a0(gen, asm_expr_type(gen, expr->data.call.args.items[0]), TYPE_FLOAT);
-                asm_emit(gen, "  fmv.w.x fa0, a0\n");
-                asm_emit(gen, "  call putfloat\n");
-                asm_load_imm(gen, "a0", 0);
-                return;
-            }
-            FunctionSymbol *meta = lookup_function_meta((IRGen *)gen, name);
-            if (asm_try_inline_call(gen, meta, &expr->data.call.args)) {
-                return;
-            }
-            asm_call_function(gen, asm_function_name(gen, name), &expr->data.call.args, meta);
-            if (meta != NULL && meta->ret_type == TYPE_FLOAT) {
-                asm_emit(gen, "  fmv.x.w a0, fa0\n");
-            }
-            return;
-        }
-        case EXPR_UNARY:
-            if (expr->data.unary.op == UNARY_MINUS && asm_expr_type(gen, expr->data.unary.operand) == TYPE_FLOAT) {
-                asm_gen_float_to_freg(gen, expr->data.unary.operand, "ft0");
-                asm_emit(gen, "  fneg.s ft0, ft0\n");
-                asm_emit(gen, "  fmv.x.w a0, ft0\n");
-                return;
-            }
-            if (expr->data.unary.op == UNARY_NOT && asm_expr_type(gen, expr->data.unary.operand) == TYPE_FLOAT) {
-                asm_float_truth_to_a0(gen, expr->data.unary.operand);
-                asm_emit(gen, "  xori a0, a0, 1\n");
-                return;
-            }
-            asm_gen_expr(gen, expr->data.unary.operand);
-            if (expr->data.unary.op == UNARY_MINUS) {
-                asm_emit(gen, "  negw a0, a0\n");
-            } else if (expr->data.unary.op == UNARY_NOT) {
-                asm_emit(gen, "  seqz a0, a0\n");
-            }
-            return;
-        case EXPR_BINARY: {
-            BinaryOp op = expr->data.binary.op;
-            if (op == BIN_AND || op == BIN_OR) {
-                asm_gen_short_circuit_expr(gen, expr);
-                return;
-            }
-            if ((asm_expr_type(gen, expr->data.binary.lhs) == TYPE_FLOAT ||
-                 asm_expr_type(gen, expr->data.binary.rhs) == TYPE_FLOAT) &&
-                op != BIN_MOD) {
-                asm_gen_float_binary(gen, op, expr->data.binary.lhs, expr->data.binary.rhs);
-                return;
-            }
-            int rhs_const = 0;
-            if (asm_eval_int_const_expr(gen, expr->data.binary.rhs, &rhs_const) &&
-                asm_try_gen_binary_const_rhs(gen, op, expr->data.binary.lhs, rhs_const)) {
-                return;
-            }
-            int lhs_const = 0;
-            if (asm_eval_int_const_expr(gen, expr->data.binary.lhs, &lhs_const) &&
-                asm_try_gen_binary_const_lhs(gen, op, lhs_const, expr->data.binary.rhs)) {
-                return;
-            }
-            if (asm_try_gen_binary_no_stack(gen, op, expr->data.binary.lhs, expr->data.binary.rhs)) {
-                return;
-            }
-            asm_gen_expr(gen, expr->data.binary.lhs);
-            asm_push_a0(gen);
-            asm_gen_expr(gen, expr->data.binary.rhs);
-            asm_emit(gen, "  mv t1, a0\n");
-            asm_pop_to(gen, "t0");
-            asm_emit_binary_regs_to_a0(gen, op, "t0", "t1");
-            return;
-        }
-    }
-}
-
-static void asm_gen_cond(AsmGen *gen, Expr *expr, const char *true_label, const char *false_label) {
-    int const_value = 0;
-    if (asm_eval_int_const_expr(gen, expr, &const_value)) {
-        asm_emit(gen, "  j %s\n", const_value ? true_label : false_label);
-        gen->current_block_terminated = true;
-        return;
-    }
-    if (expr->kind == EXPR_BINARY && expr->data.binary.op == BIN_OR) {
-        char *mid = asm_new_label(gen, "lor_rhs");
-        asm_gen_cond(gen, expr->data.binary.lhs, true_label, mid);
-        asm_mark_label(gen, mid);
-        asm_gen_cond(gen, expr->data.binary.rhs, true_label, false_label);
-        return;
-    }
-    if (expr->kind == EXPR_BINARY && expr->data.binary.op == BIN_AND) {
-        char *mid = asm_new_label(gen, "land_rhs");
-        asm_gen_cond(gen, expr->data.binary.lhs, mid, false_label);
-        asm_mark_label(gen, mid);
-        asm_gen_cond(gen, expr->data.binary.rhs, true_label, false_label);
-        return;
-    }
-    if (asm_expr_type(gen, expr) == TYPE_FLOAT) {
-        asm_float_truth_to_a0(gen, expr);
-        asm_emit(gen, "  bnez a0, %s\n", true_label);
-        asm_emit(gen, "  j %s\n", false_label);
-        gen->current_block_terminated = true;
-        return;
-    }
-    asm_gen_expr(gen, expr);
-    asm_emit(gen, "  bnez a0, %s\n", true_label);
-    asm_emit(gen, "  j %s\n", false_label);
-    gen->current_block_terminated = true;
-}
-
-typedef enum {
-    DAG_VALUE_CONST,
-    DAG_VALUE_VAR,
-    DAG_VALUE_UNARY,
-    DAG_VALUE_BINARY
-} AsmDagValueKind;
-
-typedef struct {
-    AsmDagValueKind kind;
-    int value;
-    Symbol *sym;
-    UnaryOp unary_op;
-    BinaryOp binary_op;
-    int lhs;
-    int rhs;
-    int slot;
-    int ref_count;
-    bool emitted;
-} AsmDagNode;
-
-typedef struct {
-    Symbol *sym;
-    int node;
-} AsmDagBinding;
-
-typedef struct {
-    AsmDagNode *nodes;
-    int node_count;
-    int node_capacity;
-    AsmDagBinding *env;
-    int env_count;
-    int env_capacity;
-    AsmDagBinding *targets;
-    int target_count;
-    int target_capacity;
-    bool has_duplicate;
-    bool has_overwrite;
-    bool has_const_fold;
-    bool has_const_propagation;
-} AsmDagBlock;
-
-static bool asm_dag_binary_commutative(BinaryOp op) {
-    return op == BIN_ADD || op == BIN_MUL || op == BIN_EQ || op == BIN_NE;
-}
-
-static bool asm_dag_eval_binary(BinaryOp op, int lhs, int rhs, int *out) {
-    if ((op == BIN_DIV || op == BIN_MOD) && rhs == 0) {
-        return false;
-    }
-    switch (op) {
-        case BIN_ADD: *out = lhs + rhs; return true;
-        case BIN_SUB: *out = lhs - rhs; return true;
-        case BIN_MUL: *out = lhs * rhs; return true;
-        case BIN_DIV: *out = lhs / rhs; return true;
-        case BIN_MOD: *out = lhs % rhs; return true;
-        case BIN_LT: *out = lhs < rhs; return true;
-        case BIN_GT: *out = lhs > rhs; return true;
-        case BIN_LE: *out = lhs <= rhs; return true;
-        case BIN_GE: *out = lhs >= rhs; return true;
-        case BIN_EQ: *out = lhs == rhs; return true;
-        case BIN_NE: *out = lhs != rhs; return true;
-        case BIN_AND:
-        case BIN_OR:
-            return false;
-    }
-    return false;
-}
-
-static bool asm_dag_symbol_is_local_int_scalar(Symbol *sym) {
-    return sym != NULL && !sym->is_global && !sym->info.is_param_array &&
-           sym->value_type == TYPE_INT && sym->info.dim_count == 0;
-}
-
-static Symbol *asm_dag_lval_local_int_scalar(AsmGen *gen, LVal *lval) {
-    if (lval == NULL || lval->indices.count != 0) {
-        return NULL;
-    }
-    Symbol *sym = lookup_symbol((IRGen *)gen, lval->name);
-    return asm_dag_symbol_is_local_int_scalar(sym) ? sym : NULL;
-}
-
-static bool asm_dag_expr_supported(AsmGen *gen, Expr *expr) {
-    if (expr == NULL) {
-        return true;
-    }
-    if (asm_expr_type(gen, expr) != TYPE_INT) {
-        return false;
-    }
-    switch (expr->kind) {
-        case EXPR_NUMBER:
-            return true;
-        case EXPR_LVAL: {
-            Symbol *sym = lookup_symbol((IRGen *)gen, expr->data.lval->name);
-            if (sym != NULL && sym->is_const_scalar && expr->data.lval->indices.count == 0 &&
-                sym->value_type == TYPE_INT) {
-                return true;
-            }
-            return asm_dag_lval_local_int_scalar(gen, expr->data.lval) != NULL;
-        }
-        case EXPR_UNARY:
-            return asm_dag_expr_supported(gen, expr->data.unary.operand);
-        case EXPR_BINARY:
-            if (expr->data.binary.op == BIN_AND || expr->data.binary.op == BIN_OR) {
-                return false;
-            }
-            return asm_dag_expr_supported(gen, expr->data.binary.lhs) &&
-                   asm_dag_expr_supported(gen, expr->data.binary.rhs);
-        default:
-            return false;
-    }
-}
-
-static bool asm_dag_stmt_supported(AsmGen *gen, Stmt *stmt) {
-    if (stmt == NULL || stmt->kind != STMT_ASSIGN) {
-        return false;
-    }
-    if (asm_dag_lval_local_int_scalar(gen, stmt->data.assign_stmt.lval) == NULL) {
-        return false;
-    }
-    return asm_dag_expr_supported(gen, stmt->data.assign_stmt.expr);
-}
-
-static int asm_dag_find_binding(AsmDagBinding *items, int count, Symbol *sym) {
-    for (int i = 0; i < count; ++i) {
-        if (items[i].sym == sym) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static void asm_dag_set_binding(AsmDagBinding **items, int *count, int *capacity,
-                                Symbol *sym, int node, bool *overwritten) {
-    int index = asm_dag_find_binding(*items, *count, sym);
-    if (index >= 0) {
-        (*items)[index].node = node;
-        if (overwritten != NULL) {
-            *overwritten = true;
-        }
-        return;
-    }
-    ensure_capacity((void **)items, capacity, sizeof(AsmDagBinding), *count + 1);
-    (*items)[*count].sym = sym;
-    (*items)[*count].node = node;
-    ++(*count);
-}
-
-static void asm_dag_init(AsmDagBlock *dag) {
-    memset(dag, 0, sizeof(*dag));
-}
-
-static void asm_dag_free(AsmDagBlock *dag) {
-    free(dag->nodes);
-    free(dag->env);
-    free(dag->targets);
-}
-
-static int asm_dag_add_node(AsmDagBlock *dag, AsmDagNode node) {
-    ensure_capacity((void **)&dag->nodes, &dag->node_capacity, sizeof(AsmDagNode), dag->node_count + 1);
-    dag->nodes[dag->node_count] = node;
-    return dag->node_count++;
-}
-
-static int asm_dag_node_const(AsmDagBlock *dag, int value) {
-    for (int i = 0; i < dag->node_count; ++i) {
-        if (dag->nodes[i].kind == DAG_VALUE_CONST && dag->nodes[i].value == value) {
-            return i;
-        }
-    }
-    AsmDagNode node;
-    memset(&node, 0, sizeof(node));
-    node.kind = DAG_VALUE_CONST;
-    node.value = value;
-    node.slot = INT_MIN;
-    return asm_dag_add_node(dag, node);
-}
-
-static int asm_dag_node_var(AsmDagBlock *dag, Symbol *sym) {
-    for (int i = 0; i < dag->node_count; ++i) {
-        if (dag->nodes[i].kind == DAG_VALUE_VAR && dag->nodes[i].sym == sym) {
-            return i;
-        }
-    }
-    AsmDagNode node;
-    memset(&node, 0, sizeof(node));
-    node.kind = DAG_VALUE_VAR;
-    node.sym = sym;
-    node.slot = INT_MIN;
-    return asm_dag_add_node(dag, node);
-}
-
-static int asm_dag_node_unary(AsmDagBlock *dag, UnaryOp op, int child) {
-    AsmDagNode *c = &dag->nodes[child];
-    if (op == UNARY_PLUS) {
-        if (c->kind == DAG_VALUE_CONST) {
-            dag->has_const_fold = true;
-        }
-        return child;
-    }
-    if (c->kind == DAG_VALUE_CONST) {
-        dag->has_const_fold = true;
-        return asm_dag_node_const(dag, op == UNARY_MINUS ? -c->value : !c->value);
-    }
-    for (int i = 0; i < dag->node_count; ++i) {
-        if (dag->nodes[i].kind == DAG_VALUE_UNARY &&
-            dag->nodes[i].unary_op == op && dag->nodes[i].lhs == child) {
-            dag->has_duplicate = true;
-            return i;
-        }
-    }
-    AsmDagNode node;
-    memset(&node, 0, sizeof(node));
-    node.kind = DAG_VALUE_UNARY;
-    node.unary_op = op;
-    node.lhs = child;
-    node.slot = INT_MIN;
-    return asm_dag_add_node(dag, node);
-}
-
-static int asm_dag_node_binary(AsmDagBlock *dag, BinaryOp op, int lhs, int rhs) {
-    AsmDagNode *l = &dag->nodes[lhs];
-    AsmDagNode *r = &dag->nodes[rhs];
-    int folded = 0;
-    if (l->kind == DAG_VALUE_CONST && r->kind == DAG_VALUE_CONST &&
-        asm_dag_eval_binary(op, l->value, r->value, &folded)) {
-        dag->has_const_fold = true;
-        return asm_dag_node_const(dag, folded);
-    }
-    if (asm_dag_binary_commutative(op) && rhs < lhs) {
-        int tmp = lhs;
-        lhs = rhs;
-        rhs = tmp;
-        l = &dag->nodes[lhs];
-        r = &dag->nodes[rhs];
-    }
-    if (op == BIN_ADD && r->kind == DAG_VALUE_CONST && r->value == 0) {
-        dag->has_const_fold = true;
-        return lhs;
-    }
-    if (op == BIN_ADD && l->kind == DAG_VALUE_CONST && l->value == 0) {
-        dag->has_const_fold = true;
-        return rhs;
-    }
-    if (op == BIN_SUB && r->kind == DAG_VALUE_CONST && r->value == 0) {
-        dag->has_const_fold = true;
-        return lhs;
-    }
-    if (op == BIN_MUL && r->kind == DAG_VALUE_CONST && r->value == 1) {
-        dag->has_const_fold = true;
-        return lhs;
-    }
-    if (op == BIN_MUL && l->kind == DAG_VALUE_CONST && l->value == 1) {
-        dag->has_const_fold = true;
-        return rhs;
-    }
-    if (op == BIN_MUL &&
-        ((r->kind == DAG_VALUE_CONST && r->value == 0) ||
-         (l->kind == DAG_VALUE_CONST && l->value == 0))) {
-        dag->has_const_fold = true;
-        return asm_dag_node_const(dag, 0);
-    }
-    if (op == BIN_DIV && r->kind == DAG_VALUE_CONST && r->value == 1) {
-        dag->has_const_fold = true;
-        return lhs;
-    }
-    if (op == BIN_MOD && r->kind == DAG_VALUE_CONST && (r->value == 1 || r->value == -1)) {
-        dag->has_const_fold = true;
-        return asm_dag_node_const(dag, 0);
-    }
-    if (lhs == rhs) {
-        if (op == BIN_EQ || op == BIN_LE || op == BIN_GE) {
-            dag->has_const_fold = true;
-            return asm_dag_node_const(dag, 1);
-        }
-        if (op == BIN_NE || op == BIN_LT || op == BIN_GT || op == BIN_SUB) {
-            dag->has_const_fold = true;
-            return asm_dag_node_const(dag, 0);
-        }
-    }
-    for (int i = 0; i < dag->node_count; ++i) {
-        if (dag->nodes[i].kind == DAG_VALUE_BINARY &&
-            dag->nodes[i].binary_op == op && dag->nodes[i].lhs == lhs && dag->nodes[i].rhs == rhs) {
-            dag->has_duplicate = true;
-            return i;
-        }
-    }
-    AsmDagNode node;
-    memset(&node, 0, sizeof(node));
-    node.kind = DAG_VALUE_BINARY;
-    node.binary_op = op;
-    node.lhs = lhs;
-    node.rhs = rhs;
-    node.slot = INT_MIN;
-    return asm_dag_add_node(dag, node);
-}
-
-static int asm_dag_build_expr(AsmGen *gen, AsmDagBlock *dag, Expr *expr) {
-    if (expr == NULL) {
-        return asm_dag_node_const(dag, 0);
-    }
-    switch (expr->kind) {
-        case EXPR_NUMBER:
-            return asm_dag_node_const(dag, expr->data.number);
-        case EXPR_LVAL: {
-            Symbol *sym = lookup_symbol((IRGen *)gen, expr->data.lval->name);
-            if (sym != NULL && sym->is_const_scalar && expr->data.lval->indices.count == 0 &&
-                sym->value_type == TYPE_INT) {
-                return asm_dag_node_const(dag, sym->const_scalar);
-            }
-            int index = asm_dag_find_binding(dag->env, dag->env_count, sym);
-            if (index >= 0) {
-                if (dag->nodes[dag->env[index].node].kind == DAG_VALUE_CONST) {
-                    dag->has_const_propagation = true;
-                }
-                return dag->env[index].node;
-            }
-            return asm_dag_node_var(dag, sym);
-        }
-        case EXPR_UNARY:
-            return asm_dag_node_unary(dag, expr->data.unary.op,
-                                      asm_dag_build_expr(gen, dag, expr->data.unary.operand));
-        case EXPR_BINARY:
-            return asm_dag_node_binary(dag, expr->data.binary.op,
-                                       asm_dag_build_expr(gen, dag, expr->data.binary.lhs),
-                                       asm_dag_build_expr(gen, dag, expr->data.binary.rhs));
-        default:
-            return asm_dag_node_const(dag, 0);
-    }
-}
-
-static void asm_dag_add_stmt(AsmGen *gen, AsmDagBlock *dag, Stmt *stmt) {
-    Symbol *target = asm_dag_lval_local_int_scalar(gen, stmt->data.assign_stmt.lval);
-    int node = asm_dag_build_expr(gen, dag, stmt->data.assign_stmt.expr);
-    asm_dag_set_binding(&dag->env, &dag->env_count, &dag->env_capacity,
-                        target, node, NULL);
-    asm_dag_set_binding(&dag->targets, &dag->target_count, &dag->target_capacity,
-                        target, node, &dag->has_overwrite);
-}
-
-static void asm_dag_count_node_refs(AsmDagBlock *dag) {
-    for (int i = 0; i < dag->node_count; ++i) {
-        dag->nodes[i].ref_count = 0;
-    }
-    for (int i = 0; i < dag->target_count; ++i) {
-        dag->nodes[dag->targets[i].node].ref_count++;
-    }
-    for (int i = 0; i < dag->node_count; ++i) {
-        AsmDagNode *node = &dag->nodes[i];
-        if (node->kind == DAG_VALUE_UNARY) {
-            dag->nodes[node->lhs].ref_count++;
-        } else if (node->kind == DAG_VALUE_BINARY) {
-            dag->nodes[node->lhs].ref_count++;
-            dag->nodes[node->rhs].ref_count++;
-        }
-    }
-}
-
-static bool asm_dag_node_depends_on_var(AsmDagBlock *dag, int id, Symbol *sym) {
-    AsmDagNode *node = &dag->nodes[id];
-    switch (node->kind) {
-        case DAG_VALUE_VAR:
-            return node->sym == sym;
-        case DAG_VALUE_UNARY:
-            return asm_dag_node_depends_on_var(dag, node->lhs, sym);
-        case DAG_VALUE_BINARY:
-            return asm_dag_node_depends_on_var(dag, node->lhs, sym) ||
-                   asm_dag_node_depends_on_var(dag, node->rhs, sym);
-        default:
-            return false;
-    }
-}
-
-static bool asm_dag_can_store_direct(AsmDagBlock *dag) {
-    if (dag->has_overwrite) {
-        return false;
-    }
-    for (int i = 0; i < dag->target_count; ++i) {
-        Symbol *target = dag->targets[i].sym;
-        for (int j = i + 1; j < dag->target_count; ++j) {
-            if (asm_dag_node_depends_on_var(dag, dag->targets[j].node, target)) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-static void asm_dag_emit_node(AsmGen *gen, AsmDagBlock *dag, int id);
-
-static bool asm_dag_emit_binary_const_rhs(AsmGen *gen, AsmDagBlock *dag,
-                                          BinaryOp op, int lhs, int rhs) {
-    if ((op == BIN_DIV || op == BIN_MOD) && rhs == 0) {
-        return false;
-    }
-    switch (op) {
-        case BIN_ADD:
-            asm_dag_emit_node(gen, dag, lhs);
-            asm_emit_addw_imm(gen, "a0", "a0", rhs);
-            return true;
-        case BIN_SUB:
-            asm_dag_emit_node(gen, dag, lhs);
-            asm_emit_subw_imm(gen, "a0", "a0", rhs);
-            return true;
-        case BIN_MUL:
-            asm_dag_emit_node(gen, dag, lhs);
-            if (!asm_emit_mul_const(gen, "a0", "a0", rhs)) {
-                asm_load_imm(gen, "t1", rhs);
-                asm_emit(gen, "  mulw a0, a0, t1\n");
-            }
-            return true;
-        case BIN_DIV:
-            asm_dag_emit_node(gen, dag, lhs);
-            if (!asm_emit_div_const(gen, "a0", "a0", rhs)) {
-                asm_load_imm(gen, "t1", rhs);
-                asm_emit(gen, "  divw a0, a0, t1\n");
-            }
-            return true;
-        case BIN_MOD:
-            asm_dag_emit_node(gen, dag, lhs);
-            if (!asm_emit_mod_const(gen, "a0", "a0", rhs)) {
-                asm_load_imm(gen, "t1", rhs);
-                asm_emit(gen, "  remw a0, a0, t1\n");
-            }
-            return true;
-        case BIN_LT:
-        case BIN_GT:
-        case BIN_LE:
-        case BIN_GE:
-        case BIN_EQ:
-        case BIN_NE:
-            asm_dag_emit_node(gen, dag, lhs);
-            asm_emit_compare_const_rhs(gen, op, rhs);
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool asm_dag_emit_binary_const_lhs(AsmGen *gen, AsmDagBlock *dag,
-                                          BinaryOp op, int lhs, int rhs) {
-    switch (op) {
-        case BIN_ADD:
-            return asm_dag_emit_binary_const_rhs(gen, dag, BIN_ADD, rhs, lhs);
-        case BIN_MUL:
-            return asm_dag_emit_binary_const_rhs(gen, dag, BIN_MUL, rhs, lhs);
-        case BIN_SUB:
-            asm_dag_emit_node(gen, dag, rhs);
-            asm_load_imm(gen, "t0", lhs);
-            asm_emit(gen, "  subw a0, t0, a0\n");
-            return true;
-        case BIN_LT:
-            asm_dag_emit_node(gen, dag, rhs);
-            asm_load_imm(gen, "t0", lhs);
-            asm_emit(gen, "  slt a0, t0, a0\n");
-            return true;
-        case BIN_GT:
-            asm_dag_emit_node(gen, dag, rhs);
-            asm_load_imm(gen, "t0", lhs);
-            asm_emit(gen, "  slt a0, a0, t0\n");
-            return true;
-        case BIN_LE:
-            asm_dag_emit_node(gen, dag, rhs);
-            asm_load_imm(gen, "t0", lhs);
-            asm_emit(gen, "  slt a0, a0, t0\n");
-            asm_emit(gen, "  xori a0, a0, 1\n");
-            return true;
-        case BIN_GE:
-            asm_dag_emit_node(gen, dag, rhs);
-            asm_load_imm(gen, "t0", lhs);
-            asm_emit(gen, "  slt a0, t0, a0\n");
-            asm_emit(gen, "  xori a0, a0, 1\n");
-            return true;
-        case BIN_EQ:
-        case BIN_NE:
-            return asm_dag_emit_binary_const_rhs(gen, dag, op, rhs, lhs);
-        default:
-            return false;
-    }
-}
-
-static void asm_dag_emit_node(AsmGen *gen, AsmDagBlock *dag, int id) {
-    AsmDagNode *node = &dag->nodes[id];
-    if ((node->kind == DAG_VALUE_UNARY || node->kind == DAG_VALUE_BINARY) && node->emitted) {
-        asm_emit_load(gen, "a0", node->slot, "s0");
-        return;
-    }
-    switch (node->kind) {
-        case DAG_VALUE_CONST:
-            asm_load_imm(gen, "a0", node->value);
-            return;
-        case DAG_VALUE_VAR:
-            asm_emit_load(gen, "a0", node->sym->stack_offset, "s0");
-            return;
-        case DAG_VALUE_UNARY:
-            asm_dag_emit_node(gen, dag, node->lhs);
-            if (node->unary_op == UNARY_MINUS) {
-                asm_emit(gen, "  negw a0, a0\n");
-            } else if (node->unary_op == UNARY_NOT) {
-                asm_emit(gen, "  seqz a0, a0\n");
-            }
-            break;
-        case DAG_VALUE_BINARY:
-            if (dag->nodes[node->rhs].kind == DAG_VALUE_CONST &&
-                asm_dag_emit_binary_const_rhs(gen, dag, node->binary_op, node->lhs,
-                                              dag->nodes[node->rhs].value)) {
-                break;
-            }
-            if (dag->nodes[node->lhs].kind == DAG_VALUE_CONST &&
-                asm_dag_emit_binary_const_lhs(gen, dag, node->binary_op,
-                                              dag->nodes[node->lhs].value, node->rhs)) {
-                break;
-            }
-            asm_dag_emit_node(gen, dag, node->lhs);
-            asm_push_a0(gen);
-            asm_dag_emit_node(gen, dag, node->rhs);
-            asm_emit(gen, "  mv t1, a0\n");
-            asm_pop_to(gen, "t0");
-            switch (node->binary_op) {
-                case BIN_ADD: asm_emit(gen, "  addw a0, t0, t1\n"); break;
-                case BIN_SUB: asm_emit(gen, "  subw a0, t0, t1\n"); break;
-                case BIN_MUL: asm_emit(gen, "  mulw a0, t0, t1\n"); break;
-                case BIN_DIV: asm_emit(gen, "  divw a0, t0, t1\n"); break;
-                case BIN_MOD: asm_emit(gen, "  remw a0, t0, t1\n"); break;
-                case BIN_LT: asm_emit(gen, "  slt a0, t0, t1\n"); break;
-                case BIN_GT: asm_emit(gen, "  slt a0, t1, t0\n"); break;
-                case BIN_LE:
-                    asm_emit(gen, "  slt a0, t1, t0\n");
-                    asm_emit(gen, "  xori a0, a0, 1\n");
-                    break;
-                case BIN_GE:
-                    asm_emit(gen, "  slt a0, t0, t1\n");
-                    asm_emit(gen, "  xori a0, a0, 1\n");
-                    break;
-                case BIN_EQ:
-                    asm_emit(gen, "  subw a0, t0, t1\n");
-                    asm_emit(gen, "  seqz a0, a0\n");
-                    break;
-                case BIN_NE:
-                    asm_emit(gen, "  subw a0, t0, t1\n");
-                    asm_emit(gen, "  snez a0, a0\n");
-                    break;
-                default:
-                    asm_load_imm(gen, "a0", 0);
-                    break;
-            }
-            break;
-    }
-    if (node->ref_count > 1) {
-        if (node->slot == INT_MIN) {
-            node->slot = asm_alloc_stack(gen, 4);
-        }
-        asm_emit_store(gen, "a0", node->slot, "s0");
-        node->emitted = true;
-    }
-}
-
-static bool asm_try_gen_dag_block(AsmGen *gen, Stmt **stmts, int count) {
-    (void)gen;
-    (void)stmts;
-    (void)count;
-    return false;
-#if 0
-    if (count < 2) {
-        return false;
-    }
-    AsmDagBlock dag;
-    asm_dag_init(&dag);
-    for (int i = 0; i < count; ++i) {
-        asm_dag_add_stmt(gen, &dag, stmts[i]);
-    }
-    if (!dag.has_duplicate && !dag.has_const_fold && !dag.has_const_propagation) {
-        asm_dag_free(&dag);
-        return false;
-    }
-    asm_dag_count_node_refs(&dag);
-    if (asm_dag_can_store_direct(&dag)) {
-        for (int i = 0; i < dag.target_count; ++i) {
-            asm_dag_emit_node(gen, &dag, dag.targets[i].node);
-            asm_emit_store(gen, "a0", dag.targets[i].sym->stack_offset, "s0");
-        }
-        asm_dag_free(&dag);
-        return true;
-    }
-    int *result_slots = (int *)xmalloc(sizeof(int) * (size_t)dag.target_count);
-    for (int i = 0; i < dag.target_count; ++i) {
-        asm_dag_emit_node(gen, &dag, dag.targets[i].node);
-        result_slots[i] = asm_alloc_stack(gen, 4);
-        asm_emit_store(gen, "a0", result_slots[i], "s0");
-    }
-    for (int i = 0; i < dag.target_count; ++i) {
-        asm_emit_load(gen, "a0", result_slots[i], "s0");
-        asm_emit_store(gen, "a0", dag.targets[i].sym->stack_offset, "s0");
-    }
-    free(result_slots);
-    asm_dag_free(&dag);
-    return true;
-#endif
-}
-
-static void asm_gen_decl(AsmGen *gen, Decl *decl, bool is_global);
-static void asm_gen_stmt(AsmGen *gen, Stmt *stmt);
-
-static void asm_gen_block(AsmGen *gen, Block *block, bool new_scope) {
-    if (new_scope) {
-        push_scope((IRGen *)gen);
-    }
-    for (int i = 0; i < block->items.count;) {
-        if (block->items.kinds[i] == BLOCK_ITEM_DECL) {
-            asm_gen_decl(gen, (Decl *)block->items.items[i], false);
-            ++i;
-        } else {
-            Stmt *stmt = (Stmt *)block->items.items[i];
-            if (asm_dag_stmt_supported(gen, stmt)) {
-                int start = i;
-                while (i < block->items.count && block->items.kinds[i] == BLOCK_ITEM_STMT &&
-                       asm_dag_stmt_supported(gen, (Stmt *)block->items.items[i])) {
-                    ++i;
-                }
-                int count = i - start;
-                Stmt **stmts = (Stmt **)xmalloc(sizeof(Stmt *) * (size_t)count);
-                for (int j = 0; j < count; ++j) {
-                    stmts[j] = (Stmt *)block->items.items[start + j];
-                }
-                if (asm_try_gen_dag_block(gen, stmts, count)) {
-                    free(stmts);
-                    continue;
-                }
-                free(stmts);
-                for (int j = start; j < i; ++j) {
-                    asm_gen_stmt(gen, (Stmt *)block->items.items[j]);
-                }
-                continue;
-            }
-            asm_gen_stmt(gen, stmt);
-            ++i;
-        }
-    }
-    if (new_scope) {
-        pop_scope((IRGen *)gen);
-    }
-}
-
-static void asm_gen_printf(AsmGen *gen, char *format, ExprList *args) {
-    int arg_index = 0;
-    int len = (int)strlen(format);
-    for (int i = 1; i < len - 1; ++i) {
-        if (format[i] == '%' && i + 1 < len - 1) {
-            char spec = format[++i];
-            if (spec == 'd') {
-                Expr *arg = args->items[arg_index++];
-                asm_gen_expr(gen, arg);
-                asm_convert_a0(gen, asm_expr_type(gen, arg), TYPE_INT);
-                asm_emit(gen, "  call putint\n");
-            } else if (spec == 'c') {
-                Expr *arg = args->items[arg_index++];
-                asm_gen_expr(gen, arg);
-                asm_convert_a0(gen, asm_expr_type(gen, arg), TYPE_INT);
-                asm_emit(gen, "  call putch\n");
-            } else if (spec == 'a' || spec == 'f') {
-                Expr *arg = args->items[arg_index++];
-                asm_gen_expr(gen, arg);
-                asm_convert_a0(gen, asm_expr_type(gen, arg), TYPE_FLOAT);
-                asm_emit(gen, "  fmv.w.x fa0, a0\n");
-                asm_emit(gen, "  call putfloat\n");
-            } else if (spec == '%') {
-                asm_load_imm(gen, "a0", '%');
-                asm_emit(gen, "  call putch\n");
-            } else {
-                asm_load_imm(gen, "a0", '%');
-                asm_emit(gen, "  call putch\n");
-                asm_load_imm(gen, "a0", (unsigned char)spec);
-                asm_emit(gen, "  call putch\n");
-            }
-        } else if (format[i] == '\\' && i + 1 < len - 1) {
-            int ch = format[i + 1] == 'n' ? 10 : (format[i + 1] == 't' ? 9 : format[i + 1]);
-            asm_load_imm(gen, "a0", ch);
-            asm_emit(gen, "  call putch\n");
-            ++i;
-        } else {
-            asm_load_imm(gen, "a0", (unsigned char)format[i]);
-            asm_emit(gen, "  call putch\n");
-        }
-    }
-}
-
-static void asm_gen_stmt(AsmGen *gen, Stmt *stmt) {
-    switch (stmt->kind) {
-        case STMT_ASSIGN: {
-            Symbol *scalar = asm_scalar_lval_target(gen, stmt->data.assign_stmt.lval);
-            if (scalar != NULL) {
-                asm_gen_expr(gen, stmt->data.assign_stmt.expr);
-                asm_convert_a0(gen, asm_expr_type(gen, stmt->data.assign_stmt.expr),
-                               scalar->value_type);
-                asm_store_scalar_reg(gen, scalar, "a0");
-                return;
-            }
-            asm_lval_address(gen, stmt->data.assign_stmt.lval);
-            asm_push_a0(gen);
-            asm_gen_expr(gen, stmt->data.assign_stmt.expr);
-            asm_convert_a0(gen, asm_expr_type(gen, stmt->data.assign_stmt.expr),
-                           asm_lval_type(gen, stmt->data.assign_stmt.lval));
-            asm_emit(gen, "  mv t0, a0\n");
-            asm_pop_to(gen, "t1");
-            asm_emit_store(gen, "t0", 0, "t1");
-            return;
-        }
-        case STMT_EXPR:
-            asm_gen_expr(gen, stmt->data.expr_stmt);
-            return;
-        case STMT_BLOCK:
-            asm_gen_block(gen, stmt->data.block_stmt, true);
-            return;
-        case STMT_IF: {
-            char *then_label = asm_new_label(gen, "if_then");
-            char *else_label = asm_new_label(gen, "if_else");
-            char *end_label = asm_new_label(gen, "if_end");
-            asm_gen_cond(gen, stmt->data.if_stmt.cond, then_label,
-                         stmt->data.if_stmt.else_stmt ? else_label : end_label);
-            asm_mark_label(gen, then_label);
-            asm_gen_stmt(gen, stmt->data.if_stmt.then_stmt);
-            if (!gen->current_block_terminated) {
-                asm_emit(gen, "  j %s\n", end_label);
-                gen->current_block_terminated = true;
-            }
-            if (stmt->data.if_stmt.else_stmt != NULL) {
-                asm_mark_label(gen, else_label);
-                asm_gen_stmt(gen, stmt->data.if_stmt.else_stmt);
-                if (!gen->current_block_terminated) {
-                    asm_emit(gen, "  j %s\n", end_label);
-                    gen->current_block_terminated = true;
-                }
-            }
-            asm_mark_label(gen, end_label);
-            return;
-        }
-        case STMT_WHILE: {
-            char *cond_label = asm_new_label(gen, "while_cond");
-            char *body_label = asm_new_label(gen, "while_body");
-            char *end_label = asm_new_label(gen, "while_end");
-            asm_mark_label(gen, cond_label);
-            string_list_push(&gen->break_labels, end_label);
-            string_list_push(&gen->continue_labels, cond_label);
-            asm_gen_cond(gen, stmt->data.while_stmt.cond, body_label, end_label);
-            asm_mark_label(gen, body_label);
-            asm_gen_stmt(gen, stmt->data.while_stmt.body);
-            if (!gen->current_block_terminated) {
-                asm_emit(gen, "  j %s\n", cond_label);
-                gen->current_block_terminated = true;
-            }
-            gen->break_labels.count--;
-            gen->continue_labels.count--;
-            asm_mark_label(gen, end_label);
-            return;
-        }
-        case STMT_BREAK:
-            asm_emit(gen, "  j %s\n", gen->break_labels.items[gen->break_labels.count - 1]);
-            gen->current_block_terminated = true;
-            return;
-        case STMT_CONTINUE:
-            asm_emit(gen, "  j %s\n", gen->continue_labels.items[gen->continue_labels.count - 1]);
-            gen->current_block_terminated = true;
-            return;
-        case STMT_RETURN:
-            if (stmt->data.return_expr == NULL) {
-                asm_load_imm(gen, "a0", 0);
-            } else {
-                asm_gen_expr(gen, stmt->data.return_expr);
-                asm_convert_a0(gen, asm_expr_type(gen, stmt->data.return_expr), gen->current_ret_type);
-            }
-            if (gen->current_ret_type == TYPE_FLOAT) {
-                asm_emit(gen, "  fmv.w.x fa0, a0\n");
-            }
-            asm_emit(gen, "  j %s\n", gen->return_label);
-            gen->current_block_terminated = true;
-            return;
-        case STMT_PRINTF:
-            asm_gen_printf(gen, stmt->data.printf_stmt.format, &stmt->data.printf_stmt.args);
-            return;
-    }
-}
-
-static void asm_zero_local(AsmGen *gen, Symbol *sym) {
-    if (sym->info.total_slots <= 8) {
-        for (int i = 0; i < sym->info.total_slots; ++i) {
-            asm_emit_store(gen, "zero", sym->stack_offset + i * 4, "s0");
-        }
-        return;
-    }
-    char *loop_label = asm_new_label(gen, "zero_loop");
-    char *end_label = asm_new_label(gen, "zero_end");
-    asm_emit_add_imm(gen, "t0", "s0", sym->stack_offset);
-    asm_emit(gen, "  li t1, %d\n", sym->info.total_slots);
-    asm_mark_label(gen, loop_label);
-    asm_emit(gen, "  beqz t1, %s\n", end_label);
-    asm_emit(gen, "  sw zero, 0(t0)\n");
-    asm_emit(gen, "  addi t0, t0, 4\n");
-    asm_emit(gen, "  addi t1, t1, -1\n");
-    asm_emit(gen, "  j %s\n", loop_label);
-    gen->current_block_terminated = true;
-    asm_mark_label(gen, end_label);
-}
-
-static void asm_emit_global_flat(StrBuf *data, const int *flat, int total) {
-    int i = 0;
-    while (i < total) {
-        if (flat[i] == 0) {
-            int start = i;
-            while (i < total && flat[i] == 0) {
-                ++i;
-            }
-            sb_appendf(data, "  .zero %d\n", (i - start) * 4);
-            continue;
-        }
-        sb_appendf(data, "  .word %d\n", flat[i]);
-        ++i;
-    }
-}
-
-static void asm_gen_decl(AsmGen *gen, Decl *decl, bool is_global) {
-    for (int i = 0; i < decl->items.count; ++i) {
-        DeclItem *item = decl->items.items[i];
-        Symbol *sym = scope_add_symbol((IRGen *)gen, item->name);
-        sym->is_global = is_global;
-        sym->value_type = decl->type;
-        sym->info.dim_count = item->dims.count;
-        sym->info.dims = copy_dims(item->dims.data, item->dims.count);
-        sym->info.total_slots = object_slot_count(item->dims.data, item->dims.count);
-        sym->info.is_const = decl->is_const;
-        sym->info.is_param_array = false;
-        sym->info.is_flat_storage = item->dims.count > 0;
-        if (item->dims.count == 0) {
-            if (decl->is_const && item->init != NULL) {
-                sym->is_const_scalar = true;
-                sym->const_scalar = decl->type == TYPE_FLOAT
-                                        ? eval_const_float_bits((IRGen *)gen, item->init->expr)
-                                        : eval_const_expr((IRGen *)gen, item->init->expr);
-            }
-            if (is_global) {
-                int init_val = 0;
-                if (item->init != NULL) {
-                    init_val = decl->type == TYPE_FLOAT
-                                   ? eval_const_float_bits((IRGen *)gen, item->init->expr)
-                                   : eval_const_expr((IRGen *)gen, item->init->expr);
-                }
-                sym->llvm_name = str_printf("g%d", gen->global_id++);
-                sb_appendf(&gen->data, "  .globl %s\n  .align 2\n%s:\n  .word %d\n",
-                           sym->llvm_name, sym->llvm_name, init_val);
-            } else {
-                sym->stack_offset = asm_alloc_stack(gen, 4);
-                if (item->init != NULL) {
-                    asm_gen_expr(gen, item->init->expr);
-                    asm_convert_a0(gen, asm_expr_type(gen, item->init->expr), decl->type);
-                    asm_emit_store(gen, "a0", sym->stack_offset, "s0");
-                } else {
-                    asm_emit_store(gen, "zero", sym->stack_offset, "s0");
-                }
-            }
-        } else {
-            if (decl->is_const && item->init != NULL) {
-                sym->const_flat = const_init_to_flat_typed((IRGen *)gen, item->init, item->dims.data, item->dims.count, decl->type);
-            }
-            if (is_global) {
-                sym->llvm_name = str_printf("g%d", gen->global_id++);
-                int *flat = item->init != NULL
-                                ? const_init_to_flat_typed((IRGen *)gen, item->init, item->dims.data, item->dims.count, decl->type)
-                                : NULL;
-                if (flat == NULL) {
-                    sb_appendf(&gen->bss, "  .globl %s\n  .align 2\n%s:\n  .zero %d\n",
-                               sym->llvm_name, sym->llvm_name, sym->info.total_slots * 4);
-                } else {
-                    sb_appendf(&gen->data, "  .globl %s\n  .align 2\n%s:\n",
-                               sym->llvm_name, sym->llvm_name);
-                    asm_emit_global_flat(&gen->data, flat, sym->info.total_slots);
-                }
-            } else {
-                sym->stack_offset = asm_alloc_stack(gen, sym->info.total_slots * 4);
-                asm_zero_local(gen, sym);
-                if (item->init != NULL) {
-                    Expr **slots = init_to_expr_slots(item->init, item->dims.data, item->dims.count, sym->info.total_slots);
-                    for (int j = 0; j < sym->info.total_slots; ++j) {
-                        if (slots[j] != NULL) {
-                            asm_gen_expr(gen, slots[j]);
-                            asm_convert_a0(gen, asm_expr_type(gen, slots[j]), decl->type);
-                            asm_emit_store(gen, "a0", sym->stack_offset + j * 4, "s0");
-                        }
-                    }
-                    free(slots);
-                }
-            }
-        }
-    }
-}
-
-static void asm_gen_function(AsmGen *gen, FuncDef *func) {
-    StrBuf saved_body = gen->body;
-    sb_init(&gen->body);
-    gen->next_stack_offset = -24;
-    gen->return_label = asm_new_label(gen, "return");
-    gen->current_ret_type = func->ret_type;
-    gen->current_block_terminated = false;
-    push_scope((IRGen *)gen);
-
-    int int_reg = 0;
-    int float_reg = 0;
-    int stack_arg = 0;
-    for (int i = 0; i < func->params.count; ++i) {
-        Param *param = func->params.items[i];
-        Symbol *sym = scope_add_symbol((IRGen *)gen, param->name);
-        sym->info.is_const = false;
-        sym->value_type = param->type;
-        sym->info.dim_count = param->dims.count;
-        sym->info.dims = copy_dims(param->dims.data, param->dims.count);
-        sym->info.total_slots = param->is_array ? 1 : 1;
-        sym->info.is_param_array = param->is_array;
-        sym->stack_offset = asm_alloc_stack(gen, 8);
-        asm_store_incoming_param(gen, param, sym, &int_reg, &float_reg, &stack_arg);
-    }
-
-    asm_gen_block(gen, func->block, false);
-    if (!gen->current_block_terminated) {
-        asm_load_imm(gen, "a0", 0);
-        if (gen->current_ret_type == TYPE_FLOAT) {
-            asm_emit(gen, "  fmv.w.x fa0, a0\n");
-        }
-        asm_emit(gen, "  j %s\n", gen->return_label);
-    }
-    asm_mark_label(gen, gen->return_label);
-    gen->frame_size = align_to(-gen->next_stack_offset + 16, 16);
-
-    const char *name = asm_function_name(gen, func->name);
-    sb_appendf(&gen->text, "  .globl %s\n  .align 2\n%s:\n", name, name);
-    sb_emit_add_imm(&gen->text, "sp", "sp", -gen->frame_size);
-    sb_emit_mem(&gen->text, "sd", "ra", gen->frame_size - 8, "sp");
-    sb_emit_mem(&gen->text, "sd", "s0", gen->frame_size - 16, "sp");
-    sb_emit_add_imm(&gen->text, "s0", "sp", gen->frame_size);
-    sb_append(&gen->text, gen->body.data ? gen->body.data : "");
-    sb_emit_mem(&gen->text, "ld", "ra", gen->frame_size - 8, "sp");
-    sb_emit_mem(&gen->text, "ld", "s0", gen->frame_size - 16, "sp");
-    sb_emit_add_imm(&gen->text, "sp", "sp", gen->frame_size);
-    sb_append(&gen->text, "  ret\n\n");
-
-    pop_scope((IRGen *)gen);
-    gen->body = saved_body;
 }
 
 typedef struct RVSlot {
@@ -6162,6 +4416,7 @@ typedef struct RVSlot {
     int offset;
     int object_offset;
     int object_size;
+    int value_size;
     struct RVSlot *next;
 } RVSlot;
 
@@ -6214,8 +4469,9 @@ static bool rv_value_is_pointer(IRValue *value) {
 }
 
 static int rv_alloc_frame_bytes(RVFrame *frame, int bytes) {
-    bytes = align_to(bytes <= 0 ? 8 : bytes, 8);
-    frame->next_offset -= bytes;
+    bytes = align_to(bytes <= 0 ? 4 : bytes, 4);
+    int alignment = bytes >= 8 ? 8 : 4;
+    frame->next_offset = -align_to(-(frame->next_offset - bytes), alignment);
     return frame->next_offset;
 }
 
@@ -6231,6 +4487,10 @@ static RVSlot *rv_find_slot(RVFrame *frame, IRValue *value) {
     return NULL;
 }
 
+static int rv_value_slot_size(IRValue *value) {
+    return rv_value_is_pointer(value) ? 8 : 4;
+}
+
 static RVSlot *rv_add_value_slot(RVFrame *frame, IRValue *value) {
     RVSlot *existing = rv_find_slot(frame, value);
     if (existing != NULL) {
@@ -6239,7 +4499,8 @@ static RVSlot *rv_add_value_slot(RVFrame *frame, IRValue *value) {
     RVSlot *slot = (RVSlot *)xmalloc(sizeof(RVSlot));
     memset(slot, 0, sizeof(RVSlot));
     slot->value = value;
-    slot->offset = rv_alloc_frame_bytes(frame, 8);
+    slot->value_size = rv_value_slot_size(value);
+    slot->offset = rv_alloc_frame_bytes(frame, slot->value_size);
     slot->object_offset = 0;
     slot->object_size = 0;
     slot->next = frame->slots;
@@ -6269,7 +4530,7 @@ static void rv_emit_addi(FILE *out, const char *dst, const char *base, int offse
 static void rv_store_int_slot(RVFrame *frame, IRValue *value, const char *reg) {
     RVSlot *slot = rv_find_slot(frame, value);
     if (slot != NULL) {
-        rv_emit_mem(frame->out, "sd", reg, slot->offset, "s0");
+        rv_emit_mem(frame->out, slot->value_size == 8 ? "sd" : "sw", reg, slot->offset, "s0");
     }
 }
 
@@ -6303,7 +4564,7 @@ static void rv_load_int_value(RVFrame *frame, IRValue *value, const char *reg) {
         case IR_VALUE_INSTRUCTION: {
             RVSlot *slot = rv_find_slot(frame, value);
             if (slot != NULL) {
-                rv_emit_mem(out, "ld", reg, slot->offset, "s0");
+                rv_emit_mem(out, slot->value_size == 8 ? "ld" : "lw", reg, slot->offset, "s0");
                 return;
             }
             break;
@@ -6342,19 +4603,43 @@ static void rv_load_float_value(RVFrame *frame, IRValue *value, const char *freg
     }
 }
 
+static bool rv_function_param_uses_float_reg(IRFunction *callee, int index) {
+    if (callee == NULL) {
+        return false;
+    }
+    if (index < callee->params.count) {
+        IRParameter *param = callee->params.items[index];
+        return param->type != NULL && param->type->kind == IR_TYPE_FLOAT;
+    }
+    return mem_runtime_param_is_float_scalar(callee->name, index);
+}
+
+static bool rv_function_param_uses_int_reg(IRFunction *callee, int index) {
+    if (callee == NULL) {
+        return true;
+    }
+    if (index < callee->params.count) {
+        IRParameter *param = callee->params.items[index];
+        return param->type == NULL || param->type->kind != IR_TYPE_FLOAT;
+    }
+    if (mem_runtime_param_is_pointer(callee->name, index)) {
+        return true;
+    }
+    return !mem_runtime_param_is_float_scalar(callee->name, index);
+}
+
 static int rv_call_stack_slots(IRInstruction *inst) {
     int int_regs = 0;
     int float_regs = 0;
     int stack_slots = 0;
     for (int i = 0; i < inst->data.call_inst.args.count; ++i) {
-        IRValue *arg = inst->data.call_inst.args.items[i];
-        if (rv_value_is_float(arg)) {
+        if (rv_function_param_uses_float_reg(inst->data.call_inst.callee, i)) {
             if (float_regs < 8) {
                 float_regs++;
             } else {
                 stack_slots++;
             }
-        } else {
+        } else if (rv_function_param_uses_int_reg(inst->data.call_inst.callee, i)) {
             if (int_regs < 8) {
                 int_regs++;
             } else {
@@ -6420,16 +4705,44 @@ static void rv_emit_global_init(FILE *out, IRInitializer *init, IRType *type) {
     fprintf(out, "  .zero %d\n", rv_type_size(type));
 }
 
+static bool rv_initializer_is_zero(IRInitializer *init) {
+    if (init == NULL || init->kind == IR_INIT_ZERO) {
+        return true;
+    }
+    switch (init->kind) {
+        case IR_INIT_INT:
+            return init->data.int_value == 0;
+        case IR_INIT_FLOAT:
+            return init->data.float_bits == float_bits_from_host(0.0f);
+        case IR_INIT_ARRAY:
+            for (int i = 0; i < init->data.array.count; ++i) {
+                if (!rv_initializer_is_zero(init->data.array.items[i])) {
+                    return false;
+                }
+            }
+            return true;
+        case IR_INIT_STRING:
+            return init->data.string.length == 0;
+        case IR_INIT_ZERO:
+            return true;
+    }
+    return false;
+}
+
 static void rv_emit_globals(IRModule *module, FILE *out) {
-    bool emitted = false;
+    int current_section = 0;
     for (int i = 0; i < module->globals.count; ++i) {
         IRGlobal *global = module->globals.items[i];
         if (global->is_external) {
             continue;
         }
-        if (!emitted) {
+        bool is_zero = rv_initializer_is_zero(global->initializer);
+        if (is_zero && current_section != 1) {
+            fputs("  .bss\n", out);
+            current_section = 1;
+        } else if (!is_zero && current_section != 2) {
             fputs("  .data\n", out);
-            emitted = true;
+            current_section = 2;
         }
         fprintf(out, "  .globl %s\n  .align 3\n%s:\n",
                 rv_symbol_name(global->name), rv_symbol_name(global->name));
@@ -6570,7 +4883,7 @@ static void rv_emit_call(RVFrame *frame, IRInstruction *inst) {
     int stack_slots = 0;
     for (int i = 0; i < inst->data.call_inst.args.count; ++i) {
         IRValue *arg = inst->data.call_inst.args.items[i];
-        if (rv_value_is_float(arg)) {
+        if (rv_function_param_uses_float_reg(inst->data.call_inst.callee, i)) {
             if (float_regs < 8) {
                 fprintf(out, "  # arg%d -> fa%d\n", i, float_regs);
                 rv_load_float_value(frame, arg, str_printf("fa%d", float_regs));
@@ -6580,7 +4893,7 @@ static void rv_emit_call(RVFrame *frame, IRInstruction *inst) {
                 rv_emit_mem(out, "fsw", "ft0", stack_slots * 8, "sp");
                 stack_slots++;
             }
-        } else {
+        } else if (rv_function_param_uses_int_reg(inst->data.call_inst.callee, i)) {
             if (int_regs < 8) {
                 fprintf(out, "  # arg%d -> a%d\n", i, int_regs);
                 rv_load_int_value(frame, arg, str_printf("a%d", int_regs));
@@ -6803,6 +5116,14 @@ int main(int argc, char **argv) {
             return 1;
         }
         generate_program_mid_ir(g_program, out);
+        fclose(out);
+    } else if (has_flag(argc, argv, "--emit-mem-ir") || has_flag(argc, argv, "-emit-mem-ir")) {
+        FILE *out = fopen(output_path, "w");
+        if (out == NULL) {
+            fclose(yyin);
+            return 1;
+        }
+        generate_program_mem_ir(g_program, out);
         fclose(out);
     } else if (has_flag(argc, argv, "--emit-llvm") || has_flag(argc, argv, "-emit-llvm")) {
         FILE *out = fopen(output_path, "w");
