@@ -374,6 +374,7 @@ typedef enum {
     IR_INST_ALLOCA,
     IR_INST_LOAD,
     IR_INST_STORE,
+    IR_INST_PHI,
     IR_INST_ADD,
     IR_INST_SUB,
     IR_INST_MUL,
@@ -435,6 +436,13 @@ struct IRInstruction {
             IRValue *ptr;
             int alignment;
         } store_inst;
+        struct {
+            IRValueList values;
+            IRBasicBlock **blocks;
+            int count;
+            int capacity;
+            IRInstruction *alloca_inst;
+        } phi_inst;
         struct {
             IRValue *lhs;
             IRValue *rhs;
