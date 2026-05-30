@@ -4127,7 +4127,98 @@ static bool opt_binary_algebra(IRInstruction *inst, IRValue **replacement) {
     return false;
 }
 
-static bool opt_icmp_fold(IRInstruction *inst, IRValue **replacement) {
+static bool opt_invert_icmp_pred(IRIcmpPredicate pred, IRIcmpPredicate *inverted) {
+    switch (pred) {
+        case IR_ICMP_EQ:
+            *inverted = IR_ICMP_NE;
+            return true;
+        case IR_ICMP_NE:
+            *inverted = IR_ICMP_EQ;
+            return true;
+        case IR_ICMP_SLT:
+            *inverted = IR_ICMP_SGE;
+            return true;
+        case IR_ICMP_SLE:
+            *inverted = IR_ICMP_SGT;
+            return true;
+        case IR_ICMP_SGT:
+            *inverted = IR_ICMP_SLE;
+            return true;
+        case IR_ICMP_SGE:
+            *inverted = IR_ICMP_SLT;
+            return true;
+    }
+    return false;
+}
+
+static bool opt_zext_i1_source(IRValue *value, IRValue **source) {
+    if (value == NULL || value->kind != IR_VALUE_INSTRUCTION) {
+        return false;
+    }
+    IRInstruction *inst = value->data.instruction;
+    if (inst == NULL || inst->kind != IR_INST_ZEXT) {
+        return false;
+    }
+    IRValue *cast_value = inst->data.cast_inst.value;
+    if (cast_value == NULL || cast_value->type == NULL
+            || cast_value->type->kind != IR_TYPE_I1
+            || inst->result_type == NULL
+            || inst->result_type->kind != IR_TYPE_I32) {
+        return false;
+    }
+    *source = cast_value;
+    return true;
+}
+
+static bool opt_icmp_zext_bool_zero(IRInstruction *inst, IRValue **replacement, bool *rewritten) {
+    if (inst->data.icmp_inst.pred != IR_ICMP_EQ && inst->data.icmp_inst.pred != IR_ICMP_NE) {
+        return false;
+    }
+    IRValue *bool_value = NULL;
+    int const_value = 0;
+    if (opt_zext_i1_source(inst->data.icmp_inst.lhs, &bool_value)) {
+        if (!opt_const_int_value(inst->data.icmp_inst.rhs, &const_value) || const_value != 0) {
+            return false;
+        }
+    } else if (opt_zext_i1_source(inst->data.icmp_inst.rhs, &bool_value)) {
+        if (!opt_const_int_value(inst->data.icmp_inst.lhs, &const_value) || const_value != 0) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    if (inst->data.icmp_inst.pred == IR_ICMP_NE) {
+        *replacement = bool_value;
+        return true;
+    }
+
+    if (bool_value->kind == IR_VALUE_INSTRUCTION) {
+        IRInstruction *bool_inst = bool_value->data.instruction;
+        IRIcmpPredicate inverted = IR_ICMP_EQ;
+        if (bool_inst != NULL && bool_inst->kind == IR_INST_ICMP
+                && opt_invert_icmp_pred(bool_inst->data.icmp_inst.pred, &inverted)) {
+            inst->data.icmp_inst.pred = inverted;
+            inst->data.icmp_inst.lhs = bool_inst->data.icmp_inst.lhs;
+            inst->data.icmp_inst.rhs = bool_inst->data.icmp_inst.rhs;
+            *rewritten = true;
+            return false;
+        }
+    }
+
+    inst->data.icmp_inst.lhs = bool_value;
+    inst->data.icmp_inst.rhs = opt_new_const_int(bool_value->type, 0);
+    *rewritten = true;
+    return false;
+}
+
+static bool opt_icmp_fold(IRInstruction *inst, IRValue **replacement, bool *rewritten) {
+    if (opt_icmp_zext_bool_zero(inst, replacement, rewritten)) {
+        return true;
+    }
+    if (*rewritten) {
+        return false;
+    }
     int lhs = 0;
     int rhs = 0;
     bool known = false;
@@ -4213,7 +4304,7 @@ static bool opt_is_pure_inst(IRInstruction *inst) {
     }
 }
 
-static bool opt_inst_simplify(IRInstruction *inst, IRValue **replacement) {
+static bool opt_inst_simplify(IRInstruction *inst, IRValue **replacement, bool *rewritten) {
     switch (inst->kind) {
         case IR_INST_ADD:
         case IR_INST_SUB:
@@ -4222,7 +4313,7 @@ static bool opt_inst_simplify(IRInstruction *inst, IRValue **replacement) {
         case IR_INST_SREM:
             return opt_binary_fold(inst, replacement) || opt_binary_algebra(inst, replacement);
         case IR_INST_ICMP:
-            return opt_icmp_fold(inst, replacement);
+            return opt_icmp_fold(inst, replacement, rewritten);
         case IR_INST_ZEXT:
         case IR_INST_BITCAST:
             return opt_cast_fold(inst, replacement);
@@ -4474,11 +4565,17 @@ static bool opt_basic_block(IRFunction *function, IRBasicBlock *block) {
     for (IRInstruction *inst = block->first_inst; inst != NULL;) {
         IRInstruction *next = inst->next;
         IRValue *replacement = NULL;
-        if (opt_inst_simplify(inst, &replacement)) {
+        bool rewritten = false;
+        bool removed = false;
+        if (opt_inst_simplify(inst, &replacement, &rewritten)) {
             opt_replace_all_uses(function, &inst->result, replacement);
             opt_remove_inst(block, inst);
             changed = true;
-        } else if (opt_is_pure_inst(inst)) {
+            removed = true;
+        } else {
+            changed = rewritten || changed;
+        }
+        if (!removed && opt_is_pure_inst(inst)) {
             IRInstruction *existing = opt_find_cse(&cse, inst);
             if (existing != NULL) {
                 opt_replace_all_uses(function, &inst->result, &existing->result);
@@ -6172,6 +6269,15 @@ static int rv_pow2_shift(int value) {
     return value == 1 && shift < 32 ? shift : -1;
 }
 
+static void rv_emit_and_i32_const(FILE *out, const char *dst, const char *src, int value) {
+    if (rv_imm12(value)) {
+        fprintf(out, "  andi %s, %s, %d\n", dst, src, value);
+        return;
+    }
+    fprintf(out, "  li t5, %d\n", value);
+    fprintf(out, "  and %s, %s, t5\n", dst, src);
+}
+
 static int rv_count_instruction_uses(IRInstruction *inst, IRValue *value);
 
 static bool rv_inst_reg_temp_supported(IRInstruction *inst) {
@@ -6604,7 +6710,8 @@ static void rv_emit_int_binary_to_reg(RVFrame *frame, IRInstruction *inst, const
         fprintf(out, "  addiw %s, %s, %d\n", dst, dst, lhs_const);
         return;
     }
-    if (inst->kind == IR_INST_SUB && rv_const_i32_value(inst->data.binary_inst.rhs, &rhs_const) && rv_imm12(-rhs_const)) {
+    if (inst->kind == IR_INST_SUB && rv_const_i32_value(inst->data.binary_inst.rhs, &rhs_const)
+            && rhs_const != INT_MIN && rv_imm12(-rhs_const)) {
         rv_load_int_value(frame, inst->data.binary_inst.lhs, dst);
         fprintf(out, "  addiw %s, %s, %d\n", dst, dst, -rhs_const);
         return;
@@ -6622,6 +6729,37 @@ static void rv_emit_int_binary_to_reg(RVFrame *frame, IRInstruction *inst, const
         if (shift >= 0) {
             rv_load_int_value(frame, inst->data.binary_inst.rhs, dst);
             fprintf(out, "  slliw %s, %s, %d\n", dst, dst, shift);
+            return;
+        }
+    }
+    if (inst->kind == IR_INST_SDIV && rv_const_i32_value(inst->data.binary_inst.rhs, &rhs_const)) {
+        int shift = rv_pow2_shift(rhs_const);
+        if (shift >= 0) {
+            rv_load_int_value(frame, inst->data.binary_inst.lhs, "t0");
+            if (shift == 0) {
+                fprintf(out, "  mv %s, t0\n", dst);
+                return;
+            }
+            fprintf(out, "  sraiw t1, t0, 31\n");
+            rv_emit_and_i32_const(out, "t1", "t1", rhs_const - 1);
+            fprintf(out, "  addw t0, t0, t1\n");
+            fprintf(out, "  sraiw %s, t0, %d\n", dst, shift);
+            return;
+        }
+    }
+    if (inst->kind == IR_INST_SREM && rv_const_i32_value(inst->data.binary_inst.rhs, &rhs_const)) {
+        int shift = rv_pow2_shift(rhs_const);
+        if (shift >= 0) {
+            rv_load_int_value(frame, inst->data.binary_inst.lhs, "t0");
+            if (shift == 0) {
+                fprintf(out, "  li %s, 0\n", dst);
+                return;
+            }
+            fprintf(out, "  sraiw t1, t0, 31\n");
+            rv_emit_and_i32_const(out, "t1", "t1", rhs_const - 1);
+            fprintf(out, "  addw %s, t0, t1\n", dst);
+            rv_emit_and_i32_const(out, dst, dst, rhs_const - 1);
+            fprintf(out, "  subw %s, %s, t1\n", dst, dst);
             return;
         }
     }
@@ -6648,6 +6786,50 @@ static void rv_emit_float_binary(RVFrame *frame, IRInstruction *inst, const char
 
 static void rv_emit_icmp_to_reg(RVFrame *frame, IRInstruction *inst, const char *dst) {
     FILE *out = frame->out;
+    int rhs_const = 0;
+    if (rv_const_i32_value(inst->data.icmp_inst.rhs, &rhs_const)) {
+        if (rhs_const == 0) {
+            rv_load_int_value(frame, inst->data.icmp_inst.lhs, "t0");
+            switch (inst->data.icmp_inst.pred) {
+                case IR_ICMP_EQ:
+                    fprintf(out, "  seqz %s, t0\n", dst);
+                    return;
+                case IR_ICMP_NE:
+                    fprintf(out, "  snez %s, t0\n", dst);
+                    return;
+                default:
+                    break;
+            }
+        }
+        if (rv_imm12(rhs_const)) {
+            rv_load_int_value(frame, inst->data.icmp_inst.lhs, "t0");
+            switch (inst->data.icmp_inst.pred) {
+                case IR_ICMP_SLT:
+                    fprintf(out, "  slti %s, t0, %d\n", dst, rhs_const);
+                    return;
+                case IR_ICMP_SGE:
+                    fprintf(out, "  slti %s, t0, %d\n  xori %s, %s, 1\n",
+                            dst, rhs_const, dst, dst);
+                    return;
+                default:
+                    break;
+            }
+        }
+        if (rhs_const < INT_MAX && rv_imm12(rhs_const + 1)) {
+            rv_load_int_value(frame, inst->data.icmp_inst.lhs, "t0");
+            switch (inst->data.icmp_inst.pred) {
+                case IR_ICMP_SLE:
+                    fprintf(out, "  slti %s, t0, %d\n", dst, rhs_const + 1);
+                    return;
+                case IR_ICMP_SGT:
+                    fprintf(out, "  slti %s, t0, %d\n  xori %s, %s, 1\n",
+                            dst, rhs_const + 1, dst, dst);
+                    return;
+                default:
+                    break;
+            }
+        }
+    }
     rv_load_int_value(frame, inst->data.icmp_inst.lhs, "t0");
     rv_load_int_value(frame, inst->data.icmp_inst.rhs, "t1");
     switch (inst->data.icmp_inst.pred) {
