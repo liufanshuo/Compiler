@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <ctype.h>
+#include <stdint.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -3010,19 +3011,248 @@ static Expr *mem_straightline_return_expr(FuncDef *func) {
     return mem_stmt_direct_return_expr((Stmt *)func->block->items.items[last]);
 }
 
+typedef enum {
+    MEM_INLINE_NONE,
+    MEM_INLINE_RETURN_EXPR,
+    MEM_INLINE_IF_RETURN
+} MemInlineKind;
+
+typedef struct {
+    MemInlineKind kind;
+    Expr *return_expr;
+    Stmt *if_stmt;
+    int prefix_count;
+    int cost;
+} MemInlinePlan;
+
+static bool mem_func_has_scalar_param_named(FuncDef *func, const char *name) {
+    if (func == NULL || name == NULL) {
+        return false;
+    }
+    for (int i = 0; i < func->params.count; ++i) {
+        Param *param = func->params.items[i];
+        if (param != NULL && !param->is_array && strcmp(param->name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int mem_expr_inline_cost(Expr *expr);
+
+static int mem_lval_inline_cost(LVal *lval) {
+    if (lval == NULL) {
+        return -1;
+    }
+    int cost = 1;
+    for (int i = 0; i < lval->indices.count; ++i) {
+        int index_cost = mem_expr_inline_cost(lval->indices.items[i]);
+        if (index_cost < 0) {
+            return -1;
+        }
+        cost += index_cost;
+    }
+    return cost;
+}
+
+static int mem_expr_inline_cost(Expr *expr) {
+    if (expr == NULL) {
+        return 0;
+    }
+    switch (expr->kind) {
+        case EXPR_NUMBER:
+            return 1;
+        case EXPR_LVAL:
+            return mem_lval_inline_cost(expr->data.lval);
+        case EXPR_UNARY: {
+            int inner = mem_expr_inline_cost(expr->data.unary.operand);
+            return inner < 0 ? -1 : inner + 1;
+        }
+        case EXPR_BINARY: {
+            int lhs = mem_expr_inline_cost(expr->data.binary.lhs);
+            int rhs = mem_expr_inline_cost(expr->data.binary.rhs);
+            return lhs < 0 || rhs < 0 ? -1 : lhs + rhs + 1;
+        }
+        case EXPR_CALL:
+        case EXPR_GETINT:
+        default:
+            return -1;
+    }
+}
+
+static int mem_initval_inline_cost(InitVal *init) {
+    if (init == NULL) {
+        return 0;
+    }
+    if (!init->is_expr) {
+        return -1;
+    }
+    return mem_expr_inline_cost(init->expr);
+}
+
+static int mem_decl_inline_cost(Decl *decl) {
+    if (!mem_decl_has_only_scalar_items(decl)) {
+        return -1;
+    }
+    int cost = 1;
+    for (int i = 0; i < decl->items.count; ++i) {
+        int init_cost = mem_initval_inline_cost(decl->items.items[i]->init);
+        if (init_cost < 0) {
+            return -1;
+        }
+        cost += init_cost + 1;
+    }
+    return cost;
+}
+
+static int mem_stmt_inline_prefix_cost(FuncDef *func, Stmt *stmt) {
+    if (stmt == NULL) {
+        return -1;
+    }
+    switch (stmt->kind) {
+        case STMT_ASSIGN: {
+            if (stmt->data.assign_stmt.lval == NULL) {
+                return -1;
+            }
+            if (stmt->data.assign_stmt.lval->indices.count == 0
+                    && mem_func_has_scalar_param_named(func, stmt->data.assign_stmt.lval->name)) {
+                return -1;
+            }
+            int lhs = mem_lval_inline_cost(stmt->data.assign_stmt.lval);
+            int rhs = mem_expr_inline_cost(stmt->data.assign_stmt.expr);
+            return lhs < 0 || rhs < 0 ? -1 : lhs + rhs + 1;
+        }
+        case STMT_EXPR: {
+            int expr_cost = mem_expr_inline_cost(stmt->data.expr_stmt);
+            return expr_cost < 0 ? -1 : expr_cost + 1;
+        }
+        case STMT_BLOCK: {
+            if (stmt->data.block_stmt == NULL) {
+                return 1;
+            }
+            int cost = 1;
+            for (int i = 0; i < stmt->data.block_stmt->items.count; ++i) {
+                int item_cost = -1;
+                if (stmt->data.block_stmt->items.kinds[i] == BLOCK_ITEM_DECL) {
+                    item_cost = mem_decl_inline_cost((Decl *)stmt->data.block_stmt->items.items[i]);
+                } else if (stmt->data.block_stmt->items.kinds[i] == BLOCK_ITEM_STMT) {
+                    item_cost = mem_stmt_inline_prefix_cost(func, (Stmt *)stmt->data.block_stmt->items.items[i]);
+                }
+                if (item_cost < 0) {
+                    return -1;
+                }
+                cost += item_cost;
+            }
+            return cost;
+        }
+        case STMT_IF: {
+            int cond_cost = mem_expr_inline_cost(stmt->data.if_stmt.cond);
+            int then_cost = mem_stmt_inline_prefix_cost(func, stmt->data.if_stmt.then_stmt);
+            int else_cost = stmt->data.if_stmt.else_stmt != NULL
+                                ? mem_stmt_inline_prefix_cost(func, stmt->data.if_stmt.else_stmt)
+                                : 0;
+            return cond_cost < 0 || then_cost < 0 || else_cost < 0
+                       ? -1
+                       : cond_cost + then_cost + else_cost + 2;
+        }
+        case STMT_WHILE:
+        case STMT_BREAK:
+        case STMT_CONTINUE:
+        case STMT_RETURN:
+        case STMT_PRINTF:
+        default:
+            return -1;
+    }
+}
+
+static int mem_if_return_inline_cost(Stmt *stmt) {
+    if (stmt == NULL || stmt->kind != STMT_IF || stmt->data.if_stmt.else_stmt == NULL) {
+        return -1;
+    }
+    Expr *then_expr = mem_stmt_direct_return_expr(stmt->data.if_stmt.then_stmt);
+    Expr *else_expr = mem_stmt_direct_return_expr(stmt->data.if_stmt.else_stmt);
+    if (then_expr == NULL || else_expr == NULL) {
+        return -1;
+    }
+    int cond_cost = mem_expr_inline_cost(stmt->data.if_stmt.cond);
+    int then_cost = mem_expr_inline_cost(then_expr);
+    int else_cost = mem_expr_inline_cost(else_expr);
+    return cond_cost < 0 || then_cost < 0 || else_cost < 0
+               ? -1
+               : cond_cost + then_cost + else_cost + 2;
+}
+
+static bool mem_build_inline_plan(FuncDef *func, MemInlinePlan *plan) {
+    if (plan == NULL) {
+        return false;
+    }
+    memset(plan, 0, sizeof(MemInlinePlan));
+    plan->kind = MEM_INLINE_NONE;
+    if (func == NULL || func->ret_type == TYPE_VOID || func->block == NULL
+            || func->block->items.count <= 0 || func->block->items.count > 12) {
+        return false;
+    }
+    int last = func->block->items.count - 1;
+    int total_cost = 0;
+    for (int i = 0; i < last; ++i) {
+        int item_cost = -1;
+        if (func->block->items.kinds[i] == BLOCK_ITEM_DECL) {
+            item_cost = mem_decl_inline_cost((Decl *)func->block->items.items[i]);
+        } else if (func->block->items.kinds[i] == BLOCK_ITEM_STMT) {
+            item_cost = mem_stmt_inline_prefix_cost(func, (Stmt *)func->block->items.items[i]);
+        }
+        if (item_cost < 0) {
+            return false;
+        }
+        total_cost += item_cost;
+    }
+    if (func->block->items.kinds[last] != BLOCK_ITEM_STMT) {
+        return false;
+    }
+    Stmt *tail_stmt = (Stmt *)func->block->items.items[last];
+    Expr *tail_return = mem_stmt_direct_return_expr(tail_stmt);
+    if (tail_return != NULL) {
+        int tail_cost = mem_expr_inline_cost(tail_return);
+        if (tail_cost < 0) {
+            return false;
+        }
+        total_cost += tail_cost;
+        plan->kind = MEM_INLINE_RETURN_EXPR;
+        plan->return_expr = tail_return;
+    } else {
+        int if_cost = mem_if_return_inline_cost(tail_stmt);
+        if (if_cost < 0) {
+            return false;
+        }
+        total_cost += if_cost;
+        plan->kind = MEM_INLINE_IF_RETURN;
+        plan->if_stmt = tail_stmt;
+    }
+    if (total_cost > 32) {
+        return false;
+    }
+    plan->prefix_count = last;
+    plan->cost = total_cost;
+    return true;
+}
+
 static bool mem_can_inline_call(MemIRGen *gen, MemFunctionMeta *meta, ExprList *args) {
+    MemInlinePlan plan;
     if (gen == NULL || meta == NULL || meta->ast_func == NULL || meta->function == NULL ||
         meta->function->is_external || meta->ret_type == TYPE_VOID ||
         meta->ast_func == NULL || args->count != meta->params.count ||
-        gen->inline_depth >= 16) {
+        gen->inline_depth >= 16 || meta->params.count > 8) {
         return false;
     }
     if (gen->current_function == meta->function) {
         return false;
     }
-    return mem_simple_return_expr(meta->ast_func) != NULL ||
-           mem_simple_if_return_stmt(meta->ast_func) != NULL ||
-           mem_straightline_return_expr(meta->ast_func) != NULL;
+    if (mem_simple_return_expr(meta->ast_func) != NULL ||
+            mem_simple_if_return_stmt(meta->ast_func) != NULL ||
+            mem_straightline_return_expr(meta->ast_func) != NULL) {
+        return true;
+    }
+    return mem_build_inline_plan(meta->ast_func, &plan);
 }
 
 static MemValue mem_inline_if_return_value(MemIRGen *gen, MemFunctionMeta *meta, Stmt *stmt) {
@@ -3050,6 +3280,8 @@ static MemValue mem_try_inline_call(MemIRGen *gen, MemFunctionMeta *meta, ExprLi
     if (!mem_can_inline_call(gen, meta, args)) {
         return mem_make_value(mem_const_int(gen, 0), TYPE_INT, 0, NULL, false, false);
     }
+    MemInlinePlan plan = {0};
+    bool have_plan = mem_build_inline_plan(meta->ast_func, &plan);
     MemValue *arg_values = NULL;
     if (args->count > 0) {
         arg_values = (MemValue *)xmalloc(sizeof(MemValue) * args->count);
@@ -3096,15 +3328,34 @@ static MemValue mem_try_inline_call(MemIRGen *gen, MemFunctionMeta *meta, ExprLi
         result = mem_gen_expr(gen, return_expr);
     } else if (if_return != NULL) {
         result = mem_inline_if_return_value(gen, meta, if_return);
-    } else {
+    } else if (straightline_return != NULL) {
         int last = meta->ast_func->block->items.count - 1;
         for (int i = 0; i < last; ++i) {
             mem_gen_decl(gen, (Decl *)meta->ast_func->block->items.items[i], false);
         }
         result = mem_gen_expr(gen, straightline_return);
+    } else if (have_plan && plan.kind != MEM_INLINE_NONE) {
+        for (int i = 0; i < plan.prefix_count; ++i) {
+            if (meta->ast_func->block->items.kinds[i] == BLOCK_ITEM_DECL) {
+                mem_gen_decl(gen, (Decl *)meta->ast_func->block->items.items[i], false);
+            } else if (meta->ast_func->block->items.kinds[i] == BLOCK_ITEM_STMT) {
+                mem_gen_stmt(gen, (Stmt *)meta->ast_func->block->items.items[i]);
+            }
+        }
+        if (plan.kind == MEM_INLINE_IF_RETURN) {
+            result = mem_inline_if_return_value(gen, meta, plan.if_stmt);
+        } else {
+            result = mem_gen_expr(gen, plan.return_expr);
+        }
+    } else {
+        gen->inline_depth--;
+        mem_pop_scope(gen);
+        free(arg_values);
+        return mem_make_value(mem_const_int(gen, 0), TYPE_INT, 0, NULL, false, false);
     }
     gen->inline_depth--;
     mem_pop_scope(gen);
+    free(arg_values);
     *inlined = true;
     return result;
 }
@@ -5479,6 +5730,995 @@ static IRBasicBlock *opt_find_preheader(IRFunction *function, bool *in_loop, IRB
     return preheader;
 }
 
+typedef struct {
+    IRInstruction *phi;
+    IRInstruction *update_inst;
+    IRValue *start_value;
+    int step;
+} OptLoopInductionVar;
+
+typedef struct {
+    IRValue **from;
+    IRValue **to;
+    int count;
+    int from_capacity;
+    int to_capacity;
+} OptValueMap;
+
+static void opt_value_map_push(OptValueMap *map, IRValue *from, IRValue *to) {
+    ensure_capacity((void **)&map->from, &map->from_capacity, sizeof(IRValue *), map->count + 1);
+    ensure_capacity((void **)&map->to, &map->to_capacity, sizeof(IRValue *), map->count + 1);
+    map->from[map->count] = from;
+    map->to[map->count] = to;
+    map->count++;
+}
+
+static IRValue *opt_value_map_get(OptValueMap *map, IRValue *from) {
+    for (int i = map->count - 1; i >= 0; --i) {
+        if (map->from[i] == from) {
+            return map->to[i];
+        }
+    }
+    return from;
+}
+
+static void opt_value_map_reset(OptValueMap *map) {
+    free(map->from);
+    free(map->to);
+    map->from = NULL;
+    map->to = NULL;
+    map->count = 0;
+    map->from_capacity = 0;
+    map->to_capacity = 0;
+}
+
+static IRInstruction *opt_new_inst(IRInstructionKind kind, IRType *result_type) {
+    static int temp_id = 0;
+    IRInstruction *inst = (IRInstruction *)xmalloc(sizeof(IRInstruction));
+    memset(inst, 0, sizeof(IRInstruction));
+    inst->kind = kind;
+    inst->result_type = result_type;
+    if (result_type != NULL && result_type->kind != IR_TYPE_VOID) {
+        inst->result.kind = IR_VALUE_INSTRUCTION;
+        mem_set_value_type(&inst->result, result_type);
+        inst->result.name = str_printf("%%opt%d", temp_id++);
+        inst->result.data.instruction = inst;
+    }
+    return inst;
+}
+
+static IRInstruction *opt_create_phi(IRBasicBlock *block, IRType *type) {
+    IRInstruction *phi = opt_new_inst(IR_INST_PHI, type);
+    phi->parent = block;
+    IRInstruction *insert_before = block->first_inst;
+    while (insert_before != NULL && insert_before->kind == IR_INST_PHI) {
+        insert_before = insert_before->next;
+    }
+    opt_insert_inst_before(block, insert_before, phi);
+    return phi;
+}
+
+static IRInstruction *opt_create_binary(IRBasicBlock *block, IRInstruction *before,
+                                        IRInstructionKind kind, IRType *type,
+                                        IRValue *lhs, IRValue *rhs) {
+    IRInstruction *inst = opt_new_inst(kind, type);
+    inst->data.binary_inst.lhs = lhs;
+    inst->data.binary_inst.rhs = rhs;
+    opt_insert_inst_before(block, before, inst);
+    return inst;
+}
+
+static IRInstruction *opt_create_icmp(IRBasicBlock *block, IRInstruction *before,
+                                      IRIcmpPredicate pred, IRValue *lhs, IRValue *rhs,
+                                      IRType *type) {
+    IRInstruction *inst = opt_new_inst(IR_INST_ICMP, type);
+    inst->data.icmp_inst.pred = pred;
+    inst->data.icmp_inst.lhs = lhs;
+    inst->data.icmp_inst.rhs = rhs;
+    opt_insert_inst_before(block, before, inst);
+    return inst;
+}
+
+static IRInstruction *opt_create_fcmp(IRBasicBlock *block, IRInstruction *before,
+                                      IRFcmpPredicate pred, IRValue *lhs, IRValue *rhs,
+                                      IRType *type) {
+    IRInstruction *inst = opt_new_inst(IR_INST_FCMP, type);
+    inst->data.fcmp_inst.pred = pred;
+    inst->data.fcmp_inst.lhs = lhs;
+    inst->data.fcmp_inst.rhs = rhs;
+    opt_insert_inst_before(block, before, inst);
+    return inst;
+}
+
+static IRInstruction *opt_create_cast(IRBasicBlock *block, IRInstruction *before,
+                                      IRInstructionKind kind, IRValue *value, IRType *to_type) {
+    IRInstruction *inst = opt_new_inst(kind, to_type);
+    inst->data.cast_inst.value = value;
+    inst->data.cast_inst.to_type = to_type;
+    opt_insert_inst_before(block, before, inst);
+    return inst;
+}
+
+static IRInstruction *opt_create_bitcast(IRBasicBlock *block, IRInstruction *before,
+                                         IRValue *value, IRType *to_type) {
+    IRInstruction *inst = opt_new_inst(IR_INST_BITCAST, to_type);
+    inst->data.bitcast_inst.value = value;
+    inst->data.bitcast_inst.to_type = to_type;
+    opt_insert_inst_before(block, before, inst);
+    return inst;
+}
+
+static IRInstruction *opt_create_load(IRBasicBlock *block, IRInstruction *before,
+                                      IRType *value_type, IRValue *ptr, int alignment) {
+    IRInstruction *inst = opt_new_inst(IR_INST_LOAD, value_type);
+    inst->data.load_inst.ptr = ptr;
+    inst->data.load_inst.value_type = value_type;
+    inst->data.load_inst.alignment = alignment;
+    opt_insert_inst_before(block, before, inst);
+    return inst;
+}
+
+static IRInstruction *opt_create_store(IRBasicBlock *block, IRInstruction *before,
+                                       IRType *void_type, IRValue *value, IRValue *ptr, int alignment) {
+    IRInstruction *inst = opt_new_inst(IR_INST_STORE, void_type);
+    inst->data.store_inst.value = value;
+    inst->data.store_inst.ptr = ptr;
+    inst->data.store_inst.alignment = alignment;
+    opt_insert_inst_before(block, before, inst);
+    return inst;
+}
+
+static IRInstruction *opt_create_call(IRBasicBlock *block, IRInstruction *before,
+                                      IRFunction *callee, IRType *ret_type, IRValueList args) {
+    IRInstruction *inst = opt_new_inst(IR_INST_CALL, ret_type);
+    inst->data.call_inst.callee = callee;
+    inst->data.call_inst.ret_type = ret_type;
+    inst->data.call_inst.args = args;
+    opt_insert_inst_before(block, before, inst);
+    return inst;
+}
+
+static IRInstruction *opt_create_gep(IRBasicBlock *block, IRInstruction *before,
+                                     IRValue *base_ptr, IRType *source_type,
+                                     IRValueList indices, IRType *result_pointee, bool inbounds) {
+    IRInstruction *inst = opt_new_inst(IR_INST_GETELEMENTPTR, mem_pointer_type(result_pointee));
+    inst->data.gep_inst.base_ptr = base_ptr;
+    inst->data.gep_inst.source_element_type = source_type;
+    inst->data.gep_inst.indices = indices;
+    inst->data.gep_inst.inbounds = inbounds;
+    opt_insert_inst_before(block, before, inst);
+    return inst;
+}
+
+static int opt_phi_incoming_index(IRInstruction *phi, IRBasicBlock *block) {
+    if (phi == NULL || phi->kind != IR_INST_PHI) {
+        return -1;
+    }
+    for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+        if (phi->data.phi_inst.blocks[i] == block) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static IRValue *opt_phi_incoming_value(IRInstruction *phi, IRBasicBlock *block) {
+    int index = opt_phi_incoming_index(phi, block);
+    return index >= 0 ? phi->data.phi_inst.values.items[index] : NULL;
+}
+
+static IRBasicBlock *opt_find_unique_loop_latch(IRFunction *function, bool *in_loop, IRBasicBlock *header) {
+    IRBasicBlock *latch = NULL;
+    for (int pi = 0; pi < header->pred_count; ++pi) {
+        IRBasicBlock *pred = header->preds[pi];
+        int pred_index = opt_function_block_index(function, pred);
+        if (pred_index < 0 || !in_loop[pred_index]) {
+            continue;
+        }
+        if (latch != NULL) {
+            return NULL;
+        }
+        latch = pred;
+    }
+    return latch;
+}
+
+static bool opt_inst_uses_value(IRInstruction *inst, IRValue *value) {
+    return opt_count_uses_in_inst(inst, value) > 0;
+}
+
+static bool opt_all_uses_in_loop(IRFunction *function, bool *in_loop, IRValue *value) {
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            if (!opt_inst_uses_value(inst, value)) {
+                continue;
+            }
+            if (!in_loop[bi]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void opt_replace_uses_in_loop(IRFunction *function, bool *in_loop, IRValue *old_value, IRValue *new_value) {
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        if (!in_loop[bi]) {
+            continue;
+        }
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            opt_replace_value_in_inst(inst, old_value, new_value);
+        }
+    }
+}
+
+static IRIcmpPredicate opt_swap_icmp_pred(IRIcmpPredicate pred) {
+    switch (pred) {
+        case IR_ICMP_EQ: return IR_ICMP_EQ;
+        case IR_ICMP_NE: return IR_ICMP_NE;
+        case IR_ICMP_SLT: return IR_ICMP_SGT;
+        case IR_ICMP_SLE: return IR_ICMP_SGE;
+        case IR_ICMP_SGT: return IR_ICMP_SLT;
+        case IR_ICMP_SGE: return IR_ICMP_SLE;
+    }
+    return pred;
+}
+
+static bool opt_eval_icmp_pred64(IRIcmpPredicate pred, long long lhs, long long rhs) {
+    switch (pred) {
+        case IR_ICMP_EQ: return lhs == rhs;
+        case IR_ICMP_NE: return lhs != rhs;
+        case IR_ICMP_SLT: return lhs < rhs;
+        case IR_ICMP_SLE: return lhs <= rhs;
+        case IR_ICMP_SGT: return lhs > rhs;
+        case IR_ICMP_SGE: return lhs >= rhs;
+    }
+    return false;
+}
+
+static bool opt_compute_small_trip_count(IRIcmpPredicate pred, int start, int bound, int step,
+                                         int max_trip_count, int *trip_count) {
+    if (step == 0 || max_trip_count <= 0) {
+        return false;
+    }
+    long long current = start;
+    for (int i = 0; i <= max_trip_count; ++i) {
+        if (!opt_eval_icmp_pred64(pred, current, bound)) {
+            *trip_count = i;
+            return true;
+        }
+        if (i == max_trip_count) {
+            break;
+        }
+        long long next = current + step;
+        if (next < INT_MIN || next > INT_MAX) {
+            return false;
+        }
+        current = next;
+    }
+    return false;
+}
+
+static int opt_loop_block_count(IRFunction *function, bool *in_loop) {
+    int count = 0;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        if (in_loop[bi]) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static int opt_block_non_phi_non_term_inst_count(IRBasicBlock *block) {
+    int count = 0;
+    for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+        if (inst->kind == IR_INST_PHI || inst->kind == IR_INST_BR || inst->kind == IR_INST_RET) {
+            continue;
+        }
+        count++;
+    }
+    return count;
+}
+
+static bool opt_match_loop_induction_var(IRFunction *function, bool *in_loop,
+                                         IRBasicBlock *header, IRBasicBlock *preheader,
+                                         IRBasicBlock *latch, IRInstruction *phi,
+                                         OptLoopInductionVar *iv, bool *normalized) {
+    (void)header;
+    if (phi == NULL || phi->kind != IR_INST_PHI || phi->result_type == NULL
+            || phi->result_type->kind != IR_TYPE_I32 || phi->data.phi_inst.count != 2) {
+        return false;
+    }
+    IRValue *start_value = opt_phi_incoming_value(phi, preheader);
+    IRValue *latch_value = opt_phi_incoming_value(phi, latch);
+    if (start_value == NULL || latch_value == NULL || !opt_value_invariant_for_loop(function, in_loop, start_value)) {
+        return false;
+    }
+    if (latch_value->kind != IR_VALUE_INSTRUCTION) {
+        return false;
+    }
+    IRInstruction *update_inst = latch_value->data.instruction;
+    if (update_inst == NULL || update_inst->parent != latch
+            || (update_inst->kind != IR_INST_ADD && update_inst->kind != IR_INST_SUB)) {
+        return false;
+    }
+    int step = 0;
+    int rhs_const = 0;
+    if (update_inst->kind == IR_INST_ADD) {
+        if (update_inst->data.binary_inst.lhs == &phi->result
+                && opt_const_int_value(update_inst->data.binary_inst.rhs, &rhs_const)) {
+            step = rhs_const;
+        } else if (update_inst->data.binary_inst.rhs == &phi->result
+                && opt_const_int_value(update_inst->data.binary_inst.lhs, &rhs_const)) {
+            step = rhs_const;
+            update_inst->data.binary_inst.lhs = &phi->result;
+            update_inst->data.binary_inst.rhs = opt_new_const_int(update_inst->result_type, rhs_const);
+            *normalized = true;
+        } else {
+            return false;
+        }
+    } else {
+        if (update_inst->data.binary_inst.lhs != &phi->result
+                || !opt_const_int_value(update_inst->data.binary_inst.rhs, &rhs_const)) {
+            return false;
+        }
+        if (rhs_const == INT_MIN) {
+            return false;
+        }
+        step = -rhs_const;
+        update_inst->kind = IR_INST_ADD;
+        update_inst->data.binary_inst.rhs = opt_new_const_int(update_inst->result_type, step);
+        *normalized = true;
+    }
+    if (step == 0) {
+        return false;
+    }
+    iv->phi = phi;
+    iv->update_inst = update_inst;
+    iv->start_value = start_value;
+    iv->step = step;
+    return true;
+}
+
+static bool opt_match_iv_scale(IRValue *value, IRInstruction *phi, int *scale) {
+    int factor = 0;
+    if (value == &phi->result) {
+        *scale = 1;
+        return true;
+    }
+    if (value == NULL || value->kind != IR_VALUE_INSTRUCTION) {
+        return false;
+    }
+    IRInstruction *inst = value->data.instruction;
+    if (inst == NULL || inst->kind != IR_INST_MUL || inst->result_type == NULL
+            || inst->result_type->kind != IR_TYPE_I32) {
+        return false;
+    }
+    if (inst->data.binary_inst.lhs == &phi->result && opt_const_int_value(inst->data.binary_inst.rhs, &factor)) {
+        *scale = factor;
+        return true;
+    }
+    if (inst->data.binary_inst.rhs == &phi->result && opt_const_int_value(inst->data.binary_inst.lhs, &factor)) {
+        *scale = factor;
+        return true;
+    }
+    return false;
+}
+
+static bool opt_match_strength_reduction_expr(IRFunction *function, bool *in_loop,
+                                              IRInstruction *inst, OptLoopInductionVar *iv,
+                                              int *scale, IRValue **offset, bool *subtract_offset) {
+    *scale = 0;
+    *offset = NULL;
+    *subtract_offset = false;
+    if (inst == NULL || inst == iv->phi || inst == iv->update_inst
+            || inst->result_type == NULL || inst->result_type->kind != IR_TYPE_I32) {
+        return false;
+    }
+    if (!opt_all_uses_in_loop(function, in_loop, &inst->result)) {
+        return false;
+    }
+    if (opt_match_iv_scale(&inst->result, iv->phi, scale)) {
+        return *scale != 1;
+    }
+    if (inst->kind == IR_INST_ADD || inst->kind == IR_INST_SUB) {
+        if (opt_match_iv_scale(inst->data.binary_inst.lhs, iv->phi, scale)
+                && opt_value_invariant_for_loop(function, in_loop, inst->data.binary_inst.rhs)) {
+            *offset = inst->data.binary_inst.rhs;
+            *subtract_offset = inst->kind == IR_INST_SUB;
+            return true;
+        }
+        if (inst->kind == IR_INST_ADD
+                && opt_match_iv_scale(inst->data.binary_inst.rhs, iv->phi, scale)
+                && opt_value_invariant_for_loop(function, in_loop, inst->data.binary_inst.lhs)) {
+            *offset = inst->data.binary_inst.lhs;
+            *subtract_offset = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+static IRValue *opt_build_strength_init(IRBasicBlock *preheader, IRInstruction *before,
+                                        OptLoopInductionVar *iv, int scale,
+                                        IRValue *offset, bool subtract_offset) {
+    IRValue *value = iv->start_value;
+    if (scale != 1) {
+        IRInstruction *mul = opt_create_binary(preheader, before, IR_INST_MUL,
+                                               iv->phi->result_type, value,
+                                               opt_new_const_int(iv->phi->result_type, scale));
+        value = &mul->result;
+    }
+    if (offset != NULL) {
+        IRInstruction *offset_inst = opt_create_binary(preheader, before,
+                                                       subtract_offset ? IR_INST_SUB : IR_INST_ADD,
+                                                       iv->phi->result_type, value, offset);
+        value = &offset_inst->result;
+    }
+    return value;
+}
+
+static bool opt_match_pointer_induction_index(IRValue *value, IRInstruction *phi,
+                                              int *scale, IRValue **offset,
+                                              bool *subtract_offset) {
+    *scale = 0;
+    *offset = NULL;
+    *subtract_offset = false;
+    if (opt_match_iv_scale(value, phi, scale)) {
+        return true;
+    }
+    if (value == NULL || value->kind != IR_VALUE_INSTRUCTION) {
+        return false;
+    }
+    IRInstruction *inst = value->data.instruction;
+    if (inst == NULL || inst->result_type == NULL || inst->result_type->kind != IR_TYPE_I32) {
+        return false;
+    }
+    if (inst->kind == IR_INST_ADD || inst->kind == IR_INST_SUB) {
+        if (opt_match_iv_scale(inst->data.binary_inst.lhs, phi, scale)) {
+            *offset = inst->data.binary_inst.rhs;
+            *subtract_offset = inst->kind == IR_INST_SUB;
+            return true;
+        }
+        if (inst->kind == IR_INST_ADD && opt_match_iv_scale(inst->data.binary_inst.rhs, phi, scale)) {
+            *offset = inst->data.binary_inst.lhs;
+            *subtract_offset = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool opt_match_pointer_induction_gep(IRFunction *function, bool *in_loop,
+                                            IRInstruction *inst, OptLoopInductionVar *iv,
+                                            int *varying_index, int *scale,
+                                            IRValue **offset, bool *subtract_offset) {
+    *varying_index = -1;
+    *scale = 0;
+    *offset = NULL;
+    *subtract_offset = false;
+    if (inst == NULL || inst->kind != IR_INST_GETELEMENTPTR || inst->result_type == NULL
+            || inst->result_type->kind != IR_TYPE_POINTER || inst->data.gep_inst.indices.count == 0) {
+        return false;
+    }
+    if (!opt_all_uses_in_loop(function, in_loop, &inst->result)
+            || !opt_value_invariant_for_loop(function, in_loop, inst->data.gep_inst.base_ptr)) {
+        return false;
+    }
+    for (int i = 0; i < inst->data.gep_inst.indices.count; ++i) {
+        IRValue *index = inst->data.gep_inst.indices.items[i];
+        if (opt_value_invariant_for_loop(function, in_loop, index)) {
+            continue;
+        }
+        if (i != inst->data.gep_inst.indices.count - 1 || *varying_index >= 0
+                || !opt_match_pointer_induction_index(index, iv->phi, scale, offset, subtract_offset)) {
+            return false;
+        }
+        if (*offset != NULL && !opt_value_invariant_for_loop(function, in_loop, *offset)) {
+            return false;
+        }
+        *varying_index = i;
+    }
+    return *varying_index >= 0;
+}
+
+__attribute__((unused))
+static bool opt_loop_pointer_induction(IRFunction *function, bool *in_loop,
+                                       IRBasicBlock *header, IRBasicBlock *preheader,
+                                       IRBasicBlock *latch) {
+    bool changed = false;
+    IRInstruction *insert_before_preheader = opt_preheader_insert_point(preheader);
+    IRInstruction *insert_before_latch = latch != NULL ? opt_preheader_insert_point(latch) : NULL;
+    IRInstruction **header_phis = NULL;
+    int phi_count = 0;
+    int phi_capacity = 0;
+    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        ensure_capacity((void **)&header_phis, &phi_capacity, sizeof(IRInstruction *), phi_count + 1);
+        header_phis[phi_count++] = phi;
+    }
+    for (int phi_index = 0; phi_index < phi_count; ++phi_index) {
+        IRInstruction *phi = header_phis[phi_index];
+        bool normalized = false;
+        OptLoopInductionVar iv = {0};
+        if (!opt_match_loop_induction_var(function, in_loop, header, preheader, latch, phi, &iv, &normalized)) {
+            changed = normalized || changed;
+            continue;
+        }
+        changed = normalized || changed;
+        for (int bi = 0; bi < function->blocks.count; ++bi) {
+            if (!in_loop[bi]) {
+                continue;
+            }
+            IRBasicBlock *block = function->blocks.items[bi];
+            for (IRInstruction *inst = block->first_inst; inst != NULL;) {
+                IRInstruction *next = inst->next;
+                int varying_index = -1;
+                int scale = 0;
+                IRValue *offset = NULL;
+                bool subtract_offset = false;
+                if (opt_match_pointer_induction_gep(function, in_loop, inst, &iv, &varying_index,
+                                                    &scale, &offset, &subtract_offset)) {
+                    long long delta = (long long)iv.step * scale;
+                    if (delta >= INT_MIN && delta <= INT_MAX && delta != 0) {
+                        IRValue *init_index = opt_build_strength_init(preheader, insert_before_preheader,
+                                                                      &iv, scale, offset, subtract_offset);
+                        IRValueList init_indices = {0};
+                        for (int i = 0; i < inst->data.gep_inst.indices.count; ++i) {
+                            mem_value_list_push(&init_indices, i == varying_index
+                                                                   ? init_index
+                                                                   : inst->data.gep_inst.indices.items[i]);
+                        }
+                        IRType *result_pointee = inst->result_type->data.pointer.pointee;
+                        if (result_pointee != NULL) {
+                            IRInstruction *init_gep = opt_create_gep(preheader, insert_before_preheader,
+                                                                     inst->data.gep_inst.base_ptr,
+                                                                     inst->data.gep_inst.source_element_type,
+                                                                     init_indices, result_pointee,
+                                                                     inst->data.gep_inst.inbounds);
+                            IRInstruction *derived_phi = opt_create_phi(header, inst->result_type);
+                            IRValueList step_indices = {0};
+                            mem_value_list_push(&step_indices,
+                                                opt_new_const_int(iv.phi->result_type, (int)delta));
+                            IRInstruction *next_gep = opt_create_gep(latch, insert_before_latch,
+                                                                     &derived_phi->result, result_pointee,
+                                                                     step_indices, result_pointee,
+                                                                     inst->data.gep_inst.inbounds);
+                            opt_phi_incoming_push(derived_phi, preheader, &init_gep->result);
+                            opt_phi_incoming_push(derived_phi, latch, &next_gep->result);
+                            opt_replace_uses_in_loop(function, in_loop, &inst->result, &derived_phi->result);
+                            if (opt_count_uses(function, &inst->result) == 0) {
+                                opt_remove_inst(block, inst);
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                inst = next;
+            }
+        }
+    }
+    free(header_phis);
+    return changed;
+}
+
+static bool opt_loop_strength_reduction(IRFunction *function, bool *in_loop,
+                                        IRBasicBlock *header, IRBasicBlock *preheader,
+                                        IRBasicBlock *latch) {
+    bool changed = false;
+    IRInstruction *insert_before_preheader = opt_preheader_insert_point(preheader);
+    IRInstruction *insert_before_latch = latch != NULL ? opt_preheader_insert_point(latch) : NULL;
+    IRInstruction **header_phis = NULL;
+    int phi_count = 0;
+    int phi_capacity = 0;
+    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        ensure_capacity((void **)&header_phis, &phi_capacity, sizeof(IRInstruction *), phi_count + 1);
+        header_phis[phi_count++] = phi;
+    }
+    for (int phi_index = 0; phi_index < phi_count; ++phi_index) {
+        IRInstruction *phi = header_phis[phi_index];
+        bool normalized = false;
+        OptLoopInductionVar iv = {0};
+        if (!opt_match_loop_induction_var(function, in_loop, header, preheader, latch, phi, &iv, &normalized)) {
+            changed = normalized || changed;
+            continue;
+        }
+        changed = normalized || changed;
+        for (int bi = 0; bi < function->blocks.count; ++bi) {
+            if (!in_loop[bi]) {
+                continue;
+            }
+            IRBasicBlock *block = function->blocks.items[bi];
+            for (IRInstruction *inst = block->first_inst; inst != NULL;) {
+                IRInstruction *next = inst->next;
+                int scale = 0;
+                IRValue *offset = NULL;
+                bool subtract_offset = false;
+                if (opt_match_strength_reduction_expr(function, in_loop, inst, &iv,
+                                                      &scale, &offset, &subtract_offset)) {
+                    long long delta = (long long)iv.step * scale;
+                    if (delta >= INT_MIN && delta <= INT_MAX) {
+                        IRValue *init = opt_build_strength_init(preheader, insert_before_preheader,
+                                                                &iv, scale, offset, subtract_offset);
+                        if (delta == 0) {
+                            opt_replace_uses_in_loop(function, in_loop, &inst->result, init);
+                        } else {
+                            IRInstruction *derived_phi = opt_create_phi(header, iv.phi->result_type);
+                            IRInstruction *next_value = opt_create_binary(latch, insert_before_latch,
+                                                                          IR_INST_ADD, iv.phi->result_type,
+                                                                          &derived_phi->result,
+                                                                          opt_new_const_int(iv.phi->result_type,
+                                                                                            (int)delta));
+                            opt_phi_incoming_push(derived_phi, preheader, init);
+                            opt_phi_incoming_push(derived_phi, latch, &next_value->result);
+                            opt_replace_uses_in_loop(function, in_loop, &inst->result, &derived_phi->result);
+                        }
+                        if (opt_count_uses(function, &inst->result) == 0) {
+                            opt_remove_inst(block, inst);
+                        }
+                        changed = true;
+                    }
+                }
+                inst = next;
+            }
+        }
+    }
+    free(header_phis);
+    return changed;
+}
+
+static IRInstruction *opt_clone_inst_with_map(IRBasicBlock *block, IRInstruction *before,
+                                              IRInstruction *src, OptValueMap *map) {
+    switch (src->kind) {
+        case IR_INST_LOAD:
+            return opt_create_load(block, before,
+                                   src->data.load_inst.value_type,
+                                   opt_value_map_get(map, src->data.load_inst.ptr),
+                                   src->data.load_inst.alignment);
+        case IR_INST_STORE:
+            return opt_create_store(block, before, src->result_type,
+                                    opt_value_map_get(map, src->data.store_inst.value),
+                                    opt_value_map_get(map, src->data.store_inst.ptr),
+                                    src->data.store_inst.alignment);
+        case IR_INST_ADD:
+        case IR_INST_SUB:
+        case IR_INST_MUL:
+        case IR_INST_SDIV:
+        case IR_INST_SREM:
+        case IR_INST_FADD:
+        case IR_INST_FSUB:
+        case IR_INST_FMUL:
+        case IR_INST_FDIV:
+            return opt_create_binary(block, before, src->kind, src->result_type,
+                                     opt_value_map_get(map, src->data.binary_inst.lhs),
+                                     opt_value_map_get(map, src->data.binary_inst.rhs));
+        case IR_INST_ICMP:
+            return opt_create_icmp(block, before,
+                                   src->data.icmp_inst.pred,
+                                   opt_value_map_get(map, src->data.icmp_inst.lhs),
+                                   opt_value_map_get(map, src->data.icmp_inst.rhs),
+                                   src->result_type);
+        case IR_INST_FCMP:
+            return opt_create_fcmp(block, before,
+                                   src->data.fcmp_inst.pred,
+                                   opt_value_map_get(map, src->data.fcmp_inst.lhs),
+                                   opt_value_map_get(map, src->data.fcmp_inst.rhs),
+                                   src->result_type);
+        case IR_INST_ZEXT:
+        case IR_INST_SITOFP:
+        case IR_INST_FPTOSI:
+            return opt_create_cast(block, before, src->kind,
+                                   opt_value_map_get(map, src->data.cast_inst.value),
+                                   src->data.cast_inst.to_type);
+        case IR_INST_CALL: {
+            IRValueList args = {0};
+            for (int i = 0; i < src->data.call_inst.args.count; ++i) {
+                mem_value_list_push(&args, opt_value_map_get(map, src->data.call_inst.args.items[i]));
+            }
+            return opt_create_call(block, before, src->data.call_inst.callee,
+                                   src->data.call_inst.ret_type, args);
+        }
+        case IR_INST_GETELEMENTPTR: {
+            IRValueList indices = {0};
+            for (int i = 0; i < src->data.gep_inst.indices.count; ++i) {
+                mem_value_list_push(&indices, opt_value_map_get(map, src->data.gep_inst.indices.items[i]));
+            }
+            IRType *result_pointee = src->result_type->data.pointer.pointee;
+            return opt_create_gep(block, before,
+                                  opt_value_map_get(map, src->data.gep_inst.base_ptr),
+                                  src->data.gep_inst.source_element_type,
+                                  indices, result_pointee, src->data.gep_inst.inbounds);
+        }
+        case IR_INST_BITCAST:
+            return opt_create_bitcast(block, before,
+                                      opt_value_map_get(map, src->data.bitcast_inst.value),
+                                      src->data.bitcast_inst.to_type);
+        default:
+            return NULL;
+    }
+}
+
+static bool opt_try_unroll_small_loop(IRFunction *function, bool *in_loop,
+                                      IRBasicBlock *header, IRBasicBlock *preheader,
+                                      IRBasicBlock *latch) {
+    if (opt_loop_block_count(function, in_loop) != 2 || latch == NULL || latch == header) {
+        return false;
+    }
+    if (header->last_inst == NULL || header->last_inst->kind != IR_INST_BR
+            || !header->last_inst->data.br_inst.is_conditional) {
+        return false;
+    }
+    if (latch->last_inst == NULL || latch->last_inst->kind != IR_INST_BR
+            || latch->last_inst->data.br_inst.is_conditional
+            || latch->last_inst->data.br_inst.true_block != header) {
+        return false;
+    }
+    IRBasicBlock *body = NULL;
+    IRBasicBlock *exit_block = NULL;
+    if (header->last_inst->data.br_inst.true_block == latch
+            && header->last_inst->data.br_inst.false_block != NULL
+            && header->last_inst->data.br_inst.false_block != latch) {
+        body = latch;
+        exit_block = header->last_inst->data.br_inst.false_block;
+    } else if (header->last_inst->data.br_inst.false_block == latch
+            && header->last_inst->data.br_inst.true_block != NULL
+            && header->last_inst->data.br_inst.true_block != latch) {
+        body = latch;
+        exit_block = header->last_inst->data.br_inst.true_block;
+    }
+    if (body == NULL || exit_block == NULL || opt_block_non_phi_non_term_inst_count(body) > 24) {
+        return false;
+    }
+    IRValue *cond = header->last_inst->data.br_inst.condition;
+    if (cond == NULL || cond->kind != IR_VALUE_INSTRUCTION) {
+        return false;
+    }
+    IRInstruction *cmp = cond->data.instruction;
+    if (cmp == NULL || cmp->parent != header || cmp->kind != IR_INST_ICMP) {
+        return false;
+    }
+    OptLoopInductionVar iv = {0};
+    bool matched_iv = false;
+    bool normalized = false;
+    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        OptLoopInductionVar candidate = {0};
+        bool phi_normalized = false;
+        if (!opt_match_loop_induction_var(function, in_loop, header, preheader, latch, phi,
+                                          &candidate, &phi_normalized)) {
+            normalized = phi_normalized || normalized;
+            continue;
+        }
+        normalized = phi_normalized || normalized;
+        if (cmp->data.icmp_inst.lhs == &phi->result || cmp->data.icmp_inst.rhs == &phi->result) {
+            iv = candidate;
+            matched_iv = true;
+            break;
+        }
+    }
+    if (!matched_iv) {
+        return normalized;
+    }
+    if (cmp->data.icmp_inst.rhs == &iv.phi->result) {
+        cmp->data.icmp_inst.pred = opt_swap_icmp_pred(cmp->data.icmp_inst.pred);
+        IRValue *tmp = cmp->data.icmp_inst.lhs;
+        cmp->data.icmp_inst.lhs = cmp->data.icmp_inst.rhs;
+        cmp->data.icmp_inst.rhs = tmp;
+        normalized = true;
+    }
+    if (cmp->data.icmp_inst.lhs != &iv.phi->result) {
+        return normalized;
+    }
+    int start = 0;
+    int bound = 0;
+    int trip_count = 0;
+    if (!opt_const_int_value(iv.start_value, &start)
+            || !opt_const_int_value(cmp->data.icmp_inst.rhs, &bound)
+            || !opt_compute_small_trip_count(cmp->data.icmp_inst.pred, start, bound, iv.step, 4, &trip_count)
+            || trip_count <= 0) {
+        return normalized;
+    }
+    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (phi->data.phi_inst.count != 2
+                || opt_phi_incoming_value(phi, preheader) == NULL
+                || opt_phi_incoming_value(phi, latch) == NULL) {
+            return normalized;
+        }
+    }
+    IRInstruction *insert_before = opt_preheader_insert_point(preheader);
+    OptValueMap state = {0};
+    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        opt_value_map_push(&state, &phi->result, opt_phi_incoming_value(phi, preheader));
+    }
+    for (int iter = 0; iter < trip_count; ++iter) {
+        OptValueMap iter_map = {0};
+        for (int i = 0; i < state.count; ++i) {
+            opt_value_map_push(&iter_map, state.from[i], state.to[i]);
+        }
+        for (IRInstruction *inst = body->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->kind == IR_INST_BR) {
+                continue;
+            }
+            IRInstruction *clone = opt_clone_inst_with_map(preheader, insert_before, inst, &iter_map);
+            if (clone == NULL) {
+                opt_value_map_reset(&iter_map);
+                opt_value_map_reset(&state);
+                return normalized;
+            }
+            if (clone->result_type != NULL && clone->result_type->kind != IR_TYPE_VOID) {
+                opt_value_map_push(&iter_map, &inst->result, &clone->result);
+            }
+        }
+        OptValueMap next_state = {0};
+        for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+            IRValue *next_value = opt_value_map_get(&iter_map, opt_phi_incoming_value(phi, latch));
+            opt_value_map_push(&next_state, &phi->result, next_value);
+        }
+        opt_value_map_reset(&iter_map);
+        opt_value_map_reset(&state);
+        state = next_state;
+    }
+    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        IRValue *final_value = opt_value_map_get(&state, &phi->result);
+        opt_phi_incoming_push(phi, preheader, final_value);
+    }
+    opt_value_map_reset(&state);
+    (void)exit_block;
+    return true;
+}
+
+__attribute__((unused))
+static bool opt_try_partial_unroll_loop(IRFunction *function, bool *in_loop,
+                                        IRBasicBlock *header, IRBasicBlock *preheader,
+                                        IRBasicBlock *latch) {
+    if (opt_loop_block_count(function, in_loop) != 2 || latch == NULL || latch == header) {
+        return false;
+    }
+    if (header->last_inst == NULL || header->last_inst->kind != IR_INST_BR
+            || !header->last_inst->data.br_inst.is_conditional) {
+        return false;
+    }
+    if (latch->last_inst == NULL || latch->last_inst->kind != IR_INST_BR
+            || latch->last_inst->data.br_inst.is_conditional
+            || latch->last_inst->data.br_inst.true_block != header) {
+        return false;
+    }
+    IRBasicBlock *body = NULL;
+    if (header->last_inst->data.br_inst.true_block == latch
+            && header->last_inst->data.br_inst.false_block != NULL
+            && header->last_inst->data.br_inst.false_block != latch) {
+        body = latch;
+    } else if (header->last_inst->data.br_inst.false_block == latch
+            && header->last_inst->data.br_inst.true_block != NULL
+            && header->last_inst->data.br_inst.true_block != latch) {
+        body = latch;
+    }
+    if (body == NULL) {
+        return false;
+    }
+    int body_inst_count = opt_block_non_phi_non_term_inst_count(body);
+    if (body_inst_count <= 0 || body_inst_count > 24) {
+        return false;
+    }
+    IRValue *cond = header->last_inst->data.br_inst.condition;
+    if (cond == NULL || cond->kind != IR_VALUE_INSTRUCTION) {
+        return false;
+    }
+    IRInstruction *cmp = cond->data.instruction;
+    if (cmp == NULL || cmp->parent != header || cmp->kind != IR_INST_ICMP) {
+        return false;
+    }
+    OptLoopInductionVar iv = {0};
+    bool matched_iv = false;
+    bool normalized = false;
+    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        OptLoopInductionVar candidate = {0};
+        bool phi_normalized = false;
+        if (!opt_match_loop_induction_var(function, in_loop, header, preheader, latch, phi,
+                                          &candidate, &phi_normalized)) {
+            normalized = phi_normalized || normalized;
+            continue;
+        }
+        normalized = phi_normalized || normalized;
+        if (cmp->data.icmp_inst.lhs == &phi->result || cmp->data.icmp_inst.rhs == &phi->result) {
+            iv = candidate;
+            matched_iv = true;
+            break;
+        }
+    }
+    if (!matched_iv) {
+        return normalized;
+    }
+    if (cmp->data.icmp_inst.rhs == &iv.phi->result) {
+        cmp->data.icmp_inst.pred = opt_swap_icmp_pred(cmp->data.icmp_inst.pred);
+        IRValue *tmp = cmp->data.icmp_inst.lhs;
+        cmp->data.icmp_inst.lhs = cmp->data.icmp_inst.rhs;
+        cmp->data.icmp_inst.rhs = tmp;
+        normalized = true;
+    }
+    if (cmp->data.icmp_inst.lhs != &iv.phi->result) {
+        return normalized;
+    }
+    int start = 0;
+    int bound = 0;
+    int trip_count = 0;
+    if (!opt_const_int_value(iv.start_value, &start)
+            || !opt_const_int_value(cmp->data.icmp_inst.rhs, &bound)
+            || !opt_compute_small_trip_count(cmp->data.icmp_inst.pred, start, bound, iv.step, 256, &trip_count)
+            || trip_count < 8) {
+        return normalized;
+    }
+    int unroll_factor = 0;
+    if (trip_count % 8 == 0 && body_inst_count <= 16 && body_inst_count * 8 <= 128) {
+        unroll_factor = 8;
+    } else if (trip_count % 4 == 0 && body_inst_count <= 24 && body_inst_count * 4 <= 128) {
+        unroll_factor = 4;
+    } else {
+        return normalized;
+    }
+    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (phi->data.phi_inst.count != 2
+                || opt_phi_incoming_value(phi, preheader) == NULL
+                || opt_phi_incoming_value(phi, latch) == NULL) {
+            return normalized;
+        }
+    }
+    IRInstruction *insert_before = opt_preheader_insert_point(latch);
+    if (insert_before == NULL) {
+        return normalized;
+    }
+    IRInstruction **body_insts = NULL;
+    int body_count = 0;
+    int body_capacity = 0;
+    for (IRInstruction *inst = body->first_inst; inst != NULL; inst = inst->next) {
+        if (inst->kind == IR_INST_BR) {
+            continue;
+        }
+        ensure_capacity((void **)&body_insts, &body_capacity, sizeof(IRInstruction *), body_count + 1);
+        body_insts[body_count++] = inst;
+    }
+    OptValueMap state = {0};
+    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        opt_value_map_push(&state, &phi->result, opt_phi_incoming_value(phi, latch));
+    }
+    for (int iter = 1; iter < unroll_factor; ++iter) {
+        OptValueMap iter_map = {0};
+        for (int i = 0; i < state.count; ++i) {
+            opt_value_map_push(&iter_map, state.from[i], state.to[i]);
+        }
+        for (int inst_index = 0; inst_index < body_count; ++inst_index) {
+            IRInstruction *inst = body_insts[inst_index];
+            IRInstruction *clone = opt_clone_inst_with_map(latch, insert_before, inst, &iter_map);
+            if (clone == NULL) {
+                opt_value_map_reset(&iter_map);
+                opt_value_map_reset(&state);
+                free(body_insts);
+                return normalized;
+            }
+            if (clone->result_type != NULL && clone->result_type->kind != IR_TYPE_VOID) {
+                opt_value_map_push(&iter_map, &inst->result, &clone->result);
+            }
+        }
+        OptValueMap next_state = {0};
+        for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+            IRValue *next_value = opt_value_map_get(&iter_map, opt_phi_incoming_value(phi, latch));
+            opt_value_map_push(&next_state, &phi->result, next_value);
+        }
+        opt_value_map_reset(&iter_map);
+        opt_value_map_reset(&state);
+        state = next_state;
+    }
+    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        int latch_index = opt_phi_incoming_index(phi, latch);
+        if (latch_index >= 0) {
+            phi->data.phi_inst.values.items[latch_index] = opt_value_map_get(&state, &phi->result);
+        }
+    }
+    opt_value_map_reset(&state);
+    free(body_insts);
+    return true;
+}
+
 static bool opt_loop_licm(IRFunction *function, bool *in_loop, IRBasicBlock *preheader) {
     bool changed = false;
     IRInstruction *insert_before = opt_preheader_insert_point(preheader);
@@ -5553,6 +6793,11 @@ static bool opt_loop_pass(IRFunction *function) {
             bool *in_loop = opt_collect_natural_loop(function, header, latch);
             IRBasicBlock *preheader = opt_find_preheader(function, in_loop, header);
             if (preheader != NULL) {
+                IRBasicBlock *unique_latch = opt_find_unique_loop_latch(function, in_loop, header);
+                if (unique_latch != NULL) {
+                    changed = opt_try_unroll_small_loop(function, in_loop, header, preheader, unique_latch) || changed;
+                    changed = opt_loop_strength_reduction(function, in_loop, header, preheader, unique_latch) || changed;
+                }
                 changed = opt_loop_cse(function, dom, in_loop) || changed;
                 changed = opt_loop_licm(function, in_loop, preheader) || changed;
             }
@@ -6099,6 +7344,7 @@ typedef struct RVRegTemp {
     IRInstruction *def_inst;
     IRInstruction *use_inst;
     const char *reg;
+    bool persistent;
     struct RVRegTemp *next;
 } RVRegTemp;
 
@@ -6112,8 +7358,20 @@ typedef struct {
     int phi_scratch_offset;
     int phi_scratch_slots;
     int phi_label_id;
+    int saved_reg_offsets[6];
+    bool used_saved_regs[6];
     FILE *out;
 } RVFrame;
+
+typedef struct {
+    IRValue *value;
+    IRInstruction *phi;
+    IRInstruction *update_inst;
+    IRBasicBlock *latch;
+    int score;
+} RVLoopRegCandidate;
+
+static const char *g_rv_loop_regs[] = {"s1", "s2", "s3", "s4", "s5", "s6"};
 
 static const char *rv_symbol_name(const char *name) {
     if (name == NULL) {
@@ -6187,15 +7445,41 @@ static RVRegTemp *rv_find_reg_temp(RVFrame *frame, IRValue *value) {
 
 static void rv_add_reg_temp(RVFrame *frame, IRValue *value,
                             IRInstruction *def_inst, IRInstruction *use_inst,
-                            const char *reg) {
+                            const char *reg, bool persistent) {
+    if (rv_find_reg_temp(frame, value) != NULL) {
+        return;
+    }
     RVRegTemp *temp = (RVRegTemp *)xmalloc(sizeof(RVRegTemp));
     memset(temp, 0, sizeof(RVRegTemp));
     temp->value = value;
     temp->def_inst = def_inst;
     temp->use_inst = use_inst;
     temp->reg = reg;
+    temp->persistent = persistent;
     temp->next = frame->reg_temps;
     frame->reg_temps = temp;
+}
+
+static int rv_saved_reg_index(const char *reg) {
+    for (int i = 0; i < 6; ++i) {
+        if (strcmp(g_rv_loop_regs[i], reg) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static const char *rv_value_reg_home(RVFrame *frame, IRValue *value) {
+    RVRegTemp *temp = rv_find_reg_temp(frame, value);
+    return temp != NULL ? temp->reg : NULL;
+}
+
+static void rv_add_persistent_reg_home(RVFrame *frame, IRValue *value, const char *reg) {
+    int index = rv_saved_reg_index(reg);
+    if (index >= 0) {
+        frame->used_saved_regs[index] = true;
+    }
+    rv_add_reg_temp(frame, value, NULL, NULL, reg, true);
 }
 
 static int rv_value_slot_size(IRValue *value) {
@@ -6269,6 +7553,78 @@ static int rv_pow2_shift(int value) {
     return value == 1 && shift < 32 ? shift : -1;
 }
 
+typedef struct {
+    int32_t magic;
+    int shift;
+} RVSignedDivMagic;
+
+static bool rv_compute_signed_div_magic(int divisor, RVSignedDivMagic *out) {
+    if (out == NULL || divisor == 0 || divisor == 1 || divisor == -1 || divisor == INT_MIN) {
+        return false;
+    }
+    int abs_divisor = divisor < 0 ? -divisor : divisor;
+    if (rv_pow2_shift(abs_divisor) >= 0) {
+        return false;
+    }
+    const uint64_t two31 = 1ULL << 31;
+    uint32_t ad = (uint32_t)abs_divisor;
+    uint64_t t = two31 + (((uint32_t)divisor) >> 31);
+    uint64_t anc = t - 1 - (t % ad);
+    uint64_t p = 31;
+    uint64_t q1 = two31 / anc;
+    uint64_t r1 = two31 - q1 * anc;
+    uint64_t q2 = two31 / ad;
+    uint64_t r2 = two31 - q2 * ad;
+    uint64_t delta = 0;
+    do {
+        ++p;
+        q1 <<= 1;
+        r1 <<= 1;
+        if (r1 >= anc) {
+            ++q1;
+            r1 -= anc;
+        }
+        q2 <<= 1;
+        r2 <<= 1;
+        if (r2 >= ad) {
+            ++q2;
+            r2 -= ad;
+        }
+        delta = ad - r2;
+    } while (q1 < delta || (q1 == delta && r1 == 0));
+    int64_t magic = (int64_t)q2 + 1;
+    if (divisor < 0) {
+        magic = -magic;
+    }
+    out->magic = (int32_t)magic;
+    out->shift = (int)(p - 32);
+    return true;
+}
+
+static void rv_emit_signed_div_magic_quotient(FILE *out, const char *dst,
+                                              const char *src, int divisor) {
+    RVSignedDivMagic info;
+    if (!rv_compute_signed_div_magic(divisor, &info)) {
+        return;
+    }
+    fprintf(out, "  li t1, %d\n", info.magic);
+    fprintf(out, "  mul t2, %s, t1\n", src);
+    fprintf(out, "  srai t2, t2, 32\n");
+    if (divisor > 0 && info.magic < 0) {
+        fprintf(out, "  addw t2, t2, %s\n", src);
+    } else if (divisor < 0 && info.magic > 0) {
+        fprintf(out, "  subw t2, t2, %s\n", src);
+    }
+    if (info.shift > 0) {
+        fprintf(out, "  sraiw t2, t2, %d\n", info.shift);
+    }
+    /* Scratch must avoid t3/t4 (reserved by the RVRegTemp local-register
+       cache) and t0 (=src, still needed by the SREM caller). t1 holds the
+       magic constant only for the initial mul and is dead here, so reuse it. */
+    fprintf(out, "  srliw t1, t2, 31\n");
+    fprintf(out, "  addw %s, t2, t1\n", dst);
+}
+
 static void rv_emit_and_i32_const(FILE *out, const char *dst, const char *src, int value) {
     if (rv_imm12(value)) {
         fprintf(out, "  andi %s, %s, %d\n", dst, src, value);
@@ -6282,9 +7638,21 @@ static int rv_count_instruction_uses(IRInstruction *inst, IRValue *value);
 
 static bool rv_inst_reg_temp_supported(IRInstruction *inst) {
     if (inst == NULL || inst->result_type == NULL ||
-            inst->result_type->kind == IR_TYPE_VOID ||
-            rv_value_is_float(&inst->result)) {
+            inst->result_type->kind == IR_TYPE_VOID) {
         return false;
+    }
+    if (rv_value_is_float(&inst->result)) {
+        switch (inst->kind) {
+            case IR_INST_LOAD:
+            case IR_INST_FADD:
+            case IR_INST_FSUB:
+            case IR_INST_FMUL:
+            case IR_INST_FDIV:
+            case IR_INST_SITOFP:
+                return true;
+            default:
+                return false;
+        }
     }
     switch (inst->kind) {
         case IR_INST_LOAD:
@@ -6294,9 +7662,11 @@ static bool rv_inst_reg_temp_supported(IRInstruction *inst) {
         case IR_INST_SDIV:
         case IR_INST_SREM:
         case IR_INST_ICMP:
+        case IR_INST_FCMP:
         case IR_INST_ZEXT:
         case IR_INST_GETELEMENTPTR:
         case IR_INST_BITCAST:
+        case IR_INST_FPTOSI:
             return true;
         default:
             return false;
@@ -6357,29 +7727,365 @@ static bool rv_inst_can_be_reg_temp(IRFunction *function, IRBasicBlock *def_bloc
 }
 
 static void rv_plan_reg_temps_for_block(RVFrame *frame, IRBasicBlock *block) {
-    static const char *regs[] = {"t3", "t4"};
-    IRValue *active[2] = {0};
+    static const char *int_regs[] = {"t3", "t4"};
+    static const char *float_regs[] = {"ft3", "ft4"};
+    IRValue *active_int[2] = {0};
+    IRValue *active_float[2] = {0};
     for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
         for (int i = 0; i < 2; ++i) {
-            if (active[i] != NULL && rv_count_instruction_uses(inst, active[i]) > 0) {
-                active[i] = NULL;
+            if (active_int[i] != NULL && rv_count_instruction_uses(inst, active_int[i]) > 0) {
+                active_int[i] = NULL;
+            }
+            if (active_float[i] != NULL && rv_count_instruction_uses(inst, active_float[i]) > 0) {
+                active_float[i] = NULL;
             }
         }
         IRInstruction *use_inst = NULL;
         if (!rv_inst_can_be_reg_temp(frame->function, block, inst, &use_inst)) {
             continue;
         }
+        IRValue **active = rv_value_is_float(&inst->result) ? active_float : active_int;
+        const char **regs = rv_value_is_float(&inst->result) ? float_regs : int_regs;
         for (int i = 0; i < 2; ++i) {
             if (active[i] == NULL) {
                 active[i] = &inst->result;
-                rv_add_reg_temp(frame, &inst->result, inst, use_inst, regs[i]);
+                rv_add_reg_temp(frame, &inst->result, inst, use_inst, regs[i], false);
                 break;
             }
         }
     }
 }
 
+static bool rv_match_loop_induction_candidate(IRBasicBlock *preheader, IRBasicBlock *latch,
+                                              IRInstruction *phi, IRInstruction **out_update) {
+    if (phi == NULL || phi->kind != IR_INST_PHI || phi->result_type == NULL
+            || phi->result_type->kind != IR_TYPE_I32 || phi->data.phi_inst.count != 2) {
+        return false;
+    }
+    IRValue *start_value = opt_phi_incoming_value(phi, preheader);
+    IRValue *latch_value = opt_phi_incoming_value(phi, latch);
+    if (start_value == NULL || latch_value == NULL || latch_value->kind != IR_VALUE_INSTRUCTION) {
+        return false;
+    }
+    IRInstruction *update = latch_value->data.instruction;
+    if (update == NULL || update->parent != latch) {
+        return false;
+    }
+    int delta = 0;
+    if (update->kind == IR_INST_ADD) {
+        if ((update->data.binary_inst.lhs == &phi->result
+                    && opt_const_int_value(update->data.binary_inst.rhs, &delta))
+                || (update->data.binary_inst.rhs == &phi->result
+                    && opt_const_int_value(update->data.binary_inst.lhs, &delta))) {
+            *out_update = update;
+            return delta != 0;
+        }
+    }
+    if (update->kind == IR_INST_SUB
+            && update->data.binary_inst.lhs == &phi->result
+            && opt_const_int_value(update->data.binary_inst.rhs, &delta)
+            && delta != 0 && delta != INT_MIN) {
+        *out_update = update;
+        return true;
+    }
+    return false;
+}
+
+static bool rv_value_can_have_persistent_reg_home(IRValue *value) {
+    if (value == NULL || rv_value_is_float(value)) {
+        return false;
+    }
+    if (value->kind == IR_VALUE_PARAM) {
+        return true;
+    }
+    if (value->kind != IR_VALUE_INSTRUCTION) {
+        return false;
+    }
+    IRInstruction *inst = value->data.instruction;
+    return inst != NULL && inst->kind != IR_INST_ALLOCA
+        && inst->result_type != NULL && inst->result_type->kind != IR_TYPE_VOID;
+}
+
+static int rv_count_loop_uses(IRFunction *function, bool *in_loop, IRValue *value) {
+    int count = 0;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        if (!in_loop[bi]) {
+            continue;
+        }
+        for (IRInstruction *inst = function->blocks.items[bi]->first_inst; inst != NULL; inst = inst->next) {
+            count += opt_count_uses_in_inst(inst, value);
+        }
+    }
+    return count;
+}
+
+static bool rv_block_dominates(IRFunction *function, bool *dom,
+                               IRBasicBlock *dominator, IRBasicBlock *block) {
+    int a = opt_function_block_index(function, dominator);
+    int b = opt_function_block_index(function, block);
+    return a >= 0 && b >= 0 && dom[a * function->blocks.count + b];
+}
+
+static bool rv_value_is_loop_invariant_candidate(IRFunction *function, bool *dom, bool *in_loop,
+                                                 IRBasicBlock *header, IRBasicBlock *preheader,
+                                                 IRValue *value) {
+    if (!rv_value_can_have_persistent_reg_home(value)) {
+        return false;
+    }
+    if (value->kind == IR_VALUE_PARAM) {
+        return true;
+    }
+    IRInstruction *inst = value->data.instruction;
+    if (inst == NULL || inst->parent == NULL) {
+        return false;
+    }
+    if (in_loop[opt_function_block_index(function, inst->parent)]) {
+        return false;
+    }
+    return inst->parent == preheader || rv_block_dominates(function, dom, inst->parent, header);
+}
+
+static void rv_candidate_list_push(RVLoopRegCandidate **items, int *count, int *capacity,
+                                   IRValue *value, IRInstruction *phi, IRInstruction *update,
+                                   IRBasicBlock *latch, int score) {
+    for (int i = 0; i < *count; ++i) {
+        if ((*items)[i].value == value) {
+            if (score > (*items)[i].score) {
+                (*items)[i].value = value;
+                (*items)[i].score = score;
+                (*items)[i].phi = phi;
+                (*items)[i].update_inst = update;
+                (*items)[i].latch = latch;
+            }
+            return;
+        }
+    }
+    ensure_capacity((void **)items, capacity, sizeof(RVLoopRegCandidate), *count + 1);
+    (*items)[*count].value = value;
+    (*items)[*count].phi = phi;
+    (*items)[*count].update_inst = update;
+    (*items)[*count].latch = latch;
+    (*items)[*count].score = score;
+    (*count)++;
+}
+
+/* True if instruction a is guaranteed to execute before b is reached, i.e.
+   a's definition dominates the program point of b. Within one block this is
+   simple program order; across blocks it is block dominance. */
+static bool rv_inst_dominates_inst(IRFunction *function, bool *dom,
+                                   IRInstruction *a, IRInstruction *b) {
+    if (a == NULL || b == NULL || a->parent == NULL || b->parent == NULL) {
+        return false;
+    }
+    if (a->parent == b->parent) {
+        return opt_inst_before_in_block(a, b);
+    }
+    int n = function->blocks.count;
+    int ai = opt_function_block_index(function, a->parent);
+    int bi = opt_function_block_index(function, b->parent);
+    if (ai < 0 || bi < 0) {
+        return false;
+    }
+    return dom[bi * n + ai];
+}
+
+/* Coalescing a loop phi with the value it takes on the back-edge (its "update")
+   into one register is only safe when the phi's old value is dead by the time
+   the update overwrites the shared register. Two hazards make it unsafe:
+     1. read-after-clobber: some use of the phi is reached after the update
+        (e.g. independent recurrences a=a+b; d=d+a reading the old a);
+     2. parallel-copy/rotation: the phi value is a back-edge incoming of another
+        phi, so the back-edge copy still needs the old value after the update
+        already ran (e.g. A=D; D=C; C=B; B=temp).
+   Either case means the live ranges interfere, so coalescing must be skipped. */
+static bool rv_phi_update_coalesce_safe(IRFunction *function, bool *dom,
+                                        IRInstruction *phi, IRInstruction *update) {
+    if (phi == NULL || update == NULL) {
+        return false;
+    }
+    IRValue *p = &phi->result;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            if (inst == update || inst == phi) {
+                continue;
+            }
+            if (opt_count_uses_in_inst(inst, p) == 0) {
+                continue;
+            }
+            /* Hazard 2: used as another phi's incoming value -> parallel copy
+               on the back-edge still needs the old value. */
+            if (inst->kind == IR_INST_PHI) {
+                return false;
+            }
+            /* Hazard 1: a use reached after the update overwrites the register. */
+            if (rv_inst_dominates_inst(function, dom, update, inst)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void rv_plan_loop_reg_homes(RVFrame *frame, IRFunction *function) {
+    RVLoopRegCandidate *candidates = NULL;
+    int candidate_count = 0;
+    int candidate_capacity = 0;
+    bool *dom = opt_compute_dominators(function);
+    for (int hi = 0; hi < function->blocks.count; ++hi) {
+        IRBasicBlock *header = function->blocks.items[hi];
+        for (int pi = 0; pi < header->pred_count; ++pi) {
+            IRBasicBlock *latch = header->preds[pi];
+            int latch_index = opt_function_block_index(function, latch);
+            if (latch_index < 0 || !dom[latch_index * function->blocks.count + hi]) {
+                continue;
+            }
+            bool *in_loop = opt_collect_natural_loop(function, header, latch);
+            IRBasicBlock *preheader = opt_find_preheader(function, in_loop, header);
+            IRBasicBlock *unique_latch = opt_find_unique_loop_latch(function, in_loop, header);
+            if (preheader != NULL && unique_latch == latch) {
+                int loop_blocks = opt_loop_block_count(function, in_loop);
+                for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+                    if (!rv_value_can_have_persistent_reg_home(&phi->result) || phi->data.phi_inst.count != 2) {
+                        continue;
+                    }
+                    IRValue *preheader_incoming = opt_phi_incoming_value(phi, preheader);
+                    IRValue *latch_incoming = opt_phi_incoming_value(phi, latch);
+                    if (preheader_incoming == NULL || latch_incoming == NULL) {
+                        continue;
+                    }
+                    /* Skip rotation/shift-register chains formed by loop-header
+                       phis feeding each other across the back-edge (e.g. the
+                       hash rounds A=D; D=C; C=B; B=temp). Such phis form a
+                       cyclic parallel copy on the back-edge; pinning any subset
+                       of them to persistent registers makes the mixed
+                       register/spill copy collapse the cycle. A phi is part of
+                       such a chain if its back-edge value is another header phi
+                       (it reads a phi), or its result is the back-edge value of
+                       another header phi (it is read by a phi). Induction vars
+                       and accumulators (latch value is a self-referencing
+                       arithmetic instruction) are unaffected. */
+                    bool in_phi_cycle = false;
+                    if (latch_incoming->kind == IR_VALUE_INSTRUCTION
+                            && latch_incoming->data.instruction != NULL
+                            && latch_incoming->data.instruction->kind == IR_INST_PHI
+                            && latch_incoming->data.instruction->parent == header) {
+                        in_phi_cycle = true;
+                    }
+                    for (IRInstruction *other = header->first_inst;
+                         !in_phi_cycle && other != NULL && other->kind == IR_INST_PHI;
+                         other = other->next) {
+                        if (other == phi) {
+                            continue;
+                        }
+                        if (opt_phi_incoming_value(other, latch) == &phi->result) {
+                            in_phi_cycle = true;
+                        }
+                    }
+                    if (in_phi_cycle) {
+                        continue;
+                    }
+                    int loop_uses = rv_count_loop_uses(function, in_loop, &phi->result);
+                    if (loop_uses == 0) {
+                        continue;
+                    }
+                    IRInstruction *update = NULL;
+                    bool is_induction = rv_match_loop_induction_candidate(preheader, latch, phi, &update);
+                    int score = loop_uses * 24 + loop_blocks * 4;
+                    if (is_induction) {
+                        score += 32;
+                    } else {
+                        score += 12;
+                    }
+                    if (rv_value_can_have_persistent_reg_home(preheader_incoming)
+                            && rv_value_is_loop_invariant_candidate(function, dom, in_loop,
+                                                                    header, preheader, preheader_incoming)) {
+                        score += 8;
+                    }
+                    if (latch_incoming->kind == IR_VALUE_INSTRUCTION
+                            && latch_incoming->data.instruction != NULL
+                            && latch_incoming->data.instruction->parent == latch
+                            && opt_count_uses(function, latch_incoming) == 1) {
+                        score += 12;
+                        if (update == NULL) {
+                            update = latch_incoming->data.instruction;
+                        }
+                    }
+                    rv_candidate_list_push(&candidates, &candidate_count, &candidate_capacity,
+                                           &phi->result, phi, update, latch, score);
+                }
+                for (int i = 0; i < function->params.count; ++i) {
+                    IRValue *param_value = &function->params.items[i]->value;
+                    int loop_uses = rv_count_loop_uses(function, in_loop, param_value);
+                    if (loop_uses < 2) {
+                        continue;
+                    }
+                    int score = loop_uses * 10 + loop_blocks * 3;
+                    rv_candidate_list_push(&candidates, &candidate_count, &candidate_capacity,
+                                           param_value, NULL, NULL, NULL, score);
+                }
+                for (int bi = 0; bi < function->blocks.count; ++bi) {
+                    if (in_loop[bi]) {
+                        continue;
+                    }
+                    IRBasicBlock *block = function->blocks.items[bi];
+                    if (!rv_block_dominates(function, dom, block, header)) {
+                        continue;
+                    }
+                    for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+                        if (!rv_value_is_loop_invariant_candidate(function, dom, in_loop,
+                                                                  header, preheader, &inst->result)) {
+                            continue;
+                        }
+                        int loop_uses = rv_count_loop_uses(function, in_loop, &inst->result);
+                        if (loop_uses < 2) {
+                            continue;
+                        }
+                        int score = loop_uses * 12 + loop_blocks * 3;
+                        if (block == preheader) {
+                            score += 12;
+                        }
+                        if (inst->kind == IR_INST_GETELEMENTPTR || inst->kind == IR_INST_BITCAST) {
+                            score += 10;
+                        } else if (inst->kind == IR_INST_LOAD) {
+                            score += 6;
+                        }
+                        rv_candidate_list_push(&candidates, &candidate_count, &candidate_capacity,
+                                               &inst->result, NULL, NULL, NULL, score);
+                    }
+                }
+            }
+            free(in_loop);
+        }
+    }
+    for (int i = 0; i < candidate_count; ++i) {
+        for (int j = i + 1; j < candidate_count; ++j) {
+            if (candidates[j].score > candidates[i].score) {
+                RVLoopRegCandidate tmp = candidates[i];
+                candidates[i] = candidates[j];
+                candidates[j] = tmp;
+            }
+        }
+    }
+    int assign_count = candidate_count < 6 ? candidate_count : 6;
+    for (int i = 0; i < assign_count; ++i) {
+        const char *reg = g_rv_loop_regs[i];
+        rv_add_persistent_reg_home(frame, candidates[i].value, reg);
+        if (candidates[i].phi != NULL && candidates[i].update_inst != NULL
+                && opt_phi_incoming_value(candidates[i].phi, candidates[i].latch)
+                       == &candidates[i].update_inst->result
+                && opt_count_uses(function, &candidates[i].update_inst->result) == 1
+                && rv_phi_update_coalesce_safe(function, dom,
+                                               candidates[i].phi, candidates[i].update_inst)) {
+            rv_add_persistent_reg_home(frame, &candidates[i].update_inst->result, reg);
+        }
+    }
+    free(dom);
+    free(candidates);
+}
+
 static void rv_plan_reg_temps(RVFrame *frame, IRFunction *function) {
+    rv_plan_loop_reg_homes(frame, function);
     for (int bi = 0; bi < function->blocks.count; ++bi) {
         rv_plan_reg_temps_for_block(frame, function->blocks.items[bi]);
     }
@@ -6416,6 +8122,13 @@ static void rv_store_int_slot(RVFrame *frame, IRValue *value, const char *reg) {
 }
 
 static void rv_store_float_slot(RVFrame *frame, IRValue *value, const char *reg) {
+    RVRegTemp *temp = rv_find_reg_temp(frame, value);
+    if (temp != NULL) {
+        if (strcmp(temp->reg, reg) != 0) {
+            fprintf(frame->out, "  fmv.s %s, %s\n", temp->reg, reg);
+        }
+        return;
+    }
     RVSlot *slot = rv_find_slot(frame, value);
     if (slot != NULL) {
         rv_emit_mem(frame->out, "fsw", reg, slot->offset, "s0");
@@ -6493,6 +8206,13 @@ static void rv_load_float_value(RVFrame *frame, IRValue *value, const char *freg
         fprintf(out, "  fcvt.s.w %s, t6\n", freg);
         return;
     }
+    RVRegTemp *temp = rv_find_reg_temp(frame, value);
+    if (temp != NULL) {
+        if (strcmp(freg, temp->reg) != 0) {
+            fprintf(out, "  fmv.s %s, %s\n", freg, temp->reg);
+        }
+        return;
+    }
     RVSlot *slot = rv_find_slot(frame, value);
     if (slot != NULL) {
         rv_emit_mem(out, "flw", freg, slot->offset, "s0");
@@ -6548,11 +8268,19 @@ static int rv_call_stack_slots(IRInstruction *inst) {
     return stack_slots;
 }
 
-static int rv_block_phi_count(IRBasicBlock *block) {
+static bool rv_phi_needs_scratch(RVFrame *frame, IRInstruction *phi) {
+    return phi == NULL || phi->kind != IR_INST_PHI
+        || rv_value_is_float(&phi->result)
+        || rv_value_reg_home(frame, &phi->result) == NULL;
+}
+
+static int rv_block_phi_count(RVFrame *frame, IRBasicBlock *block) {
     int count = 0;
     for (IRInstruction *inst = block != NULL ? block->first_inst : NULL;
          inst != NULL && inst->kind == IR_INST_PHI; inst = inst->next) {
-        ++count;
+        if (rv_phi_needs_scratch(frame, inst)) {
+            ++count;
+        }
     }
     return count;
 }
@@ -6567,7 +8295,7 @@ static void rv_prepare_frame(RVFrame *frame, IRFunction *function) {
     }
     for (int bi = 0; bi < function->blocks.count; ++bi) {
         IRBasicBlock *block = function->blocks.items[bi];
-        int phi_count = rv_block_phi_count(block);
+        int phi_count = rv_block_phi_count(frame, block);
         if (phi_count > frame->phi_scratch_slots) {
             frame->phi_scratch_slots = phi_count;
         }
@@ -6589,6 +8317,11 @@ static void rv_prepare_frame(RVFrame *frame, IRFunction *function) {
     }
     if (frame->phi_scratch_slots > 0) {
         frame->phi_scratch_offset = rv_alloc_frame_bytes(frame, frame->phi_scratch_slots * 8);
+    }
+    for (int i = 0; i < 6; ++i) {
+        if (frame->used_saved_regs[i]) {
+            frame->saved_reg_offsets[i] = rv_alloc_frame_bytes(frame, 8);
+        }
     }
     frame->frame_size = align_to(-frame->next_offset + frame->max_outgoing_args, 16);
 }
@@ -6733,22 +8466,38 @@ static void rv_emit_int_binary_to_reg(RVFrame *frame, IRInstruction *inst, const
         }
     }
     if (inst->kind == IR_INST_SDIV && rv_const_i32_value(inst->data.binary_inst.rhs, &rhs_const)) {
-        int shift = rv_pow2_shift(rhs_const);
+        int abs_rhs_const = rhs_const == INT_MIN ? 0 : (rhs_const < 0 ? -rhs_const : rhs_const);
+        int shift = rv_pow2_shift(abs_rhs_const);
         if (shift >= 0) {
             rv_load_int_value(frame, inst->data.binary_inst.lhs, "t0");
             if (shift == 0) {
-                fprintf(out, "  mv %s, t0\n", dst);
+                if (rhs_const > 0) {
+                    fprintf(out, "  mv %s, t0\n", dst);
+                } else {
+                    fprintf(out, "  negw %s, t0\n", dst);
+                }
                 return;
             }
             fprintf(out, "  sraiw t1, t0, 31\n");
-            rv_emit_and_i32_const(out, "t1", "t1", rhs_const - 1);
+            rv_emit_and_i32_const(out, "t1", "t1", abs_rhs_const - 1);
             fprintf(out, "  addw t0, t0, t1\n");
-            fprintf(out, "  sraiw %s, t0, %d\n", dst, shift);
+            fprintf(out, "  sraiw t0, t0, %d\n", shift);
+            if (rhs_const > 0) {
+                fprintf(out, "  mv %s, t0\n", dst);
+            } else {
+                fprintf(out, "  negw %s, t0\n", dst);
+            }
+            return;
+        }
+        if (rv_compute_signed_div_magic(rhs_const, &(RVSignedDivMagic){0})) {
+            rv_load_int_value(frame, inst->data.binary_inst.lhs, "t0");
+            rv_emit_signed_div_magic_quotient(out, dst, "t0", rhs_const);
             return;
         }
     }
     if (inst->kind == IR_INST_SREM && rv_const_i32_value(inst->data.binary_inst.rhs, &rhs_const)) {
-        int shift = rv_pow2_shift(rhs_const);
+        int abs_rhs_const = rhs_const == INT_MIN ? 0 : (rhs_const < 0 ? -rhs_const : rhs_const);
+        int shift = rv_pow2_shift(abs_rhs_const);
         if (shift >= 0) {
             rv_load_int_value(frame, inst->data.binary_inst.lhs, "t0");
             if (shift == 0) {
@@ -6756,10 +8505,18 @@ static void rv_emit_int_binary_to_reg(RVFrame *frame, IRInstruction *inst, const
                 return;
             }
             fprintf(out, "  sraiw t1, t0, 31\n");
-            rv_emit_and_i32_const(out, "t1", "t1", rhs_const - 1);
+            rv_emit_and_i32_const(out, "t1", "t1", abs_rhs_const - 1);
             fprintf(out, "  addw %s, t0, t1\n", dst);
-            rv_emit_and_i32_const(out, dst, dst, rhs_const - 1);
+            rv_emit_and_i32_const(out, dst, dst, abs_rhs_const - 1);
             fprintf(out, "  subw %s, %s, t1\n", dst, dst);
+            return;
+        }
+        if (rv_compute_signed_div_magic(rhs_const, &(RVSignedDivMagic){0})) {
+            rv_load_int_value(frame, inst->data.binary_inst.lhs, "t0");
+            rv_emit_signed_div_magic_quotient(out, "t2", "t0", rhs_const);
+            fprintf(out, "  li t1, %d\n", rhs_const);
+            fprintf(out, "  mul t1, t2, t1\n");
+            fprintf(out, "  subw %s, t0, t1\n", dst);
             return;
         }
     }
@@ -6964,17 +8721,87 @@ static bool rv_block_has_phi(IRBasicBlock *block) {
     return block != NULL && block->first_inst != NULL && block->first_inst->kind == IR_INST_PHI;
 }
 
-static void rv_emit_phi_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *to) {
-    int index = 0;
-    for (IRInstruction *phi = to->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next, ++index) {
-        IRValue *incoming = NULL;
-        for (int i = 0; i < phi->data.phi_inst.count; ++i) {
-            if (phi->data.phi_inst.blocks[i] == from) {
-                incoming = phi->data.phi_inst.values.items[i];
+static void rv_emit_phi_reg_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *to) {
+    const char *dst_regs[16] = {0};
+    const char *src_regs[16] = {0};
+    IRValue *incoming_values[16] = {0};
+    bool done[16] = {0};
+    int count = 0;
+    for (IRInstruction *phi = to->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (rv_phi_needs_scratch(frame, phi)) {
+            continue;
+        }
+        IRValue *incoming = opt_phi_incoming_value(phi, from);
+        const char *dst_reg = rv_value_reg_home(frame, &phi->result);
+        if (incoming == NULL || dst_reg == NULL || count >= 16) {
+            continue;
+        }
+        dst_regs[count] = dst_reg;
+        src_regs[count] = rv_value_reg_home(frame, incoming);
+        incoming_values[count] = incoming;
+        ++count;
+    }
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (int i = 0; i < count; ++i) {
+            if (done[i] || src_regs[i] == NULL) {
+                continue;
+            }
+            if (strcmp(dst_regs[i], src_regs[i]) == 0) {
+                done[i] = true;
+                progress = true;
+                continue;
+            }
+            bool dst_used_as_src = false;
+            for (int j = 0; j < count; ++j) {
+                if (i == j || done[j] || src_regs[j] == NULL) {
+                    continue;
+                }
+                if (strcmp(src_regs[j], dst_regs[i]) == 0) {
+                    dst_used_as_src = true;
+                    break;
+                }
+            }
+            if (!dst_used_as_src) {
+                fprintf(frame->out, "  mv %s, %s\n", dst_regs[i], src_regs[i]);
+                done[i] = true;
+                progress = true;
+            }
+        }
+        if (!progress) {
+            for (int i = 0; i < count; ++i) {
+                if (done[i] || src_regs[i] == NULL || strcmp(dst_regs[i], src_regs[i]) == 0) {
+                    continue;
+                }
+                fprintf(frame->out, "  mv t6, %s\n", dst_regs[i]);
+                for (int j = 0; j < count; ++j) {
+                    if (!done[j] && src_regs[j] != NULL && strcmp(src_regs[j], dst_regs[i]) == 0) {
+                        src_regs[j] = "t6";
+                    }
+                }
+                progress = true;
                 break;
             }
         }
-        int scratch_offset = frame->phi_scratch_offset + index * 8;
+    }
+    for (int i = 0; i < count; ++i) {
+        if (!done[i]) {
+            rv_load_int_value(frame, incoming_values[i], dst_regs[i]);
+            done[i] = true;
+        }
+    }
+}
+
+static void rv_emit_phi_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *to) {
+    rv_emit_phi_reg_moves(frame, from, to);
+    int scratch_index = 0;
+    for (IRInstruction *phi = to->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (!rv_phi_needs_scratch(frame, phi)) {
+            continue;
+        }
+        IRValue *incoming = opt_phi_incoming_value(phi, from);
+        int scratch_offset = frame->phi_scratch_offset + scratch_index * 8;
         if (rv_value_is_float(&phi->result)) {
             rv_load_float_value(frame, incoming, "ft0");
             rv_emit_mem(frame->out, "fsw", "ft0", scratch_offset, "s0");
@@ -6982,10 +8809,14 @@ static void rv_emit_phi_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *
             rv_load_int_value(frame, incoming, "t6");
             rv_emit_mem(frame->out, rv_value_is_pointer(&phi->result) ? "sd" : "sw", "t6", scratch_offset, "s0");
         }
+        ++scratch_index;
     }
-    index = 0;
-    for (IRInstruction *phi = to->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next, ++index) {
-        int scratch_offset = frame->phi_scratch_offset + index * 8;
+    scratch_index = 0;
+    for (IRInstruction *phi = to->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (!rv_phi_needs_scratch(frame, phi)) {
+            continue;
+        }
+        int scratch_offset = frame->phi_scratch_offset + scratch_index * 8;
         if (rv_value_is_float(&phi->result)) {
             rv_emit_mem(frame->out, "flw", "ft0", scratch_offset, "s0");
             rv_store_float_slot(frame, &phi->result, "ft0");
@@ -6993,6 +8824,7 @@ static void rv_emit_phi_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *
             rv_emit_mem(frame->out, rv_value_is_pointer(&phi->result) ? "ld" : "lw", "t6", scratch_offset, "s0");
             rv_store_int_slot(frame, &phi->result, "t6");
         }
+        ++scratch_index;
     }
 }
 
@@ -7377,6 +9209,11 @@ static void rv_emit_function(IRFunction *function, FILE *out) {
     rv_emit_mem(out, "sd", "ra", frame.frame_size - 8, "sp");
     rv_emit_mem(out, "sd", "s0", frame.frame_size - 16, "sp");
     rv_emit_addi(out, "s0", "sp", frame.frame_size);
+    for (int i = 0; i < 6; ++i) {
+        if (frame.used_saved_regs[i]) {
+            rv_emit_mem(out, "sd", g_rv_loop_regs[i], frame.saved_reg_offsets[i], "s0");
+        }
+    }
     rv_store_incoming_params(&frame);
     for (int bi = 0; bi < function->blocks.count; ++bi) {
         IRBasicBlock *block = function->blocks.items[bi];
@@ -7393,6 +9230,11 @@ static void rv_emit_function(IRFunction *function, FILE *out) {
         }
     }
     fprintf(out, ".L_%s_return:\n", rv_symbol_name(function->name));
+    for (int i = 0; i < 6; ++i) {
+        if (frame.used_saved_regs[i]) {
+            rv_emit_mem(out, "ld", g_rv_loop_regs[i], frame.saved_reg_offsets[i], "s0");
+        }
+    }
     rv_emit_mem(out, "ld", "ra", frame.frame_size - 8, "sp");
     rv_emit_mem(out, "ld", "s0", frame.frame_size - 16, "sp");
     rv_emit_addi(out, "sp", "sp", frame.frame_size);
