@@ -517,6 +517,8 @@ struct IRFunction {
     IRBasicBlockList blocks;
     IRBasicBlock *entry;
     bool is_external;
+    int special_mod_multiply_mod;
+    int special_digit_extract_base;
     IRFunction *next;
 };
 
