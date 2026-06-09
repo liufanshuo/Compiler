@@ -4392,16 +4392,6 @@ static void mem_gen_decl(MemIRGen *gen, Decl *decl, bool is_global) {
     }
 }
 
-static bool ast_lval_is_name(Expr *expr, const char *name) {
-    return expr != NULL && expr->kind == EXPR_LVAL && expr->data.lval != NULL
-        && expr->data.lval->indices.count == 0
-        && strcmp(expr->data.lval->name, name) == 0;
-}
-
-static bool ast_number_is(Expr *expr, int value) {
-    return expr != NULL && expr->kind == EXPR_NUMBER && expr->data.number == value;
-}
-
 static bool ast_const_int_value(Expr *expr, int *value) {
     if (expr == NULL) {
         return false;
@@ -4417,220 +4407,12 @@ static bool ast_const_int_value(Expr *expr, int *value) {
     return false;
 }
 
-static bool ast_binary_lval_const(Expr *expr, BinaryOp op, const char *name, int value) {
-    return expr != NULL && expr->kind == EXPR_BINARY && expr->data.binary.op == op
-        && ast_lval_is_name(expr->data.binary.lhs, name)
-        && ast_number_is(expr->data.binary.rhs, value);
-}
-
-static bool ast_stmt_assigns_lval(Stmt *stmt, const char **name, Expr **expr) {
-    if (stmt == NULL || stmt->kind != STMT_ASSIGN || stmt->data.assign_stmt.lval == NULL
-            || stmt->data.assign_stmt.lval->indices.count != 0) {
-        return false;
-    }
-    *name = stmt->data.assign_stmt.lval->name;
-    *expr = stmt->data.assign_stmt.expr;
-    return true;
-}
-
-static Stmt *ast_unwrap_single_stmt_block(Stmt *stmt) {
-    if (stmt != NULL && stmt->kind == STMT_BLOCK && stmt->data.block_stmt != NULL
-            && stmt->data.block_stmt->items.count == 1
-            && stmt->data.block_stmt->items.kinds[0] == BLOCK_ITEM_STMT) {
-        return (Stmt *)stmt->data.block_stmt->items.items[0];
-    }
-    return stmt;
-}
-
-static bool ast_expr_is_lval_div2(Expr *expr, const char *name) {
-    return ast_binary_lval_const(expr, BIN_DIV, name, 2);
-}
-
-static bool ast_expr_is_lval_mod2_eq1(Expr *expr, const char *name) {
-    return expr != NULL && expr->kind == EXPR_BINARY && expr->data.binary.op == BIN_EQ
-        && ast_binary_lval_const(expr->data.binary.lhs, BIN_MOD, name, 2)
-        && ast_number_is(expr->data.binary.rhs, 1);
-}
-
-static bool ast_expr_is_mod_sum(Expr *expr, const char *lhs_name, const char *rhs_name, int mod_value) {
-    int rhs_value = 0;
-    if (expr == NULL || expr->kind != EXPR_BINARY || expr->data.binary.op != BIN_MOD
-            || !ast_const_int_value(expr->data.binary.rhs, &rhs_value)
-            || rhs_value != mod_value) {
-        return false;
-    }
-    Expr *sum = expr->data.binary.lhs;
-    return sum != NULL && sum->kind == EXPR_BINARY && sum->data.binary.op == BIN_ADD
-        && ast_lval_is_name(sum->data.binary.lhs, lhs_name)
-        && ast_lval_is_name(sum->data.binary.rhs, rhs_name);
-}
-
-static int ast_match_mod_multiply_func(FuncDef *func) {
-    if (func == NULL || func->ret_type != TYPE_INT || func->params.count != 2
-            || func->block == NULL || func->block->items.count != 5) {
-        return 0;
-    }
-    Param *param0 = func->params.items[0];
-    Param *param1 = func->params.items[1];
-    if (param0->type != TYPE_INT || param1->type != TYPE_INT
-            || param0->is_array || param1->is_array) {
-        return 0;
-    }
-    BlockItemList *items = &func->block->items;
-    if (items->kinds[0] != BLOCK_ITEM_STMT || items->kinds[1] != BLOCK_ITEM_STMT
-            || items->kinds[2] != BLOCK_ITEM_DECL || items->kinds[3] != BLOCK_ITEM_STMT
-            || items->kinds[4] != BLOCK_ITEM_STMT) {
-        return 0;
-    }
-    Stmt *if_zero = (Stmt *)items->items[0];
-    Stmt *if_one = (Stmt *)items->items[1];
-    Decl *cur_decl = (Decl *)items->items[2];
-    Stmt *cur_assign = (Stmt *)items->items[3];
-    Stmt *if_odd = (Stmt *)items->items[4];
-    if (if_zero->kind != STMT_IF || if_one->kind != STMT_IF || if_odd->kind != STMT_IF
-            || !ast_binary_lval_const(if_zero->data.if_stmt.cond, BIN_EQ, param1->name, 0)
-            || !ast_binary_lval_const(if_one->data.if_stmt.cond, BIN_EQ, param1->name, 1)
-            || !ast_expr_is_lval_mod2_eq1(if_odd->data.if_stmt.cond, param1->name)) {
-        return 0;
-    }
-    Stmt *ret_zero = ast_unwrap_single_stmt_block(if_zero->data.if_stmt.then_stmt);
-    if (ret_zero == NULL || ret_zero->kind != STMT_RETURN
-            || !ast_number_is(ret_zero->data.return_expr, 0)) {
-        return 0;
-    }
-    Stmt *ret_one = ast_unwrap_single_stmt_block(if_one->data.if_stmt.then_stmt);
-    if (ret_one == NULL || ret_one->kind != STMT_RETURN) {
-        return 0;
-    }
-    int mod_value = 0;
-    if (ret_one->data.return_expr == NULL || ret_one->data.return_expr->kind != EXPR_BINARY
-            || ret_one->data.return_expr->data.binary.op != BIN_MOD
-            || !ast_lval_is_name(ret_one->data.return_expr->data.binary.lhs, param0->name)
-            || !ast_const_int_value(ret_one->data.return_expr->data.binary.rhs, &mod_value)
-            || mod_value <= 1) {
-        return 0;
-    }
-    if (cur_decl->items.count != 1) {
-        return 0;
-    }
-    DeclItem *cur_item = cur_decl->items.items[0];
-    const char *cur_name = cur_item->name;
-    if (cur_item->init == NULL || !cur_item->init->is_expr
-            || cur_item->init->expr == NULL || cur_item->init->expr->kind != EXPR_CALL
-            || strcmp(cur_item->init->expr->data.call.name, func->name) != 0
-            || cur_item->init->expr->data.call.args.count != 2
-            || !ast_lval_is_name(cur_item->init->expr->data.call.args.items[0], param0->name)
-            || !ast_expr_is_lval_div2(cur_item->init->expr->data.call.args.items[1], param1->name)) {
-        return 0;
-    }
-    const char *assigned = NULL;
-    Expr *assigned_expr = NULL;
-    if (!ast_stmt_assigns_lval(cur_assign, &assigned, &assigned_expr)
-            || strcmp(assigned, cur_name) != 0
-            || !ast_expr_is_mod_sum(assigned_expr, cur_name, cur_name, mod_value)) {
-        return 0;
-    }
-    Stmt *ret_odd = ast_unwrap_single_stmt_block(if_odd->data.if_stmt.then_stmt);
-    Stmt *ret_even = ast_unwrap_single_stmt_block(if_odd->data.if_stmt.else_stmt);
-    if (ret_odd == NULL || ret_odd->kind != STMT_RETURN
-            || ret_even == NULL || ret_even->kind != STMT_RETURN
-            || !ast_expr_is_mod_sum(ret_odd->data.return_expr, cur_name, param0->name, mod_value)
-            || !ast_lval_is_name(ret_even->data.return_expr, cur_name)) {
-        return 0;
-    }
-    return mod_value;
-}
-
-static bool ast_match_digit_extract_func(FuncDef *func, int *base_value) {
-    if (func == NULL || func->ret_type != TYPE_INT || func->params.count != 2
-            || func->block == NULL || func->block->items.count < 3) {
-        return false;
-    }
-    Param *num_param = func->params.items[0];
-    Param *pos_param = func->params.items[1];
-    if (num_param->type != TYPE_INT || pos_param->type != TYPE_INT
-            || num_param->is_array || pos_param->is_array) {
-        return false;
-    }
-    Stmt *while_stmt = NULL;
-    Stmt *return_stmt = NULL;
-    const char *index_name = NULL;
-    for (int i = 0; i < func->block->items.count; ++i) {
-        if (func->block->items.kinds[i] == BLOCK_ITEM_DECL) {
-            Decl *decl = (Decl *)func->block->items.items[i];
-            if (decl->type != TYPE_INT || decl->items.count != 1) {
-                continue;
-            }
-            DeclItem *item = decl->items.items[0];
-            if (item->dims.count == 0 && item->init != NULL && item->init->is_expr
-                    && ast_number_is(item->init->expr, 0)) {
-                index_name = item->name;
-            }
-        } else if (func->block->items.kinds[i] == BLOCK_ITEM_STMT) {
-            Stmt *stmt = (Stmt *)func->block->items.items[i];
-            if (stmt->kind == STMT_WHILE && while_stmt == NULL) {
-                while_stmt = stmt;
-            } else if (stmt->kind == STMT_RETURN && return_stmt == NULL) {
-                return_stmt = stmt;
-            }
-        }
-    }
-    if (index_name == NULL || while_stmt == NULL || return_stmt == NULL
-            || while_stmt->data.while_stmt.cond == NULL
-            || while_stmt->data.while_stmt.cond->kind != EXPR_BINARY
-            || while_stmt->data.while_stmt.cond->data.binary.op != BIN_LT
-            || !ast_lval_is_name(while_stmt->data.while_stmt.cond->data.binary.lhs, index_name)
-            || !ast_lval_is_name(while_stmt->data.while_stmt.cond->data.binary.rhs, pos_param->name)
-            || while_stmt->data.while_stmt.body == NULL
-            || while_stmt->data.while_stmt.body->kind != STMT_BLOCK) {
-        return false;
-    }
-    BlockItemList *body = &while_stmt->data.while_stmt.body->data.block_stmt->items;
-    if (body->count != 2 || body->kinds[0] != BLOCK_ITEM_STMT || body->kinds[1] != BLOCK_ITEM_STMT) {
-        return false;
-    }
-    const char *assigned = NULL;
-    Expr *expr = NULL;
-    int div_base = 0;
-    if (!ast_stmt_assigns_lval((Stmt *)body->items[0], &assigned, &expr)
-            || strcmp(assigned, num_param->name) != 0
-            || expr == NULL || expr->kind != EXPR_BINARY || expr->data.binary.op != BIN_DIV
-            || !ast_lval_is_name(expr->data.binary.lhs, num_param->name)
-            || !ast_const_int_value(expr->data.binary.rhs, &div_base)
-            || div_base <= 1) {
-        return false;
-    }
-    if (!ast_stmt_assigns_lval((Stmt *)body->items[1], &assigned, &expr)
-            || strcmp(assigned, index_name) != 0
-            || !ast_binary_lval_const(expr, BIN_ADD, index_name, 1)) {
-        return false;
-    }
-    if (return_stmt->data.return_expr == NULL
-            || return_stmt->data.return_expr->kind != EXPR_BINARY
-            || return_stmt->data.return_expr->data.binary.op != BIN_MOD
-            || !ast_lval_is_name(return_stmt->data.return_expr->data.binary.lhs, num_param->name)) {
-        return false;
-    }
-    int mod_base = 0;
-    if (!ast_const_int_value(return_stmt->data.return_expr->data.binary.rhs, &mod_base)
-            || mod_base != div_base) {
-        return false;
-    }
-    *base_value = div_base;
-    return true;
-}
-
 static void mem_gen_function(MemIRGen *gen, FuncDef *func) {
     MemFunctionMeta *meta = mem_lookup_function(gen, func->name);
     if (meta == NULL) {
         return;
     }
     gen->current_function = meta->function;
-    gen->current_function->special_mod_multiply_mod = ast_match_mod_multiply_func(func);
-    int digit_base = 0;
-    if (ast_match_digit_extract_func(func, &digit_base)) {
-        gen->current_function->special_digit_extract_base = digit_base;
-    }
     gen->current_ret_type = func->ret_type;
     gen->current_block = mem_create_block(gen, "entry");
     mem_push_scope(gen);
@@ -6754,11 +6536,6 @@ static IRValue *opt_base_object_value(IRValue *value) {
     return NULL;
 }
 
-static IRValue *opt_global_base_value(IRValue *value) {
-    IRValue *base = opt_base_object_value(value);
-    return base != NULL && base->kind == IR_VALUE_GLOBAL ? base : NULL;
-}
-
 static int opt_param_index_for_value(IRFunction *function, IRValue *value) {
     if (function == NULL || value == NULL || value->kind != IR_VALUE_PARAM) {
         return -1;
@@ -7878,157 +7655,6 @@ static bool opt_try_unroll_small_loop(IRFunction *function, bool *in_loop,
     return true;
 }
 
-static bool opt_try_partial_unroll_loop(IRFunction *function, bool *in_loop,
-                                        IRBasicBlock *header, IRBasicBlock *preheader,
-                                        IRBasicBlock *latch) {
-    if (opt_loop_block_count(function, in_loop) != 2 || latch == NULL || latch == header) {
-        return false;
-    }
-    if (header->last_inst == NULL || header->last_inst->kind != IR_INST_BR
-            || !header->last_inst->data.br_inst.is_conditional) {
-        return false;
-    }
-    if (latch->last_inst == NULL || latch->last_inst->kind != IR_INST_BR
-            || latch->last_inst->data.br_inst.is_conditional
-            || latch->last_inst->data.br_inst.true_block != header) {
-        return false;
-    }
-    IRBasicBlock *body = NULL;
-    if (header->last_inst->data.br_inst.true_block == latch
-            && header->last_inst->data.br_inst.false_block != NULL
-            && header->last_inst->data.br_inst.false_block != latch) {
-        body = latch;
-    } else if (header->last_inst->data.br_inst.false_block == latch
-            && header->last_inst->data.br_inst.true_block != NULL
-            && header->last_inst->data.br_inst.true_block != latch) {
-        body = latch;
-    }
-    if (body == NULL) {
-        return false;
-    }
-    int body_inst_count = opt_block_non_phi_non_term_inst_count(body);
-    if (body_inst_count <= 0 || body_inst_count > 24) {
-        return false;
-    }
-    IRValue *cond = header->last_inst->data.br_inst.condition;
-    if (cond == NULL || cond->kind != IR_VALUE_INSTRUCTION) {
-        return false;
-    }
-    IRInstruction *cmp = cond->data.instruction;
-    if (cmp == NULL || cmp->parent != header || cmp->kind != IR_INST_ICMP) {
-        return false;
-    }
-    OptLoopInductionVar iv = {0};
-    bool matched_iv = false;
-    bool normalized = false;
-    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
-        OptLoopInductionVar candidate = {0};
-        bool phi_normalized = false;
-        if (!opt_match_loop_induction_var(function, in_loop, header, preheader, latch, phi,
-                                          &candidate, &phi_normalized)) {
-            normalized = phi_normalized || normalized;
-            continue;
-        }
-        normalized = phi_normalized || normalized;
-        if (cmp->data.icmp_inst.lhs == &phi->result || cmp->data.icmp_inst.rhs == &phi->result) {
-            iv = candidate;
-            matched_iv = true;
-            break;
-        }
-    }
-    if (!matched_iv) {
-        return normalized;
-    }
-    if (cmp->data.icmp_inst.rhs == &iv.phi->result) {
-        cmp->data.icmp_inst.pred = opt_swap_icmp_pred(cmp->data.icmp_inst.pred);
-        IRValue *tmp = cmp->data.icmp_inst.lhs;
-        cmp->data.icmp_inst.lhs = cmp->data.icmp_inst.rhs;
-        cmp->data.icmp_inst.rhs = tmp;
-        normalized = true;
-    }
-    if (cmp->data.icmp_inst.lhs != &iv.phi->result) {
-        return normalized;
-    }
-    int start = 0;
-    int bound = 0;
-    int trip_count = 0;
-    if (!opt_const_int_value(iv.start_value, &start)
-            || !opt_const_int_value(cmp->data.icmp_inst.rhs, &bound)
-            || !opt_compute_small_trip_count(cmp->data.icmp_inst.pred, start, bound, iv.step, 512, &trip_count)
-            || trip_count < 16) {
-        return normalized;
-    }
-    int unroll_factor = 0;
-    if (trip_count % 8 == 0 && body_inst_count <= 10 && body_inst_count * 8 <= 80) {
-        unroll_factor = 8;
-    } else if (trip_count % 4 == 0 && body_inst_count <= 12 && body_inst_count * 4 <= 64) {
-        unroll_factor = 4;
-    } else {
-        return normalized;
-    }
-    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
-        if (phi->data.phi_inst.count != 2
-                || opt_phi_incoming_value(phi, preheader) == NULL
-                || opt_phi_incoming_value(phi, latch) == NULL) {
-            return normalized;
-        }
-    }
-    IRInstruction *insert_before = opt_preheader_insert_point(latch);
-    if (insert_before == NULL) {
-        return normalized;
-    }
-    IRInstruction **body_insts = NULL;
-    int body_count = 0;
-    int body_capacity = 0;
-    for (IRInstruction *inst = body->first_inst; inst != NULL; inst = inst->next) {
-        if (inst->kind == IR_INST_BR) {
-            continue;
-        }
-        ensure_capacity((void **)&body_insts, &body_capacity, sizeof(IRInstruction *), body_count + 1);
-        body_insts[body_count++] = inst;
-    }
-    OptValueMap state = {0};
-    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
-        opt_value_map_push(&state, &phi->result, opt_phi_incoming_value(phi, latch));
-    }
-    for (int iter = 1; iter < unroll_factor; ++iter) {
-        OptValueMap iter_map = {0};
-        for (int i = 0; i < state.count; ++i) {
-            opt_value_map_push(&iter_map, state.from[i], state.to[i]);
-        }
-        for (int inst_index = 0; inst_index < body_count; ++inst_index) {
-            IRInstruction *inst = body_insts[inst_index];
-            IRInstruction *clone = opt_clone_inst_with_map(latch, insert_before, inst, &iter_map);
-            if (clone == NULL) {
-                opt_value_map_reset(&iter_map);
-                opt_value_map_reset(&state);
-                free(body_insts);
-                return normalized;
-            }
-            if (clone->result_type != NULL && clone->result_type->kind != IR_TYPE_VOID) {
-                opt_value_map_push(&iter_map, &inst->result, &clone->result);
-            }
-        }
-        OptValueMap next_state = {0};
-        for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
-            IRValue *next_value = opt_value_map_get(&iter_map, opt_phi_incoming_value(phi, latch));
-            opt_value_map_push(&next_state, &phi->result, next_value);
-        }
-        opt_value_map_reset(&iter_map);
-        opt_value_map_reset(&state);
-        state = next_state;
-    }
-    for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
-        int latch_index = opt_phi_incoming_index(phi, latch);
-        if (latch_index >= 0) {
-            phi->data.phi_inst.values.items[latch_index] = opt_value_map_get(&state, &phi->result);
-        }
-    }
-    opt_value_map_reset(&state);
-    free(body_insts);
-    return true;
-}
-
 static bool opt_loop_licm(IRFunction *function, bool *in_loop, IRBasicBlock *preheader) {
     bool changed = false;
     IRInstruction *insert_before = opt_preheader_insert_point(preheader);
@@ -8111,6 +7737,7 @@ static bool opt_loop_pass(IRFunction *function) {
                 if (unique_latch != NULL) {
                     changed = opt_try_unroll_small_loop(function, in_loop, header, preheader, unique_latch) || changed;
                     changed = opt_loop_strength_reduction(function, in_loop, header, preheader, unique_latch) || changed;
+                    changed = opt_loop_pointer_induction(function, in_loop, header, preheader, unique_latch) || changed;
                 }
                 changed = opt_loop_cse(function, dom, in_loop) || changed;
                 changed = opt_loop_licm(function, in_loop, preheader) || changed;
@@ -8693,15 +8320,6 @@ typedef struct {
 
 static const char *g_rv_loop_regs[] = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
 #define RV_LOOP_REG_COUNT ((int)(sizeof(g_rv_loop_regs) / sizeof(g_rv_loop_regs[0])))
-static const char *g_rv_nocall_extra_regs[] = {"a4", "a5", "a6", "a7"};
-#define RV_NOCALL_EXTRA_REG_COUNT ((int)(sizeof(g_rv_nocall_extra_regs) / sizeof(g_rv_nocall_extra_regs[0])))
-
-enum {
-    RV_MEMO_SLOT_COUNT = 1 << 16,
-    RV_MEMO_SLOT_MASK = RV_MEMO_SLOT_COUNT - 1,
-    RV_MEMO_FNV_OFFSET = 2166136261u,
-    RV_MEMO_FNV_PRIME = 16777619u
-};
 
 static const char *rv_symbol_name(const char *name) {
     if (name == NULL) {
@@ -8763,46 +8381,6 @@ static bool rv_function_has_non_tail_self_call(IRFunction *function) {
         }
     }
     return false;
-}
-
-static bool rv_function_eligible_for_recursive_memo(IRFunction *function) {
-    if (function == NULL || function->is_external || function->sysy_ret_type != TYPE_INT
-            || function->params.count < 1 || function->params.count > 4) {
-        return false;
-    }
-    if (function->special_mod_multiply_mod > 1) {
-        return false;
-    }
-    if (rv_function_all_self_calls_are_tail(function)) {
-        return false;
-    }
-    for (int i = 0; i < function->params.count; ++i) {
-        IRParameter *param = function->params.items[i];
-        if (param->is_array || param->sysy_type != TYPE_INT || param->type == NULL
-                || param->type->kind != IR_TYPE_I32) {
-            return false;
-        }
-    }
-    bool has_self_call = false;
-    for (int bi = 0; bi < function->blocks.count; ++bi) {
-        IRBasicBlock *block = function->blocks.items[bi];
-        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
-            if (inst->kind == IR_INST_STORE) {
-                return false;
-            }
-            if (inst->kind == IR_INST_CALL) {
-                if (inst->data.call_inst.callee != function) {
-                    return false;
-                }
-                has_self_call = true;
-            }
-        }
-    }
-    return has_self_call;
-}
-
-static char *rv_memo_label(IRFunction *function, const char *suffix) {
-    return str_printf("__rv_memo_%s_%s", rv_symbol_name(function->name), suffix);
 }
 
 static bool rv_function_all_self_calls_are_tail(IRFunction *function) {
@@ -10151,31 +9729,6 @@ static void rv_emit_globals(IRModule *module, FILE *out) {
     }
 }
 
-static void rv_emit_memo_globals(IRModule *module, FILE *out) {
-    bool emitted_bss = false;
-    for (int i = 0; i < module->functions.count; ++i) {
-        IRFunction *function = module->functions.items[i];
-        if (!rv_function_eligible_for_recursive_memo(function)) {
-            continue;
-        }
-        if (!emitted_bss) {
-            fputs("  .bss\n", out);
-            emitted_bss = true;
-        }
-        char *keys = rv_memo_label(function, "keys");
-        char *values = rv_memo_label(function, "values");
-        char *stamps = rv_memo_label(function, "stamps");
-        char *generation = rv_memo_label(function, "generation");
-        char *depth = rv_memo_label(function, "depth");
-        fprintf(out, "  .align 3\n%s:\n  .zero %d\n",
-                keys, RV_MEMO_SLOT_COUNT * function->params.count * 4);
-        fprintf(out, "  .align 3\n%s:\n  .zero %d\n", values, RV_MEMO_SLOT_COUNT * 4);
-        fprintf(out, "  .align 3\n%s:\n  .zero %d\n", stamps, RV_MEMO_SLOT_COUNT * 4);
-        fprintf(out, "  .align 3\n%s:\n  .zero 4\n", generation);
-        fprintf(out, "  .align 3\n%s:\n  .zero 4\n", depth);
-    }
-}
-
 static bool rv_memory_inst_uses_ptr(IRInstruction *inst, IRValue *ptr) {
     if (inst == NULL || ptr == NULL) {
         return false;
@@ -10231,26 +9784,6 @@ static bool rv_gep_is_folded_into_memory(RVFrame *frame, IRInstruction *gep) {
     return user != NULL && rv_can_fold_gep_into_user(frame, gep, user);
 }
 
-static IRInstruction *rv_unique_user_of_value(IRFunction *function, IRValue *value) {
-    IRInstruction *user = NULL;
-    int total_uses = 0;
-    for (int bi = 0; bi < function->blocks.count; ++bi) {
-        IRBasicBlock *block = function->blocks.items[bi];
-        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
-            int uses = rv_count_instruction_uses(inst, value);
-            if (uses == 0) {
-                continue;
-            }
-            total_uses += uses;
-            user = inst;
-            if (total_uses > 1) {
-                return NULL;
-            }
-        }
-    }
-    return total_uses == 1 ? user : NULL;
-}
-
 static bool rv_icmp_only_feeds_own_branch(IRFunction *function, IRInstruction *inst) {
     if (function == NULL || inst == NULL || inst->kind != IR_INST_ICMP
             || inst->result_type == NULL || inst->next == NULL
@@ -10281,13 +9814,6 @@ static const char *rv_emit_address_value_reg(RVFrame *frame, IRInstruction *user
     }
     rv_load_int_value(frame, ptr, scratch);
     return scratch;
-}
-
-static void rv_emit_address_value(RVFrame *frame, IRInstruction *user, IRValue *ptr, const char *reg) {
-    const char *actual = rv_emit_address_value_reg(frame, user, ptr, reg);
-    if (strcmp(actual, reg) != 0) {
-        fprintf(frame->out, "  mv %s, %s\n", reg, actual);
-    }
 }
 
 static void rv_emit_load_inst(RVFrame *frame, IRInstruction *inst) {
@@ -11196,96 +10722,8 @@ static void rv_emit_gep(RVFrame *frame, IRInstruction *inst) {
     rv_store_int_slot(frame, &inst->result, "t0");
 }
 
-static void rv_emit_div_i32_const_reg(FILE *out, const char *reg, int divisor) {
-    int shift = rv_pow2_shift(divisor);
-    if (shift > 0) {
-        fputs("  sraiw t3, t0, 31\n", out);
-        rv_emit_and_i32_const(out, "t3", "t3", divisor - 1);
-        fputs("  addw t0, t0, t3\n", out);
-        fprintf(out, "  sraiw %s, t0, %d\n", reg, shift);
-    } else if (shift == 0) {
-        if (strcmp(reg, "t0") != 0) {
-            fprintf(out, "  mv %s, t0\n", reg);
-        }
-    } else {
-        fprintf(out, "  li t3, %d\n", divisor);
-        fprintf(out, "  divw %s, t0, t3\n", reg);
-    }
-}
-
-static void rv_emit_rem_i32_const_reg(FILE *out, const char *dst, const char *src, int divisor) {
-    int shift = rv_pow2_shift(divisor);
-    if (shift > 0) {
-        fprintf(out, "  sraiw t3, %s, 31\n", src);
-        rv_emit_and_i32_const(out, "t3", "t3", divisor - 1);
-        fprintf(out, "  addw %s, %s, t3\n", dst, src);
-        rv_emit_and_i32_const(out, dst, dst, divisor - 1);
-        fprintf(out, "  subw %s, %s, t3\n", dst, dst);
-    } else if (shift == 0) {
-        fprintf(out, "  li %s, 0\n", dst);
-    } else {
-        fprintf(out, "  li t3, %d\n", divisor);
-        fprintf(out, "  remw %s, %s, t3\n", dst, src);
-    }
-}
-
 static void rv_emit_call(RVFrame *frame, IRInstruction *inst) {
     FILE *out = frame->out;
-    if (inst->data.call_inst.callee != NULL
-            && inst->data.call_inst.callee->special_digit_extract_base > 1
-            && inst->data.call_inst.args.count == 2) {
-        int base = inst->data.call_inst.callee->special_digit_extract_base;
-        char *loop_label = str_printf(".L_%s_digit_call_loop_%d",
-                                      rv_symbol_name(frame->function->name),
-                                      frame->phi_label_id++);
-        char *done_label = str_printf(".L_%s_digit_call_done_%d",
-                                      rv_symbol_name(frame->function->name),
-                                      frame->phi_label_id++);
-        rv_load_int_value(frame, inst->data.call_inst.args.items[0], "t0");
-        rv_load_int_value(frame, inst->data.call_inst.args.items[1], "t1");
-        fputs("  li t2, 0\n", out);
-        fprintf(out, "%s:\n", loop_label);
-        fprintf(out, "  bge t2, t1, %s\n", done_label);
-        rv_emit_div_i32_const_reg(out, "t0", base);
-        fputs("  addiw t2, t2, 1\n", out);
-        fprintf(out, "  j %s\n", loop_label);
-        fprintf(out, "%s:\n", done_label);
-        rv_emit_rem_i32_const_reg(out, "t2", "t0", base);
-        if (inst->result_type != NULL && inst->result_type->kind != IR_TYPE_VOID) {
-            rv_store_int_slot(frame, &inst->result, "t2");
-        }
-        return;
-    }
-    if (inst->data.call_inst.callee != NULL
-            && inst->data.call_inst.callee->special_mod_multiply_mod > 1
-            && inst->data.call_inst.args.count == 2) {
-        char *slow_label = str_printf(".L_%s_modmul_call_slow_%d",
-                                      rv_symbol_name(frame->function->name),
-                                      frame->phi_label_id++);
-        char *end_label = str_printf(".L_%s_modmul_call_end_%d",
-                                     rv_symbol_name(frame->function->name),
-                                     frame->phi_label_id++);
-        rv_load_int_value(frame, inst->data.call_inst.args.items[0], "t0");
-        rv_load_int_value(frame, inst->data.call_inst.args.items[1], "t1");
-        fputs("  or t2, t0, t1\n", out);
-        fprintf(out, "  bltz t2, %s\n", slow_label);
-        fputs("  mul t2, t0, t1\n", out);
-        fprintf(out, "  li t3, %d\n", inst->data.call_inst.callee->special_mod_multiply_mod);
-        fputs("  rem t2, t2, t3\n", out);
-        if (inst->result_type != NULL && inst->result_type->kind != IR_TYPE_VOID) {
-            rv_store_int_slot(frame, &inst->result, "t2");
-        }
-        fprintf(out, "  j %s\n", end_label);
-        fprintf(out, "%s:\n", slow_label);
-        fputs("  mv a0, t0\n", out);
-        fputs("  mv a1, t1\n", out);
-        fprintf(out, "  call %s\n", rv_symbol_name(inst->data.call_inst.callee->name));
-        if (inst->result_type != NULL && inst->result_type->kind != IR_TYPE_VOID) {
-            rv_store_int_slot(frame, &inst->result, "a0");
-        }
-        fprintf(out, "%s:\n", end_label);
-        return;
-    }
     int int_regs = 0;
     int float_regs = 0;
     int stack_slots = 0;
@@ -11604,137 +11042,12 @@ static void rv_store_incoming_params(RVFrame *frame) {
     }
 }
 
-static void rv_emit_memo_index_from_regs(FILE *out, IRFunction *function,
-                                         const char **arg_regs, const char *index_reg) {
-    fprintf(out, "  li %s, %u\n", index_reg, RV_MEMO_FNV_OFFSET);
-    for (int i = 0; i < function->params.count; ++i) {
-        fprintf(out, "  slli t4, %s, 32\n", arg_regs[i]);
-        fputs("  srli t4, t4, 32\n", out);
-        fprintf(out, "  xor %s, %s, t4\n", index_reg, index_reg);
-        fprintf(out, "  li t4, %u\n", RV_MEMO_FNV_PRIME);
-        fprintf(out, "  mul %s, %s, t4\n", index_reg, index_reg);
-    }
-    fprintf(out, "  li t4, %d\n", RV_MEMO_SLOT_MASK);
-    fprintf(out, "  and %s, %s, t4\n", index_reg, index_reg);
-}
-
-static void rv_emit_memo_entry_probe(IRFunction *function, FILE *out) {
-    char *keys = rv_memo_label(function, "keys");
-    char *values = rv_memo_label(function, "values");
-    char *stamps = rv_memo_label(function, "stamps");
-    char *generation = rv_memo_label(function, "generation");
-    char *depth = rv_memo_label(function, "depth");
-    char *recursive_label = str_printf(".L_%s_memo_recursive", rv_symbol_name(function->name));
-    char *miss_label = str_printf(".L_%s_memo_miss", rv_symbol_name(function->name));
-    fprintf(out, "  lla t0, %s\n", depth);
-    fputs("  lw t1, 0(t0)\n", out);
-    fprintf(out, "  bnez t1, %s\n", recursive_label);
-    fprintf(out, "  lla t2, %s\n", generation);
-    fputs("  lw t3, 0(t2)\n", out);
-    fputs("  addiw t3, t3, 1\n", out);
-    fputs("  sw t3, 0(t2)\n", out);
-    fprintf(out, "%s:\n", recursive_label);
-    fputs("  addiw t1, t1, 1\n", out);
-    fputs("  sw t1, 0(t0)\n", out);
-    const char *arg_regs[] = {"a0", "a1", "a2", "a3"};
-    rv_emit_memo_index_from_regs(out, function, arg_regs, "t3");
-    fprintf(out, "  lla t5, %s\n", generation);
-    fputs("  lw t6, 0(t5)\n", out);
-    fprintf(out, "  lla t0, %s\n", stamps);
-    fputs("  slli t4, t3, 2\n", out);
-    fputs("  add t0, t0, t4\n", out);
-    fputs("  lw t1, 0(t0)\n", out);
-    fprintf(out, "  bne t1, t6, %s\n", miss_label);
-    fprintf(out, "  lla t0, %s\n", keys);
-    fprintf(out, "  li t4, %d\n", function->params.count * 4);
-    fputs("  mul t4, t3, t4\n", out);
-    fputs("  add t0, t0, t4\n", out);
-    for (int i = 0; i < function->params.count; ++i) {
-        fprintf(out, "  lw t1, %d(t0)\n", i * 4);
-        fprintf(out, "  bne t1, %s, %s\n", arg_regs[i], miss_label);
-    }
-    fprintf(out, "  lla t0, %s\n", values);
-    fputs("  slli t4, t3, 2\n", out);
-    fputs("  add t0, t0, t4\n", out);
-    fputs("  lw a0, 0(t0)\n", out);
-    fprintf(out, "  lla t0, %s\n", depth);
-    fputs("  lw t1, 0(t0)\n", out);
-    fputs("  addiw t1, t1, -1\n", out);
-    fputs("  sw t1, 0(t0)\n", out);
-    fputs("  ret\n", out);
-    fprintf(out, "%s:\n", miss_label);
-}
-
-static void rv_emit_memo_return_update(RVFrame *frame) {
-    IRFunction *function = frame->function;
-    FILE *out = frame->out;
-    RVSlot *param_slots[4] = {0};
-    const char *param_regs[] = {"t0", "t1", "t2", "t5"};
-    for (int i = 0; i < function->params.count; ++i) {
-        param_slots[i] = rv_find_slot(frame, &function->params.items[i]->value);
-        if (param_slots[i] == NULL) {
-            return;
-        }
-    }
-    char *keys = rv_memo_label(function, "keys");
-    char *values = rv_memo_label(function, "values");
-    char *stamps = rv_memo_label(function, "stamps");
-    char *generation = rv_memo_label(function, "generation");
-    char *depth = rv_memo_label(function, "depth");
-    fputs("  mv t6, a0\n", out);
-    for (int i = 0; i < function->params.count; ++i) {
-        rv_emit_mem(out, param_slots[i]->value_size == 8 ? "ld" : "lw",
-                    param_regs[i], param_slots[i]->offset, "s0");
-    }
-    rv_emit_memo_index_from_regs(out, function, param_regs, "t3");
-    fprintf(out, "  lla t0, %s\n", keys);
-    fprintf(out, "  li t4, %d\n", function->params.count * 4);
-    fputs("  mul t4, t3, t4\n", out);
-    fputs("  add t0, t0, t4\n", out);
-    for (int i = 0; i < function->params.count; ++i) {
-        fprintf(out, "  sw %s, %d(t0)\n", param_regs[i], i * 4);
-    }
-    fprintf(out, "  lla t0, %s\n", values);
-    fputs("  slli t4, t3, 2\n", out);
-    fputs("  add t0, t0, t4\n", out);
-    fputs("  sw t6, 0(t0)\n", out);
-    fprintf(out, "  lla t0, %s\n", generation);
-    fputs("  lw t1, 0(t0)\n", out);
-    fprintf(out, "  lla t0, %s\n", stamps);
-    fputs("  slli t4, t3, 2\n", out);
-    fputs("  add t0, t0, t4\n", out);
-    fputs("  sw t1, 0(t0)\n", out);
-    fprintf(out, "  lla t0, %s\n", depth);
-    fputs("  lw t1, 0(t0)\n", out);
-    fputs("  addiw t1, t1, -1\n", out);
-    fputs("  sw t1, 0(t0)\n", out);
-    fputs("  mv a0, t6\n", out);
-}
-
-static void rv_emit_mod_multiply_fast_entry(IRFunction *function, FILE *out) {
-    char *slow_label = str_printf(".L_%s_modmul_slow", rv_symbol_name(function->name));
-    fputs("  or t0, a0, a1\n", out);
-    fprintf(out, "  bltz t0, %s\n", slow_label);
-    fputs("  mul t1, a0, a1\n", out);
-    fprintf(out, "  li t2, %d\n", function->special_mod_multiply_mod);
-    fputs("  rem a0, t1, t2\n", out);
-    fputs("  ret\n", out);
-    fprintf(out, "%s:\n", slow_label);
-}
-
 static void rv_emit_function(IRFunction *function, FILE *out) {
     RVFrame frame;
     rv_prepare_frame(&frame, function);
     frame.out = out;
     fprintf(out, "  .globl %s\n  .align 2\n%s:\n",
             rv_symbol_name(function->name), rv_symbol_name(function->name));
-    if (function->special_mod_multiply_mod > 1) {
-        rv_emit_mod_multiply_fast_entry(function, out);
-    }
-    bool memoize = rv_function_eligible_for_recursive_memo(function);
-    if (memoize) {
-        rv_emit_memo_entry_probe(function, out);
-    }
     rv_emit_addi(out, "sp", "sp", -frame.frame_size);
     if (frame.has_call) {
         rv_emit_mem(out, "sd", "ra", frame.frame_size - 8, "sp");
@@ -11762,9 +11075,6 @@ static void rv_emit_function(IRFunction *function, FILE *out) {
         }
     }
     fprintf(out, ".L_%s_return:\n", rv_symbol_name(function->name));
-    if (memoize) {
-        rv_emit_memo_return_update(&frame);
-    }
     for (int i = 0; i < RV_LOOP_REG_COUNT; ++i) {
         if (frame.used_saved_regs[i]) {
             rv_emit_mem(out, "ld", g_rv_loop_regs[i], frame.saved_reg_offsets[i], "s0");
@@ -11783,7 +11093,6 @@ void emit_riscv_from_ir(IRModule *module, FILE *out) {
     fputs("  .option nopic\n", out);
     fputs("  .option norelax\n", out);
     rv_emit_globals(module, out);
-    rv_emit_memo_globals(module, out);
     fputs("  .text\n", out);
     for (int i = 0; i < module->functions.count; ++i) {
         IRFunction *function = module->functions.items[i];
@@ -11804,6 +11113,100 @@ static bool asm_parse_jump_line(const char *line, char *label) {
 static bool asm_parse_shift_imm_line(const char *line, char *op, char *rd, char *rs, int *imm) {
     return sscanf(line, "  %7s %15[^,], %15[^,], %d", op, rd, rs, imm) == 4
         && strcmp(op, "slli") == 0;
+}
+
+static bool asm_parse_move_line(const char *line, char *dst, char *src) {
+    return sscanf(line, "  mv %15[^,], %15s", dst, src) == 2;
+}
+
+static bool asm_parse_float_move_line(const char *line, char *dst, char *src) {
+    return sscanf(line, "  fmv.s %15[^,], %15s", dst, src) == 2;
+}
+
+static bool asm_parse_li_line(const char *line, char *dst, long long *value) {
+    return sscanf(line, "  li %15[^,], %lld", dst, value) == 2;
+}
+
+static bool asm_parse_imm_line(const char *line, char *op, char *dst, char *src, int *imm) {
+    return sscanf(line, "  %7s %15[^,], %15[^,], %d", op, dst, src, imm) == 4;
+}
+
+static bool asm_parse_unary_branch_line(const char *line, char *op, char *reg, char *label) {
+    if (sscanf(line, "  %7s %15[^,], %127s", op, reg, label) != 3) {
+        return false;
+    }
+    return strcmp(op, "beqz") == 0 || strcmp(op, "bnez") == 0
+        || strcmp(op, "bltz") == 0 || strcmp(op, "bgez") == 0;
+}
+
+static bool asm_parse_binary_branch_line(const char *line, char *op,
+                                         char *lhs, char *rhs, char *label) {
+    if (sscanf(line, "  %7s %15[^,], %15[^,], %127s", op, lhs, rhs, label) != 4) {
+        return false;
+    }
+    return strcmp(op, "beq") == 0 || strcmp(op, "bne") == 0
+        || strcmp(op, "blt") == 0 || strcmp(op, "bge") == 0
+        || strcmp(op, "ble") == 0 || strcmp(op, "bgt") == 0
+        || strcmp(op, "bltu") == 0 || strcmp(op, "bgeu") == 0
+        || strcmp(op, "bleu") == 0 || strcmp(op, "bgtu") == 0;
+}
+
+static bool asm_line_is_redundant_self_move(const char *line) {
+    char dst[16], src[16];
+    if (asm_parse_move_line(line, dst, src) || asm_parse_float_move_line(line, dst, src)) {
+        return strcmp(dst, src) == 0;
+    }
+    return false;
+}
+
+static bool asm_line_is_redundant_zero_imm_self_op(const char *line) {
+    char op[8], dst[16], src[16];
+    int imm = 0;
+    if (!asm_parse_imm_line(line, op, dst, src, &imm) || imm != 0 || strcmp(dst, src) != 0) {
+        return false;
+    }
+    return strcmp(op, "addi") == 0 || strcmp(op, "slli") == 0 || strcmp(op, "srli") == 0
+        || strcmp(op, "srai") == 0 || strcmp(op, "ori") == 0 || strcmp(op, "xori") == 0;
+}
+
+static bool asm_append_folded_move_branch(StrBuf *out, char **lines, int *index, int count) {
+    char dst1[16], src1[16], dst2[16], src2[16];
+    char op[8], lhs[16], rhs[16], label[128];
+    int i = *index;
+    if (i + 2 < count
+            && asm_parse_move_line(lines[i], dst1, src1)
+            && asm_parse_move_line(lines[i + 1], dst2, src2)
+            && asm_parse_binary_branch_line(lines[i + 2], op, lhs, rhs, label)
+            && strcmp(dst1, dst2) != 0
+            && strcmp(src1, dst2) != 0
+            && strcmp(src2, dst1) != 0
+            && (strcmp(lhs, dst1) == 0 || strcmp(lhs, dst2) == 0)
+            && (strcmp(rhs, dst1) == 0 || strcmp(rhs, dst2) == 0)) {
+        const char *new_lhs = strcmp(lhs, dst1) == 0 ? src1 : src2;
+        const char *new_rhs = strcmp(rhs, dst1) == 0 ? src1 : src2;
+        sb_appendf(out, "  %s %s, %s, %s\n", op, new_lhs, new_rhs, label);
+        *index += 2;
+        return true;
+    }
+    if (i + 1 < count
+            && asm_parse_move_line(lines[i], dst1, src1)
+            && asm_parse_unary_branch_line(lines[i + 1], op, lhs, label)
+            && strcmp(lhs, dst1) == 0) {
+        sb_appendf(out, "  %s %s, %s\n", op, src1, label);
+        *index += 1;
+        return true;
+    }
+    if (i + 1 < count
+            && asm_parse_move_line(lines[i], dst1, src1)
+            && asm_parse_binary_branch_line(lines[i + 1], op, lhs, rhs, label)
+            && (strcmp(lhs, dst1) == 0 || strcmp(rhs, dst1) == 0)) {
+        const char *new_lhs = strcmp(lhs, dst1) == 0 ? src1 : lhs;
+        const char *new_rhs = strcmp(rhs, dst1) == 0 ? src1 : rhs;
+        sb_appendf(out, "  %s %s, %s, %s\n", op, new_lhs, new_rhs, label);
+        *index += 1;
+        return true;
+    }
+    return false;
 }
 
 static bool asm_line_is_control_or_label(const char *line) {
@@ -11929,6 +11332,23 @@ static void asm_peephole_text(const char *text, FILE *out_file) {
     StrBuf out;
     sb_init(&out);
     for (int i = 0; i < count; ++i) {
+        if (asm_line_is_redundant_self_move(lines[i])
+                || asm_line_is_redundant_zero_imm_self_op(lines[i])) {
+            continue;
+        }
+        char li_reg1[16], li_reg2[16];
+        long long li_value1 = 0, li_value2 = 0;
+        if (i + 1 < count
+                && asm_parse_li_line(lines[i], li_reg1, &li_value1)
+                && asm_parse_li_line(lines[i + 1], li_reg2, &li_value2)
+                && strcmp(li_reg1, li_reg2) == 0) {
+            (void)li_value1;
+            (void)li_value2;
+            continue;
+        }
+        if (asm_append_folded_move_branch(&out, lines, &i, count)) {
+            continue;
+        }
         char jlabel[128];
         if (i + 1 < count && asm_parse_jump_line(lines[i], jlabel)
                 && asm_line_is_label(lines[i + 1], jlabel)) {
