@@ -2396,6 +2396,28 @@ static MemSymbol *mem_lookup_symbol(MemIRGen *gen, const char *name) {
     return NULL;
 }
 
+static bool mem_has_global_symbol_named(MemIRGen *gen, const char *name) {
+    for (MemScope *scope = gen->scopes; scope != NULL; scope = scope->next) {
+        for (MemSymbol *sym = scope->symbols; sym != NULL; sym = sym->next) {
+            if (sym->is_global && strcmp(sym->name, name) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool mem_has_local_symbol_named(MemIRGen *gen, const char *name) {
+    for (MemScope *scope = gen->scopes; scope != NULL; scope = scope->next) {
+        for (MemSymbol *sym = scope->symbols; sym != NULL; sym = sym->next) {
+            if (!sym->is_global && strcmp(sym->name, name) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static IRFunction *mem_create_function(MemIRGen *gen, const char *name, TypeSpec ret_type,
                                        ParamList params, bool has_sysy_params, bool is_external,
                                        bool is_variadic) {
@@ -2888,8 +2910,48 @@ static MemAddress mem_lval_address(MemIRGen *gen, LVal *lval) {
     return mem_make_address(ptr, sym->value_type, dim_count, dims, param_array, current_type);
 }
 
+
+static bool ast_const_int_value(Expr *expr, int *value);
+
+static bool mem_try_const_array_lval(MemIRGen *gen, MemSymbol *sym, LVal *lval, MemValue *out) {
+    if (gen == NULL || sym == NULL || lval == NULL || out == NULL) {
+        return false;
+    }
+    if (!sym->is_const || sym->const_flat == NULL || sym->dim_count <= 0) {
+        return false;
+    }
+    if (lval->indices.count != sym->dim_count) {
+        return false;
+    }
+    int flat_index = 0;
+    for (int i = 0; i < sym->dim_count; ++i) {
+        int idx = 0;
+        if (!ast_const_int_value(lval->indices.items[i], &idx)) {
+            return false;
+        }
+        if (idx < 0 || idx >= sym->dims[i]) {
+            return false;
+        }
+        flat_index = flat_index * sym->dims[i] + idx;
+    }
+    if (flat_index < 0 || flat_index >= sym->total_slots) {
+        return false;
+    }
+    int raw = sym->const_flat[flat_index];
+    if (sym->value_type == TYPE_FLOAT) {
+        *out = mem_make_value(mem_const_float(gen, raw), TYPE_FLOAT, 0, NULL, false, false);
+    } else {
+        *out = mem_make_value(mem_const_int(gen, raw), TYPE_INT, 0, NULL, false, false);
+    }
+    return true;
+}
+
 static MemValue mem_lval_expr(MemIRGen *gen, LVal *lval) {
     MemSymbol *sym = mem_lookup_symbol(gen, lval->name);
+    MemValue const_array_value;
+    if (mem_try_const_array_lval(gen, sym, lval, &const_array_value)) {
+        return const_array_value;
+    }
     if (sym != NULL && sym->is_inline_value && lval->indices.count == 0) {
         return sym->inline_value;
     }
@@ -3014,7 +3076,8 @@ static Expr *mem_straightline_return_expr(FuncDef *func) {
 typedef enum {
     MEM_INLINE_NONE,
     MEM_INLINE_RETURN_EXPR,
-    MEM_INLINE_IF_RETURN
+    MEM_INLINE_IF_RETURN,
+    MEM_INLINE_MULTI_RETURN
 } MemInlineKind;
 
 typedef struct {
@@ -3073,7 +3136,20 @@ static int mem_expr_inline_cost(Expr *expr) {
             int rhs = mem_expr_inline_cost(expr->data.binary.rhs);
             return lhs < 0 || rhs < 0 ? -1 : lhs + rhs + 1;
         }
-        case EXPR_CALL:
+        case EXPR_CALL: {
+            if (expr->data.call.args.count > 8) {
+                return -1;
+            }
+            int cost = 8;
+            for (int i = 0; i < expr->data.call.args.count; ++i) {
+                int arg_cost = mem_expr_inline_cost(expr->data.call.args.items[i]);
+                if (arg_cost < 0) {
+                    return -1;
+                }
+                cost += arg_cost;
+            }
+            return cost;
+        }
         case EXPR_GETINT:
         default:
             return -1;
@@ -3182,6 +3258,361 @@ static int mem_if_return_inline_cost(Stmt *stmt) {
                : cond_cost + then_cost + else_cost + 2;
 }
 
+static int mem_stmt_multi_return_inline_cost(FuncDef *func, Stmt *stmt, bool *has_return) {
+    if (stmt == NULL) {
+        return -1;
+    }
+    switch (stmt->kind) {
+        case STMT_ASSIGN: {
+            if (stmt->data.assign_stmt.lval == NULL) {
+                return -1;
+            }
+            if (stmt->data.assign_stmt.lval->indices.count == 0
+                    && mem_func_has_scalar_param_named(func, stmt->data.assign_stmt.lval->name)) {
+                return -1;
+            }
+            int lhs = mem_lval_inline_cost(stmt->data.assign_stmt.lval);
+            int rhs = mem_expr_inline_cost(stmt->data.assign_stmt.expr);
+            return lhs < 0 || rhs < 0 ? -1 : lhs + rhs + 1;
+        }
+        case STMT_EXPR: {
+            int expr_cost = mem_expr_inline_cost(stmt->data.expr_stmt);
+            return expr_cost < 0 ? -1 : expr_cost + 1;
+        }
+        case STMT_BLOCK: {
+            if (stmt->data.block_stmt == NULL) {
+                return 1;
+            }
+            int cost = 1;
+            for (int i = 0; i < stmt->data.block_stmt->items.count; ++i) {
+                int item_cost = -1;
+                if (stmt->data.block_stmt->items.kinds[i] == BLOCK_ITEM_DECL) {
+                    item_cost = mem_decl_inline_cost((Decl *)stmt->data.block_stmt->items.items[i]);
+                } else if (stmt->data.block_stmt->items.kinds[i] == BLOCK_ITEM_STMT) {
+                    item_cost = mem_stmt_multi_return_inline_cost(
+                        func, (Stmt *)stmt->data.block_stmt->items.items[i], has_return);
+                }
+                if (item_cost < 0) {
+                    return -1;
+                }
+                cost += item_cost;
+            }
+            return cost;
+        }
+        case STMT_IF: {
+            int cond_cost = mem_expr_inline_cost(stmt->data.if_stmt.cond);
+            int then_cost = mem_stmt_multi_return_inline_cost(func, stmt->data.if_stmt.then_stmt, has_return);
+            int else_cost = stmt->data.if_stmt.else_stmt != NULL
+                                ? mem_stmt_multi_return_inline_cost(func, stmt->data.if_stmt.else_stmt, has_return)
+                                : 0;
+            return cond_cost < 0 || then_cost < 0 || else_cost < 0
+                       ? -1
+                       : cond_cost + then_cost + else_cost + 2;
+        }
+        case STMT_RETURN: {
+            if (stmt->data.return_expr == NULL) {
+                return -1;
+            }
+            int expr_cost = mem_expr_inline_cost(stmt->data.return_expr);
+            if (expr_cost < 0) {
+                return -1;
+            }
+            *has_return = true;
+            return expr_cost + 1;
+        }
+        case STMT_WHILE: {
+            int cond_cost = mem_expr_inline_cost(stmt->data.while_stmt.cond);
+            int body_cost = mem_stmt_multi_return_inline_cost(func, stmt->data.while_stmt.body, has_return);
+            return cond_cost < 0 || body_cost < 0 ? -1 : cond_cost + body_cost + 4;
+        }
+        case STMT_BREAK:
+        case STMT_CONTINUE:
+            return 1;
+        case STMT_PRINTF:
+        default:
+            return -1;
+    }
+}
+
+static bool mem_expr_calls_name(Expr *expr, const char *name);
+
+static bool mem_lval_calls_name(LVal *lval, const char *name) {
+    if (lval == NULL) {
+        return false;
+    }
+    for (int i = 0; i < lval->indices.count; ++i) {
+        if (mem_expr_calls_name(lval->indices.items[i], name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mem_expr_calls_name(Expr *expr, const char *name) {
+    if (expr == NULL || name == NULL) {
+        return false;
+    }
+    switch (expr->kind) {
+        case EXPR_LVAL:
+            return mem_lval_calls_name(expr->data.lval, name);
+        case EXPR_UNARY:
+            return mem_expr_calls_name(expr->data.unary.operand, name);
+        case EXPR_BINARY:
+            return mem_expr_calls_name(expr->data.binary.lhs, name)
+                || mem_expr_calls_name(expr->data.binary.rhs, name);
+        case EXPR_CALL:
+            if (strcmp(expr->data.call.name, name) == 0) {
+                return true;
+            }
+            for (int i = 0; i < expr->data.call.args.count; ++i) {
+                if (mem_expr_calls_name(expr->data.call.args.items[i], name)) {
+                    return true;
+                }
+            }
+            return false;
+        case EXPR_NUMBER:
+        case EXPR_FLOAT_NUMBER:
+        case EXPR_GETINT:
+        default:
+            return false;
+    }
+}
+
+static bool mem_stmt_calls_name(Stmt *stmt, const char *name) {
+    if (stmt == NULL || name == NULL) {
+        return false;
+    }
+    switch (stmt->kind) {
+        case STMT_ASSIGN:
+            return mem_lval_calls_name(stmt->data.assign_stmt.lval, name)
+                || mem_expr_calls_name(stmt->data.assign_stmt.expr, name);
+        case STMT_EXPR:
+            return mem_expr_calls_name(stmt->data.expr_stmt, name);
+        case STMT_BLOCK:
+            if (stmt->data.block_stmt == NULL) {
+                return false;
+            }
+            for (int i = 0; i < stmt->data.block_stmt->items.count; ++i) {
+                if (stmt->data.block_stmt->items.kinds[i] == BLOCK_ITEM_DECL) {
+                    Decl *decl = (Decl *)stmt->data.block_stmt->items.items[i];
+                    for (int j = 0; decl != NULL && j < decl->items.count; ++j) {
+                        InitVal *init = decl->items.items[j]->init;
+                        if (init != NULL && init->is_expr && mem_expr_calls_name(init->expr, name)) {
+                            return true;
+                        }
+                    }
+                } else if (stmt->data.block_stmt->items.kinds[i] == BLOCK_ITEM_STMT
+                        && mem_stmt_calls_name((Stmt *)stmt->data.block_stmt->items.items[i], name)) {
+                    return true;
+                }
+            }
+            return false;
+        case STMT_IF:
+            return mem_expr_calls_name(stmt->data.if_stmt.cond, name)
+                || mem_stmt_calls_name(stmt->data.if_stmt.then_stmt, name)
+                || mem_stmt_calls_name(stmt->data.if_stmt.else_stmt, name);
+        case STMT_WHILE:
+            return mem_expr_calls_name(stmt->data.while_stmt.cond, name)
+                || mem_stmt_calls_name(stmt->data.while_stmt.body, name);
+        case STMT_RETURN:
+            return mem_expr_calls_name(stmt->data.return_expr, name);
+        case STMT_PRINTF:
+            for (int i = 0; i < stmt->data.printf_stmt.args.count; ++i) {
+                if (mem_expr_calls_name(stmt->data.printf_stmt.args.items[i], name)) {
+                    return true;
+                }
+            }
+            return false;
+        case STMT_BREAK:
+        case STMT_CONTINUE:
+        default:
+            return false;
+    }
+}
+
+static bool mem_function_calls_name(FuncDef *func, const char *name) {
+    if (func == NULL || func->block == NULL || name == NULL) {
+        return false;
+    }
+    for (int i = 0; i < func->block->items.count; ++i) {
+        if (func->block->items.kinds[i] == BLOCK_ITEM_DECL) {
+            Decl *decl = (Decl *)func->block->items.items[i];
+            for (int j = 0; decl != NULL && j < decl->items.count; ++j) {
+                InitVal *init = decl->items.items[j]->init;
+                if (init != NULL && init->is_expr && mem_expr_calls_name(init->expr, name)) {
+                    return true;
+                }
+            }
+        } else if (func->block->items.kinds[i] == BLOCK_ITEM_STMT) {
+            if (mem_stmt_calls_name((Stmt *)func->block->items.items[i], name)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool mem_expr_references_shadowed_global(MemIRGen *gen, Expr *expr);
+
+static bool mem_lval_references_shadowed_global(MemIRGen *gen, LVal *lval) {
+    if (lval == NULL) {
+        return false;
+    }
+    if (mem_has_global_symbol_named(gen, lval->name)
+            && mem_has_local_symbol_named(gen, lval->name)) {
+        return true;
+    }
+    for (int i = 0; i < lval->indices.count; ++i) {
+        if (mem_expr_references_shadowed_global(gen, lval->indices.items[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mem_initval_references_shadowed_global(MemIRGen *gen, InitVal *init) {
+    if (init == NULL) {
+        return false;
+    }
+    if (init->is_expr) {
+        return mem_expr_references_shadowed_global(gen, init->expr);
+    }
+    for (int i = 0; i < init->children.count; ++i) {
+        if (mem_initval_references_shadowed_global(gen, init->children.items[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mem_decl_references_shadowed_global(MemIRGen *gen, Decl *decl) {
+    for (int i = 0; decl != NULL && i < decl->items.count; ++i) {
+        if (mem_initval_references_shadowed_global(gen, decl->items.items[i]->init)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mem_stmt_references_shadowed_global(MemIRGen *gen, Stmt *stmt) {
+    if (stmt == NULL) {
+        return false;
+    }
+    switch (stmt->kind) {
+        case STMT_ASSIGN:
+            return mem_lval_references_shadowed_global(gen, stmt->data.assign_stmt.lval)
+                || mem_expr_references_shadowed_global(gen, stmt->data.assign_stmt.expr);
+        case STMT_EXPR:
+            return mem_expr_references_shadowed_global(gen, stmt->data.expr_stmt);
+        case STMT_BLOCK:
+            for (int i = 0; stmt->data.block_stmt != NULL && i < stmt->data.block_stmt->items.count; ++i) {
+                if (stmt->data.block_stmt->items.kinds[i] == BLOCK_ITEM_DECL) {
+                    if (mem_decl_references_shadowed_global(gen, (Decl *)stmt->data.block_stmt->items.items[i])) {
+                        return true;
+                    }
+                } else if (mem_stmt_references_shadowed_global(gen, (Stmt *)stmt->data.block_stmt->items.items[i])) {
+                    return true;
+                }
+            }
+            return false;
+        case STMT_IF:
+            return mem_expr_references_shadowed_global(gen, stmt->data.if_stmt.cond)
+                || mem_stmt_references_shadowed_global(gen, stmt->data.if_stmt.then_stmt)
+                || mem_stmt_references_shadowed_global(gen, stmt->data.if_stmt.else_stmt);
+        case STMT_WHILE:
+            return mem_expr_references_shadowed_global(gen, stmt->data.while_stmt.cond)
+                || mem_stmt_references_shadowed_global(gen, stmt->data.while_stmt.body);
+        case STMT_RETURN:
+            return mem_expr_references_shadowed_global(gen, stmt->data.return_expr);
+        case STMT_PRINTF:
+            for (int i = 0; i < stmt->data.printf_stmt.args.count; ++i) {
+                if (mem_expr_references_shadowed_global(gen, stmt->data.printf_stmt.args.items[i])) {
+                    return true;
+                }
+            }
+            return false;
+        case STMT_BREAK:
+        case STMT_CONTINUE:
+        default:
+            return false;
+    }
+}
+
+static bool mem_expr_references_shadowed_global(MemIRGen *gen, Expr *expr) {
+    if (expr == NULL) {
+        return false;
+    }
+    switch (expr->kind) {
+        case EXPR_NUMBER:
+        case EXPR_FLOAT_NUMBER:
+        case EXPR_GETINT:
+            return false;
+        case EXPR_LVAL:
+            return mem_lval_references_shadowed_global(gen, expr->data.lval);
+        case EXPR_UNARY:
+            return mem_expr_references_shadowed_global(gen, expr->data.unary.operand);
+        case EXPR_BINARY:
+            return mem_expr_references_shadowed_global(gen, expr->data.binary.lhs)
+                || mem_expr_references_shadowed_global(gen, expr->data.binary.rhs);
+        case EXPR_CALL:
+            for (int i = 0; i < expr->data.call.args.count; ++i) {
+                if (mem_expr_references_shadowed_global(gen, expr->data.call.args.items[i])) {
+                    return true;
+                }
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+static bool mem_function_references_shadowed_global(MemIRGen *gen, FuncDef *func) {
+    for (int i = 0; func != NULL && func->block != NULL && i < func->block->items.count; ++i) {
+        if (func->block->items.kinds[i] == BLOCK_ITEM_DECL) {
+            if (mem_decl_references_shadowed_global(gen, (Decl *)func->block->items.items[i])) {
+                return true;
+            }
+        } else if (mem_stmt_references_shadowed_global(gen, (Stmt *)func->block->items.items[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mem_build_multi_return_inline_plan(FuncDef *func, MemInlinePlan *plan) {
+    if (plan == NULL) {
+        return false;
+    }
+    if (func == NULL || func->ret_type == TYPE_VOID || func->block == NULL
+            || func->block->items.count <= 1 || func->block->items.count > 32
+            || mem_function_calls_name(func, func->name)) {
+        return false;
+    }
+    bool has_return = false;
+    int total_cost = 0;
+    for (int i = 0; i < func->block->items.count; ++i) {
+        int item_cost = -1;
+        if (func->block->items.kinds[i] == BLOCK_ITEM_DECL) {
+            item_cost = mem_decl_inline_cost((Decl *)func->block->items.items[i]);
+        } else if (func->block->items.kinds[i] == BLOCK_ITEM_STMT) {
+            item_cost = mem_stmt_multi_return_inline_cost(
+                func, (Stmt *)func->block->items.items[i], &has_return);
+        }
+        if (item_cost < 0) {
+            return false;
+        }
+        total_cost += item_cost;
+    }
+    if (!has_return || total_cost > 192) {
+        return false;
+    }
+    memset(plan, 0, sizeof(MemInlinePlan));
+    plan->kind = MEM_INLINE_MULTI_RETURN;
+    plan->prefix_count = func->block->items.count;
+    plan->cost = total_cost;
+    return true;
+}
+
 static bool mem_build_inline_plan(FuncDef *func, MemInlinePlan *plan) {
     if (plan == NULL) {
         return false;
@@ -3247,12 +3678,16 @@ static bool mem_can_inline_call(MemIRGen *gen, MemFunctionMeta *meta, ExprList *
     if (gen->current_function == meta->function) {
         return false;
     }
+    if (mem_function_references_shadowed_global(gen, meta->ast_func)) {
+        return false;
+    }
     if (mem_simple_return_expr(meta->ast_func) != NULL ||
             mem_simple_if_return_stmt(meta->ast_func) != NULL ||
             mem_straightline_return_expr(meta->ast_func) != NULL) {
         return true;
     }
-    return mem_build_inline_plan(meta->ast_func, &plan);
+    return mem_build_inline_plan(meta->ast_func, &plan)
+        || mem_build_multi_return_inline_plan(meta->ast_func, &plan);
 }
 
 static MemValue mem_inline_if_return_value(MemIRGen *gen, MemFunctionMeta *meta, Stmt *stmt) {
@@ -3275,13 +3710,136 @@ static MemValue mem_inline_if_return_value(MemIRGen *gen, MemFunctionMeta *meta,
     return mem_make_value(loaded, meta->ret_type, 0, NULL, false, false);
 }
 
+static void mem_gen_inline_return_stmt(MemIRGen *gen, Stmt *stmt,
+                                       TypeSpec ret_type, IRValue *ret_slot,
+                                       IRBasicBlock *end_block);
+
+static void mem_gen_inline_return_block(MemIRGen *gen, Block *block,
+                                        TypeSpec ret_type, IRValue *ret_slot,
+                                        IRBasicBlock *end_block, bool new_scope) {
+    if (new_scope) {
+        mem_push_scope(gen);
+    }
+    for (int i = 0; block != NULL && i < block->items.count && !mem_block_terminated(gen); ++i) {
+        if (block->items.kinds[i] == BLOCK_ITEM_DECL) {
+            mem_gen_decl(gen, (Decl *)block->items.items[i], false);
+        } else {
+            mem_gen_inline_return_stmt(gen, (Stmt *)block->items.items[i],
+                                       ret_type, ret_slot, end_block);
+        }
+    }
+    if (new_scope) {
+        mem_pop_scope(gen);
+    }
+}
+
+static void mem_gen_inline_return_stmt(MemIRGen *gen, Stmt *stmt,
+                                       TypeSpec ret_type, IRValue *ret_slot,
+                                       IRBasicBlock *end_block) {
+    if (stmt == NULL || mem_block_terminated(gen)) {
+        return;
+    }
+    switch (stmt->kind) {
+        case STMT_ASSIGN: {
+            MemAddress addr = mem_lval_address(gen, stmt->data.assign_stmt.lval);
+            MemValue value = mem_gen_expr(gen, stmt->data.assign_stmt.expr);
+            mem_emit_store(gen, mem_ensure_type(gen, value, addr.type), addr.ptr);
+            return;
+        }
+        case STMT_EXPR:
+            if (stmt->data.expr_stmt != NULL) {
+                mem_gen_expr(gen, stmt->data.expr_stmt);
+            }
+            return;
+        case STMT_BLOCK:
+            mem_gen_inline_return_block(gen, stmt->data.block_stmt, ret_type, ret_slot, end_block, true);
+            return;
+        case STMT_IF: {
+            IRBasicBlock *then_block = mem_create_block(gen, mem_new_label(gen, "inline_then"));
+            IRBasicBlock *else_block = stmt->data.if_stmt.else_stmt != NULL
+                                           ? mem_create_block(gen, mem_new_label(gen, "inline_else"))
+                                           : NULL;
+            IRBasicBlock *cont_block = mem_create_block(gen, mem_new_label(gen, "inline_cont"));
+            mem_gen_cond(gen, stmt->data.if_stmt.cond, then_block,
+                         else_block != NULL ? else_block : cont_block);
+            mem_position_at(gen, then_block);
+            mem_gen_inline_return_stmt(gen, stmt->data.if_stmt.then_stmt,
+                                       ret_type, ret_slot, end_block);
+            if (!mem_block_terminated(gen)) {
+                mem_emit_br(gen, NULL, cont_block, NULL);
+            }
+            if (else_block != NULL) {
+                mem_position_at(gen, else_block);
+                mem_gen_inline_return_stmt(gen, stmt->data.if_stmt.else_stmt,
+                                           ret_type, ret_slot, end_block);
+                if (!mem_block_terminated(gen)) {
+                    mem_emit_br(gen, NULL, cont_block, NULL);
+                }
+            }
+            mem_position_at(gen, cont_block);
+            return;
+        }
+        case STMT_WHILE: {
+            IRBasicBlock *cond_block = mem_create_block(gen, mem_new_label(gen, "inline_while_cond"));
+            IRBasicBlock *body_block = mem_create_block(gen, mem_new_label(gen, "inline_while_body"));
+            IRBasicBlock *after_block = mem_create_block(gen, mem_new_label(gen, "inline_while_end"));
+            mem_emit_br(gen, NULL, cond_block, NULL);
+            mem_position_at(gen, cond_block);
+            mem_loop_push(gen, after_block, cond_block);
+            mem_gen_cond(gen, stmt->data.while_stmt.cond, body_block, after_block);
+            mem_position_at(gen, body_block);
+            mem_gen_inline_return_stmt(gen, stmt->data.while_stmt.body,
+                                       ret_type, ret_slot, end_block);
+            if (!mem_block_terminated(gen)) {
+                mem_emit_br(gen, NULL, cond_block, NULL);
+            }
+            mem_loop_pop(gen);
+            mem_position_at(gen, after_block);
+            return;
+        }
+        case STMT_BREAK:
+            if (gen->break_count > 0) {
+                mem_emit_br(gen, NULL, gen->break_blocks[gen->break_count - 1], NULL);
+            }
+            return;
+        case STMT_CONTINUE:
+            if (gen->continue_count > 0) {
+                mem_emit_br(gen, NULL, gen->continue_blocks[gen->continue_count - 1], NULL);
+            }
+            return;
+        case STMT_RETURN: {
+            MemValue value = mem_gen_expr(gen, stmt->data.return_expr);
+            mem_emit_store(gen, mem_ensure_type(gen, value, ret_type), ret_slot);
+            mem_emit_br(gen, NULL, end_block, NULL);
+            return;
+        }
+        case STMT_PRINTF:
+        default:
+            return;
+    }
+}
+
+static MemValue mem_inline_multi_return_value(MemIRGen *gen, MemFunctionMeta *meta) {
+    IRType *ret_type = mem_scalar_type(gen->module, meta->ret_type);
+    IRValue *slot = mem_emit_alloca(gen, ret_type);
+    IRBasicBlock *end_block = mem_create_block(gen, mem_new_label(gen, "inline_end"));
+    mem_gen_inline_return_block(gen, meta->ast_func->block, meta->ret_type, slot, end_block, false);
+    if (!mem_block_terminated(gen)) {
+        mem_emit_br(gen, NULL, end_block, NULL);
+    }
+    mem_position_at(gen, end_block);
+    IRValue *loaded = mem_emit_load(gen, ret_type, slot);
+    return mem_make_value(loaded, meta->ret_type, 0, NULL, false, false);
+}
+
 static MemValue mem_try_inline_call(MemIRGen *gen, MemFunctionMeta *meta, ExprList *args, bool *inlined) {
     *inlined = false;
     if (!mem_can_inline_call(gen, meta, args)) {
         return mem_make_value(mem_const_int(gen, 0), TYPE_INT, 0, NULL, false, false);
     }
     MemInlinePlan plan = {0};
-    bool have_plan = mem_build_inline_plan(meta->ast_func, &plan);
+    bool have_plan = mem_build_inline_plan(meta->ast_func, &plan)
+        || mem_build_multi_return_inline_plan(meta->ast_func, &plan);
     MemValue *arg_values = NULL;
     if (args->count > 0) {
         arg_values = (MemValue *)xmalloc(sizeof(MemValue) * args->count);
@@ -3335,16 +3893,20 @@ static MemValue mem_try_inline_call(MemIRGen *gen, MemFunctionMeta *meta, ExprLi
         }
         result = mem_gen_expr(gen, straightline_return);
     } else if (have_plan && plan.kind != MEM_INLINE_NONE) {
-        for (int i = 0; i < plan.prefix_count; ++i) {
-            if (meta->ast_func->block->items.kinds[i] == BLOCK_ITEM_DECL) {
-                mem_gen_decl(gen, (Decl *)meta->ast_func->block->items.items[i], false);
-            } else if (meta->ast_func->block->items.kinds[i] == BLOCK_ITEM_STMT) {
-                mem_gen_stmt(gen, (Stmt *)meta->ast_func->block->items.items[i]);
+        if (plan.kind == MEM_INLINE_MULTI_RETURN) {
+            result = mem_inline_multi_return_value(gen, meta);
+        } else {
+            for (int i = 0; i < plan.prefix_count; ++i) {
+                if (meta->ast_func->block->items.kinds[i] == BLOCK_ITEM_DECL) {
+                    mem_gen_decl(gen, (Decl *)meta->ast_func->block->items.items[i], false);
+                } else if (meta->ast_func->block->items.kinds[i] == BLOCK_ITEM_STMT) {
+                    mem_gen_stmt(gen, (Stmt *)meta->ast_func->block->items.items[i]);
+                }
             }
         }
         if (plan.kind == MEM_INLINE_IF_RETURN) {
             result = mem_inline_if_return_value(gen, meta, plan.if_stmt);
-        } else {
+        } else if (plan.kind == MEM_INLINE_RETURN_EXPR) {
             result = mem_gen_expr(gen, plan.return_expr);
         }
     } else {
@@ -3712,14 +4274,48 @@ static void mem_zero_local_array(MemIRGen *gen, MemSymbol *sym) {
     mem_position_at(gen, end_block);
 }
 
+static bool mem_expr_is_literal_zero(Expr *expr, TypeSpec type) {
+    if (expr == NULL) {
+        return false;
+    }
+    if (expr->kind == EXPR_NUMBER) {
+        return expr->data.number == 0;
+    }
+    if (expr->kind == EXPR_FLOAT_NUMBER) {
+        return expr->data.number == float_bits_from_host(0.0f);
+    }
+    if (expr->kind == EXPR_UNARY && expr->data.unary.op == UNARY_PLUS) {
+        return mem_expr_is_literal_zero(expr->data.unary.operand, type);
+    }
+    if (expr->kind == EXPR_UNARY && expr->data.unary.op == UNARY_MINUS) {
+        return mem_expr_is_literal_zero(expr->data.unary.operand, type);
+    }
+    (void)type;
+    return false;
+}
+
 static void mem_init_local_array(MemIRGen *gen, MemSymbol *sym, InitVal *init) {
-    mem_zero_local_array(gen, sym);
     if (init == NULL) {
+        /* SysY leaves uninitialized local variables/arrays undefined; avoid
+           emitting a redundant memset for stack arrays without an initializer. */
         return;
     }
     Expr **slots = init_to_expr_slots(init, sym->dims, sym->dim_count, sym->total_slots);
+    bool fully_initialized = true;
     for (int i = 0; i < sym->total_slots; ++i) {
         if (slots[i] == NULL) {
+            fully_initialized = false;
+            break;
+        }
+    }
+    if (!fully_initialized) {
+        mem_zero_local_array(gen, sym);
+    }
+    for (int i = 0; i < sym->total_slots; ++i) {
+        if (slots[i] == NULL) {
+            continue;
+        }
+        if (!fully_initialized && mem_expr_is_literal_zero(slots[i], sym->value_type)) {
             continue;
         }
         IRValueList indices = {0};
@@ -3784,14 +4380,11 @@ static void mem_gen_decl(MemIRGen *gen, Decl *decl, bool is_global) {
         } else {
             sym->addr = mem_emit_alloca(gen, object_type);
             if (item->dims.count == 0) {
-                IRValue *init_value = decl->type == TYPE_FLOAT
-                                          ? mem_const_float(gen, float_bits_from_host(0.0f))
-                                          : mem_const_int(gen, 0);
                 if (item->init != NULL) {
                     MemValue value = mem_gen_expr(gen, item->init->expr);
-                    init_value = mem_ensure_type(gen, value, decl->type);
+                    IRValue *init_value = mem_ensure_type(gen, value, decl->type);
+                    mem_emit_store(gen, init_value, sym->addr);
                 }
-                mem_emit_store(gen, init_value, sym->addr);
             } else {
                 mem_init_local_array(gen, sym, item->init);
             }
@@ -5077,6 +5670,127 @@ static bool opt_basic_block(IRFunction *function, IRBasicBlock *block) {
     return changed;
 }
 
+static int opt_function_block_index(IRFunction *function, IRBasicBlock *block);
+
+static bool opt_simplify_const_branches(IRFunction *function) {
+    bool changed = false;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        IRInstruction *term = block->last_inst;
+        if (term == NULL || term->kind != IR_INST_BR || !term->data.br_inst.is_conditional) {
+            continue;
+        }
+        int cond = 0;
+        if (opt_const_int_value(term->data.br_inst.condition, &cond)) {
+            term->data.br_inst.is_conditional = false;
+            term->data.br_inst.condition = NULL;
+            term->data.br_inst.true_block = cond != 0
+                ? term->data.br_inst.true_block
+                : term->data.br_inst.false_block;
+            term->data.br_inst.false_block = NULL;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static void opt_rebuild_cfg(IRFunction *function) {
+    if (function == NULL) {
+        return;
+    }
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        block->pred_count = 0;
+        block->succ_count = 0;
+    }
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        IRInstruction *term = block->last_inst;
+        if (term == NULL || term->kind != IR_INST_BR) {
+            continue;
+        }
+        if (term->data.br_inst.is_conditional) {
+            mem_add_cfg_edge(block, term->data.br_inst.true_block);
+            mem_add_cfg_edge(block, term->data.br_inst.false_block);
+        } else {
+            mem_add_cfg_edge(block, term->data.br_inst.true_block);
+        }
+    }
+}
+
+static bool opt_remove_unreachable_blocks(IRFunction *function) {
+    if (function == NULL || function->entry == NULL || function->blocks.count == 0) {
+        return false;
+    }
+    opt_rebuild_cfg(function);
+    int n = function->blocks.count;
+    bool *reachable = (bool *)xmalloc(sizeof(bool) * n);
+    memset(reachable, 0, sizeof(bool) * n);
+    int *stack = (int *)xmalloc(sizeof(int) * n);
+    int top = 0;
+    int entry_index = opt_function_block_index(function, function->entry);
+    if (entry_index >= 0) {
+        reachable[entry_index] = true;
+        stack[top++] = entry_index;
+    }
+    while (top > 0) {
+        int idx = stack[--top];
+        IRBasicBlock *block = function->blocks.items[idx];
+        for (int si = 0; si < block->succ_count; ++si) {
+            int succ_index = opt_function_block_index(function, block->succs[si]);
+            if (succ_index >= 0 && !reachable[succ_index]) {
+                reachable[succ_index] = true;
+                stack[top++] = succ_index;
+            }
+        }
+    }
+    bool changed = false;
+    for (int bi = 0; bi < n; ++bi) {
+        if (reachable[bi]) {
+            IRBasicBlock *block = function->blocks.items[bi];
+            for (IRInstruction *phi = block->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+                int out = 0;
+                for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+                    int pred_index = opt_function_block_index(function, phi->data.phi_inst.blocks[i]);
+                    if (pred_index >= 0 && reachable[pred_index]) {
+                        phi->data.phi_inst.blocks[out] = phi->data.phi_inst.blocks[i];
+                        phi->data.phi_inst.values.items[out] = phi->data.phi_inst.values.items[i];
+                        ++out;
+                    } else {
+                        changed = true;
+                    }
+                }
+                phi->data.phi_inst.count = out;
+                phi->data.phi_inst.values.count = out;
+            }
+        }
+    }
+    int out_count = 0;
+    IRBasicBlock *prev = NULL;
+    for (int bi = 0; bi < n; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        if (!reachable[bi]) {
+            changed = true;
+            continue;
+        }
+        function->blocks.items[out_count++] = block;
+        if (prev != NULL) {
+            prev->next = block;
+        }
+        prev = block;
+    }
+    if (prev != NULL) {
+        prev->next = NULL;
+    }
+    function->blocks.count = out_count;
+    free(stack);
+    free(reachable);
+    if (changed) {
+        opt_rebuild_cfg(function);
+    }
+    return changed;
+}
+
 static bool opt_delete_dead_pure_insts(IRFunction *function) {
     bool changed = false;
     for (int bi = 0; bi < function->blocks.count; ++bi) {
@@ -5746,11 +6460,157 @@ static bool opt_delete_dead_scalar_memory(IRFunction *function) {
     return changed;
 }
 
+static bool opt_inst_dominates_inst(IRFunction *function, bool *dom,
+                                    IRInstruction *dominator, IRInstruction *inst);
+static bool opt_function_is_pure(IRFunction *function);
+
+static bool opt_function_memory_is_readonly_for_load_cse(IRFunction *function) {
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->kind == IR_INST_STORE) {
+                return false;
+            }
+            if (inst->kind == IR_INST_CALL && !opt_function_is_pure(inst->data.call_inst.callee)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool opt_load_same_address(IRInstruction *a, IRInstruction *b) {
+    return a != NULL && b != NULL
+        && a->kind == IR_INST_LOAD && b->kind == IR_INST_LOAD
+        && opt_type_equal(a->result_type, b->result_type)
+        && opt_value_equal(a->data.load_inst.ptr, b->data.load_inst.ptr);
+}
+
+static bool opt_readonly_load_cse(IRFunction *function) {
+    if (!opt_function_memory_is_readonly_for_load_cse(function)) {
+        return false;
+    }
+    bool changed = false;
+    bool *dom = opt_compute_dominators(function);
+    OptCSEntryList loads = {0};
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL;) {
+            IRInstruction *next = inst->next;
+            if (inst->kind != IR_INST_LOAD || inst->result_type == NULL
+                    || inst->result_type->kind == IR_TYPE_VOID) {
+                inst = next;
+                continue;
+            }
+            IRInstruction *existing = NULL;
+            for (int i = 0; i < loads.count; ++i) {
+                IRInstruction *candidate = loads.items[i].inst;
+                if (opt_load_same_address(candidate, inst)
+                        && opt_inst_dominates_inst(function, dom, candidate, inst)) {
+                    existing = candidate;
+                    break;
+                }
+            }
+            if (existing != NULL) {
+                opt_replace_all_uses(function, &inst->result, &existing->result);
+                opt_remove_inst(block, inst);
+                changed = true;
+            } else {
+                opt_cse_list_push(&loads, inst);
+            }
+            inst = next;
+        }
+    }
+    free(loads.items);
+    free(dom);
+    return changed;
+}
+
+static bool opt_global_cse(IRFunction *function) {
+    bool changed = false;
+    bool *dom = opt_compute_dominators(function);
+    OptCSEntryList cse = {0};
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL;) {
+            IRInstruction *next = inst->next;
+            bool eligible = opt_is_pure_inst(inst);
+            if (!eligible && inst->kind == IR_INST_CALL
+                    && inst->result_type != NULL
+                    && inst->result_type->kind != IR_TYPE_VOID
+                    && opt_function_is_pure(inst->data.call_inst.callee)) {
+                eligible = true;
+            }
+            if (!eligible) {
+                inst = next;
+                continue;
+            }
+            IRInstruction *existing = NULL;
+            for (int i = 0; i < cse.count; ++i) {
+                IRInstruction *candidate = cse.items[i].inst;
+                if (opt_inst_same_expr(candidate, inst)
+                        && opt_inst_dominates_inst(function, dom, candidate, inst)) {
+                    existing = candidate;
+                    break;
+                }
+            }
+            if (existing != NULL) {
+                opt_replace_all_uses(function, &inst->result, &existing->result);
+                opt_remove_inst(block, inst);
+                changed = true;
+            } else {
+                opt_cse_list_push(&cse, inst);
+            }
+            inst = next;
+        }
+    }
+    free(cse.items);
+    free(dom);
+    return changed;
+}
+
+
+static bool opt_block_local_load_cse(IRFunction *function, IRBasicBlock *block) {
+    bool changed = false;
+    OptCSEntryList loads = {0};
+    for (IRInstruction *inst = block->first_inst; inst != NULL;) {
+        IRInstruction *next = inst->next;
+        if (inst->kind == IR_INST_STORE || inst->kind == IR_INST_CALL) {
+            loads.count = 0;
+            inst = next;
+            continue;
+        }
+        if (inst->kind == IR_INST_LOAD && inst->result_type != NULL
+                && inst->result_type->kind != IR_TYPE_VOID) {
+            IRInstruction *existing = NULL;
+            for (int i = 0; i < loads.count; ++i) {
+                if (opt_load_same_address(loads.items[i].inst, inst)) {
+                    existing = loads.items[i].inst;
+                    break;
+                }
+            }
+            if (existing != NULL) {
+                opt_replace_all_uses(function, &inst->result, &existing->result);
+                opt_remove_inst(block, inst);
+                changed = true;
+            } else {
+                opt_cse_list_push(&loads, inst);
+            }
+        }
+        inst = next;
+    }
+    free(loads.items);
+    return changed;
+}
+
 static bool opt_global_memory_pass(IRFunction *function) {
     bool changed = false;
     changed = opt_mem2reg(function) || changed;
     changed = opt_promote_single_store_allocas(function) || changed;
+    changed = opt_global_cse(function) || changed;
+    changed = opt_readonly_load_cse(function) || changed;
     for (int bi = 0; bi < function->blocks.count; ++bi) {
+        changed = opt_block_local_load_cse(function, function->blocks.items[bi]) || changed;
         changed = opt_forward_loads_in_block(function, function->blocks.items[bi]) || changed;
     }
     changed = opt_delete_dead_scalar_memory(function) || changed;
@@ -5870,22 +6730,154 @@ static bool opt_value_list_invariant_for_loop(IRFunction *function, bool *in_loo
     return true;
 }
 
-static IRValue *opt_global_base_value(IRValue *value) {
+static IRModule *g_opt_alias_module = NULL;
+
+static IRValue *opt_base_object_value(IRValue *value) {
     if (value == NULL) {
         return NULL;
     }
-    if (value->kind == IR_VALUE_GLOBAL) {
+    if (value->kind == IR_VALUE_GLOBAL || value->kind == IR_VALUE_PARAM) {
         return value;
     }
-    if (value->kind == IR_VALUE_INSTRUCTION && value->data.instruction != NULL
-            && value->data.instruction->kind == IR_INST_GETELEMENTPTR) {
-        return opt_global_base_value(value->data.instruction->data.gep_inst.base_ptr);
+    if (value->kind == IR_VALUE_INSTRUCTION && value->data.instruction != NULL) {
+        IRInstruction *inst = value->data.instruction;
+        if (inst->kind == IR_INST_GETELEMENTPTR) {
+            return opt_base_object_value(inst->data.gep_inst.base_ptr);
+        }
+        if (inst->kind == IR_INST_BITCAST) {
+            return opt_base_object_value(inst->data.bitcast_inst.value);
+        }
+        if (inst->kind == IR_INST_ALLOCA) {
+            return value;
+        }
     }
     return NULL;
 }
 
-static bool opt_loop_stores_may_alias_global(IRFunction *function, bool *in_loop, IRValue *global_base) {
-    if (global_base == NULL) {
+static IRValue *opt_global_base_value(IRValue *value) {
+    IRValue *base = opt_base_object_value(value);
+    return base != NULL && base->kind == IR_VALUE_GLOBAL ? base : NULL;
+}
+
+static int opt_param_index_for_value(IRFunction *function, IRValue *value) {
+    if (function == NULL || value == NULL || value->kind != IR_VALUE_PARAM) {
+        return -1;
+    }
+    for (int i = 0; i < function->params.count; ++i) {
+        if (&function->params.items[i]->value == value) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool opt_actual_base_is_known_nonparam(IRValue *value, IRValue **base_out) {
+    IRValue *base = opt_base_object_value(value);
+    if (base == NULL || base->kind == IR_VALUE_PARAM) {
+        return false;
+    }
+    *base_out = base;
+    return true;
+}
+
+static bool opt_function_param_pair_noalias(IRFunction *function, int lhs_index, int rhs_index) {
+    if (g_opt_alias_module == NULL || function == NULL || lhs_index < 0 || rhs_index < 0 || lhs_index == rhs_index) {
+        return false;
+    }
+    bool saw_call = false;
+    for (int fi = 0; fi < g_opt_alias_module->functions.count; ++fi) {
+        IRFunction *scan_func = g_opt_alias_module->functions.items[fi];
+        if (scan_func == NULL || scan_func->is_external) {
+            continue;
+        }
+        for (int bi = 0; bi < scan_func->blocks.count; ++bi) {
+            IRBasicBlock *block = scan_func->blocks.items[bi];
+            for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+                if (inst->kind != IR_INST_CALL || inst->data.call_inst.callee != function) {
+                    continue;
+                }
+                saw_call = true;
+                if (lhs_index >= inst->data.call_inst.args.count || rhs_index >= inst->data.call_inst.args.count) {
+                    return false;
+                }
+                IRValue *lhs_base = NULL;
+                IRValue *rhs_base = NULL;
+                if (!opt_actual_base_is_known_nonparam(inst->data.call_inst.args.items[lhs_index], &lhs_base) ||
+                        !opt_actual_base_is_known_nonparam(inst->data.call_inst.args.items[rhs_index], &rhs_base) ||
+                        lhs_base == rhs_base) {
+                    return false;
+                }
+            }
+        }
+    }
+    return saw_call;
+}
+
+static bool opt_function_param_global_noalias(IRFunction *function, int param_index, IRValue *global_base) {
+    if (g_opt_alias_module == NULL || function == NULL || global_base == NULL ||
+            global_base->kind != IR_VALUE_GLOBAL || param_index < 0) {
+        return false;
+    }
+    bool saw_call = false;
+    for (int fi = 0; fi < g_opt_alias_module->functions.count; ++fi) {
+        IRFunction *scan_func = g_opt_alias_module->functions.items[fi];
+        if (scan_func == NULL || scan_func->is_external) {
+            continue;
+        }
+        for (int bi = 0; bi < scan_func->blocks.count; ++bi) {
+            IRBasicBlock *block = scan_func->blocks.items[bi];
+            for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+                if (inst->kind != IR_INST_CALL || inst->data.call_inst.callee != function) {
+                    continue;
+                }
+                saw_call = true;
+                if (param_index >= inst->data.call_inst.args.count) {
+                    return false;
+                }
+                IRValue *actual_base = NULL;
+                if (!opt_actual_base_is_known_nonparam(inst->data.call_inst.args.items[param_index], &actual_base) ||
+                        actual_base == global_base) {
+                    return false;
+                }
+            }
+        }
+    }
+    return saw_call;
+}
+
+static bool opt_base_values_may_alias(IRFunction *function, IRValue *a, IRValue *b) {
+    if (a == NULL || b == NULL) {
+        return true;
+    }
+    if (a == b) {
+        return true;
+    }
+    if (a->kind == IR_VALUE_GLOBAL && b->kind == IR_VALUE_GLOBAL) {
+        return false;
+    }
+    if (a->kind == IR_VALUE_INSTRUCTION && b->kind == IR_VALUE_INSTRUCTION) {
+        IRInstruction *ai = a->data.instruction;
+        IRInstruction *bi = b->data.instruction;
+        if (ai != NULL && bi != NULL && ai->kind == IR_INST_ALLOCA && bi->kind == IR_INST_ALLOCA) {
+            return false;
+        }
+    }
+    int ai = opt_param_index_for_value(function, a);
+    int bi = opt_param_index_for_value(function, b);
+    if (ai >= 0 && bi >= 0) {
+        return !opt_function_param_pair_noalias(function, ai, bi);
+    }
+    if (ai >= 0 && b->kind == IR_VALUE_GLOBAL) {
+        return !opt_function_param_global_noalias(function, ai, b);
+    }
+    if (bi >= 0 && a->kind == IR_VALUE_GLOBAL) {
+        return !opt_function_param_global_noalias(function, bi, a);
+    }
+    return true;
+}
+
+static bool opt_loop_stores_may_alias_base(IRFunction *function, bool *in_loop, IRValue *load_base) {
+    if (load_base == NULL) {
         return true;
     }
     for (int bi = 0; bi < function->blocks.count; ++bi) {
@@ -5900,8 +6892,8 @@ static bool opt_loop_stores_may_alias_global(IRFunction *function, bool *in_loop
             if (inst->kind != IR_INST_STORE) {
                 continue;
             }
-            IRValue *store_base = opt_global_base_value(inst->data.store_inst.ptr);
-            if (store_base == NULL || store_base == global_base) {
+            IRValue *store_base = opt_base_object_value(inst->data.store_inst.ptr);
+            if (opt_base_values_may_alias(function, load_base, store_base)) {
                 return true;
             }
         }
@@ -5916,11 +6908,11 @@ static bool opt_inst_loop_invariant(IRFunction *function, bool *in_loop, IRInstr
             && opt_value_list_invariant_for_loop(function, in_loop, &inst->data.call_inst.args);
     }
     if (inst->kind == IR_INST_LOAD) {
-        IRValue *global_base = opt_global_base_value(inst->data.load_inst.ptr);
+        IRValue *load_base = opt_base_object_value(inst->data.load_inst.ptr);
         return inst->result_type != NULL && inst->result_type->kind != IR_TYPE_VOID
             && opt_value_invariant_for_loop(function, in_loop, inst->data.load_inst.ptr)
-            && global_base != NULL
-            && !opt_loop_stores_may_alias_global(function, in_loop, global_base);
+            && load_base != NULL
+            && !opt_loop_stores_may_alias_base(function, in_loop, load_base);
     }
     if (!opt_loop_safe_pure_inst(inst)) {
         return false;
@@ -6886,7 +7878,6 @@ static bool opt_try_unroll_small_loop(IRFunction *function, bool *in_loop,
     return true;
 }
 
-__attribute__((unused))
 static bool opt_try_partial_unroll_loop(IRFunction *function, bool *in_loop,
                                         IRBasicBlock *header, IRBasicBlock *preheader,
                                         IRBasicBlock *latch) {
@@ -6963,14 +7954,14 @@ static bool opt_try_partial_unroll_loop(IRFunction *function, bool *in_loop,
     int trip_count = 0;
     if (!opt_const_int_value(iv.start_value, &start)
             || !opt_const_int_value(cmp->data.icmp_inst.rhs, &bound)
-            || !opt_compute_small_trip_count(cmp->data.icmp_inst.pred, start, bound, iv.step, 256, &trip_count)
-            || trip_count < 8) {
+            || !opt_compute_small_trip_count(cmp->data.icmp_inst.pred, start, bound, iv.step, 512, &trip_count)
+            || trip_count < 16) {
         return normalized;
     }
     int unroll_factor = 0;
-    if (trip_count % 8 == 0 && body_inst_count <= 16 && body_inst_count * 8 <= 128) {
+    if (trip_count % 8 == 0 && body_inst_count <= 10 && body_inst_count * 8 <= 80) {
         unroll_factor = 8;
-    } else if (trip_count % 4 == 0 && body_inst_count <= 24 && body_inst_count * 4 <= 128) {
+    } else if (trip_count % 4 == 0 && body_inst_count <= 12 && body_inst_count * 4 <= 64) {
         unroll_factor = 4;
     } else {
         return normalized;
@@ -7136,12 +8127,15 @@ static bool opt_simplify_function(IRFunction *function) {
     for (int bi = 0; bi < function->blocks.count; ++bi) {
         changed = opt_basic_block(function, function->blocks.items[bi]) || changed;
     }
+    changed = opt_simplify_const_branches(function) || changed;
+    changed = opt_remove_unreachable_blocks(function) || changed;
     changed = opt_delete_dead_pure_insts(function) || changed;
     changed = opt_delete_after_terminator(function) || changed;
     return changed;
 }
 
 static void optimize_ir(IRModule *module) {
+    g_opt_alias_module = module;
     for (int fi = 0; fi < module->functions.count; ++fi) {
         IRFunction *function = module->functions.items[fi];
         if (function->is_external) {
@@ -7680,9 +8674,11 @@ typedef struct {
     int max_outgoing_args;
     int phi_scratch_offset;
     int phi_scratch_slots;
+    int tail_scratch_offset;
+    int tail_scratch_slots;
     int phi_label_id;
-    int saved_reg_offsets[6];
-    bool used_saved_regs[6];
+    int saved_reg_offsets[11];
+    bool used_saved_regs[11];
     bool has_call;
     FILE *out;
 } RVFrame;
@@ -7695,7 +8691,10 @@ typedef struct {
     int score;
 } RVLoopRegCandidate;
 
-static const char *g_rv_loop_regs[] = {"s1", "s2", "s3", "s4", "s5", "s6"};
+static const char *g_rv_loop_regs[] = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
+#define RV_LOOP_REG_COUNT ((int)(sizeof(g_rv_loop_regs) / sizeof(g_rv_loop_regs[0])))
+static const char *g_rv_nocall_extra_regs[] = {"a4", "a5", "a6", "a7"};
+#define RV_NOCALL_EXTRA_REG_COUNT ((int)(sizeof(g_rv_nocall_extra_regs) / sizeof(g_rv_nocall_extra_regs[0])))
 
 enum {
     RV_MEMO_SLOT_COUNT = 1 << 16,
@@ -7717,8 +8716,7 @@ static bool rv_self_tail_call_shape(IRFunction *function, IRInstruction *inst) {
     if (function == NULL || inst == NULL || inst->kind != IR_INST_CALL
             || inst->data.call_inst.callee != function
             || inst->next == NULL || inst->next->kind != IR_INST_RET
-            || inst->data.call_inst.args.count != function->params.count
-            || inst->data.call_inst.args.count > 7) {
+            || inst->data.call_inst.args.count != function->params.count) {
         return false;
     }
     if (inst->result_type != NULL && inst->result_type->kind != IR_TYPE_VOID
@@ -7728,12 +8726,6 @@ static bool rv_self_tail_call_shape(IRFunction *function, IRInstruction *inst) {
     if ((inst->result_type == NULL || inst->result_type->kind == IR_TYPE_VOID)
             && inst->next->data.ret_inst.value != NULL) {
         return false;
-    }
-    for (int i = 0; i < function->params.count; ++i) {
-        IRParameter *param = function->params.items[i];
-        if (param->sysy_type == TYPE_FLOAT) {
-            return false;
-        }
     }
     return true;
 }
@@ -7749,6 +8741,23 @@ static bool rv_function_has_call(IRFunction *function) {
                 if (rv_self_tail_call_shape(function, inst)) {
                     continue;
                 }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+
+static bool rv_function_has_non_tail_self_call(IRFunction *function) {
+    if (function == NULL) {
+        return false;
+    }
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->kind == IR_INST_CALL && inst->data.call_inst.callee == function
+                    && !rv_self_tail_call_shape(function, inst)) {
                 return true;
             }
         }
@@ -7822,6 +8831,7 @@ static bool rv_function_all_self_calls_are_tail(IRFunction *function) {
 
 static bool rv_block_has_phi(IRBasicBlock *block);
 static bool rv_const_i32_value(IRValue *value, int *out_value);
+static void rv_emit_gep_to_reg(RVFrame *frame, IRInstruction *inst, const char *dst);
 
 static char *rv_block_label(IRFunction *function, IRBasicBlock *block) {
     return str_printf(".L_%s_%s", rv_symbol_name(function->name), block->name);
@@ -7919,7 +8929,7 @@ static void rv_add_reg_temp(RVFrame *frame, IRValue *value,
 }
 
 static int rv_saved_reg_index(const char *reg) {
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < RV_LOOP_REG_COUNT; ++i) {
         if (strcmp(g_rv_loop_regs[i], reg) == 0) {
             return i;
         }
@@ -7940,6 +8950,15 @@ static void rv_add_persistent_reg_home(RVFrame *frame, IRValue *value, const cha
     rv_add_reg_temp(frame, value, NULL, NULL, reg, true);
 }
 
+static bool rv_reg_reserved_by_persistent_home(RVFrame *frame, const char *reg) {
+    for (RVRegTemp *temp = frame->reg_temps; temp != NULL; temp = temp->next) {
+        if (temp->persistent && strcmp(temp->reg, reg) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int rv_value_slot_size(IRValue *value) {
     return rv_value_is_pointer(value) ? 8 : 4;
 }
@@ -7954,6 +8973,23 @@ static RVSlot *rv_add_value_slot(RVFrame *frame, IRValue *value) {
     slot->value = value;
     slot->value_size = rv_value_slot_size(value);
     slot->offset = rv_alloc_frame_bytes(frame, slot->value_size);
+    slot->object_offset = 0;
+    slot->object_size = 0;
+    slot->next = frame->slots;
+    frame->slots = slot;
+    return slot;
+}
+
+static RVSlot *rv_add_incoming_stack_param_slot(RVFrame *frame, IRValue *value, int offset) {
+    RVSlot *existing = rv_find_slot(frame, value);
+    if (existing != NULL) {
+        return existing;
+    }
+    RVSlot *slot = (RVSlot *)xmalloc(sizeof(RVSlot));
+    memset(slot, 0, sizeof(RVSlot));
+    slot->value = value;
+    slot->value_size = rv_value_slot_size(value);
+    slot->offset = offset;
     slot->object_offset = 0;
     slot->object_size = 0;
     slot->next = frame->slots;
@@ -8093,6 +9129,7 @@ static void rv_emit_and_i32_const(FILE *out, const char *dst, const char *src, i
 }
 
 static int rv_count_instruction_uses(IRInstruction *inst, IRValue *value);
+static int rv_count_function_uses(IRFunction *function, IRValue *value);
 
 static bool rv_inst_reg_temp_supported(IRInstruction *inst) {
     if (inst == NULL || inst->result_type == NULL ||
@@ -8131,9 +9168,9 @@ static bool rv_inst_reg_temp_supported(IRInstruction *inst) {
     }
 }
 
-static IRInstruction *rv_find_unique_use_in_block(IRFunction *function, IRValue *value,
-                                                  IRBasicBlock **out_block) {
-    IRInstruction *use_inst = NULL;
+static IRInstruction *rv_find_last_use_in_single_block(IRFunction *function, IRValue *value,
+                                                        IRBasicBlock **out_block) {
+    IRInstruction *last_use = NULL;
     IRBasicBlock *use_block = NULL;
     int count = 0;
     for (int bi = 0; bi < function->blocks.count; ++bi) {
@@ -8143,18 +9180,18 @@ static IRInstruction *rv_find_unique_use_in_block(IRFunction *function, IRValue 
             if (uses == 0) {
                 continue;
             }
-            count += uses;
-            use_inst = inst;
-            use_block = block;
-            if (count > 1) {
+            if (use_block != NULL && use_block != block) {
                 return NULL;
             }
+            count += uses;
+            use_block = block;
+            last_use = inst;
         }
     }
-    if (count == 1 && out_block != NULL) {
+    if (count > 0 && out_block != NULL) {
         *out_block = use_block;
     }
-    return count == 1 ? use_inst : NULL;
+    return count > 0 ? last_use : NULL;
 }
 
 static bool rv_has_call_between(IRInstruction *from, IRInstruction *to) {
@@ -8169,43 +9206,132 @@ static bool rv_has_call_between(IRInstruction *from, IRInstruction *to) {
     return false;
 }
 
+static IRInstruction *rv_block_terminator(IRBasicBlock *block) {
+    return block != NULL ? block->last_inst : NULL;
+}
+
+static bool rv_block_is_successor(IRBasicBlock *from, IRBasicBlock *to) {
+    if (from == NULL || to == NULL) {
+        return false;
+    }
+    for (int i = 0; i < from->succ_count; ++i) {
+        if (from->succs[i] == to) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rv_phi_has_incoming_from_block(IRInstruction *phi, IRBasicBlock *from, IRValue *value) {
+    if (phi == NULL || phi->kind != IR_INST_PHI || from == NULL || value == NULL) {
+        return false;
+    }
+    for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+        if (phi->data.phi_inst.blocks[i] == from && phi->data.phi_inst.values.items[i] == value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rv_value_only_used_by_successor_phis(IRFunction *function, IRBasicBlock *def_block,
+                                                 IRValue *value, IRInstruction **out_use) {
+    if (function == NULL || def_block == NULL || value == NULL) {
+        return false;
+    }
+    IRInstruction *terminator = rv_block_terminator(def_block);
+    if (terminator == NULL || (terminator->kind != IR_INST_BR && terminator->kind != IR_INST_RET)) {
+        return false;
+    }
+    int uses = 0;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *scan = block->first_inst; scan != NULL; scan = scan->next) {
+            int count = rv_count_instruction_uses(scan, value);
+            if (count == 0) {
+                continue;
+            }
+            if (scan->kind != IR_INST_PHI || !rv_block_is_successor(def_block, block) ||
+                    !rv_phi_has_incoming_from_block(scan, def_block, value)) {
+                return false;
+            }
+            uses += count;
+        }
+    }
+    if (uses <= 0) {
+        return false;
+    }
+    if (out_use != NULL) {
+        *out_use = terminator;
+    }
+    return true;
+}
+
 static bool rv_inst_can_be_reg_temp(IRFunction *function, IRBasicBlock *def_block,
                                     IRInstruction *inst, IRInstruction **out_use) {
     if (!rv_inst_reg_temp_supported(inst)) {
         return false;
     }
     IRBasicBlock *use_block = NULL;
-    IRInstruction *use_inst = rv_find_unique_use_in_block(function, &inst->result, &use_block);
-    if (use_inst == NULL || use_block != def_block || use_inst == inst ||
-            rv_has_call_between(inst, use_inst)) {
-        return false;
+    IRInstruction *use_inst = rv_find_last_use_in_single_block(function, &inst->result, &use_block);
+    if (use_inst != NULL && use_block == def_block && use_inst != inst &&
+            !rv_has_call_between(inst, use_inst)) {
+        *out_use = use_inst;
+        return true;
     }
-    *out_use = use_inst;
-    return true;
+    if (rv_value_only_used_by_successor_phis(function, def_block, &inst->result, &use_inst)
+            && !rv_has_call_between(inst, use_inst)) {
+        *out_use = use_inst;
+        return true;
+    }
+    return false;
 }
 
 static void rv_plan_reg_temps_for_block(RVFrame *frame, IRBasicBlock *block) {
-    static const char *int_regs[] = {"t3", "t4"};
-    static const char *float_regs[] = {"ft3", "ft4"};
-    IRValue *active_int[2] = {0};
-    IRValue *active_float[2] = {0};
+    enum { RV_LOCAL_INT_REGS = 8, RV_LOCAL_FLOAT_REGS = 8 };
+    static const char *int_regs[RV_LOCAL_INT_REGS] = {"t3", "t4", "a2", "a3", "a4", "a5", "a6", "a7"};
+    static const char *call_int_regs[2] = {"t3", "t4"};
+    static const char *float_regs[RV_LOCAL_FLOAT_REGS] = {"ft3", "ft4", "ft5", "ft6", "ft7", "fa2", "fa3", "fa4"};
+    IRValue *active_int[RV_LOCAL_INT_REGS] = {0};
+    IRValue *active_float[RV_LOCAL_FLOAT_REGS] = {0};
     for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
-        for (int i = 0; i < 2; ++i) {
-            if (active_int[i] != NULL && rv_count_instruction_uses(inst, active_int[i]) > 0) {
-                active_int[i] = NULL;
+        for (int i = 0; i < RV_LOCAL_INT_REGS; ++i) {
+            if (active_int[i] != NULL) {
+                RVRegTemp *temp = rv_find_reg_temp(frame, active_int[i]);
+                if ((temp != NULL && temp->use_inst == inst)
+                        || (temp == NULL && rv_count_instruction_uses(inst, active_int[i]) > 0)) {
+                    active_int[i] = NULL;
+                }
             }
-            if (active_float[i] != NULL && rv_count_instruction_uses(inst, active_float[i]) > 0) {
-                active_float[i] = NULL;
+        }
+        for (int i = 0; i < RV_LOCAL_FLOAT_REGS; ++i) {
+            if (active_float[i] != NULL) {
+                RVRegTemp *temp = rv_find_reg_temp(frame, active_float[i]);
+                if ((temp != NULL && temp->use_inst == inst)
+                        || (temp == NULL && rv_count_instruction_uses(inst, active_float[i]) > 0)) {
+                    active_float[i] = NULL;
+                }
             }
         }
         IRInstruction *use_inst = NULL;
         if (!rv_inst_can_be_reg_temp(frame->function, block, inst, &use_inst)) {
             continue;
         }
-        IRValue **active = rv_value_is_float(&inst->result) ? active_float : active_int;
-        const char **regs = rv_value_is_float(&inst->result) ? float_regs : int_regs;
-        for (int i = 0; i < 2; ++i) {
-            if (active[i] == NULL) {
+        bool is_float = rv_value_is_float(&inst->result);
+        IRValue **active = is_float ? active_float : active_int;
+        const char **regs = is_float ? float_regs : int_regs;
+        int reg_count = is_float ? RV_LOCAL_FLOAT_REGS : RV_LOCAL_INT_REGS;
+        if (use_inst != NULL && use_inst->kind == IR_INST_CALL) {
+            /* During call setup, integer and float argument registers are filled left-to-right.
+               Keep call-argument temporaries in t3/t4 or ft3/ft4 so they cannot be
+               overwritten before a later argument reads them. */
+            if (!is_float) {
+                regs = call_int_regs;
+            }
+            reg_count = reg_count < 2 ? reg_count : 2;
+        }
+        for (int i = 0; i < reg_count; ++i) {
+            if (active[i] == NULL && !rv_reg_reserved_by_persistent_home(frame, regs[i])) {
                 active[i] = &inst->result;
                 rv_add_reg_temp(frame, &inst->result, inst, use_inst, regs[i], false);
                 break;
@@ -8281,7 +9407,7 @@ static bool rv_block_dominates(IRFunction *function, bool *dom,
                                IRBasicBlock *dominator, IRBasicBlock *block) {
     int a = opt_function_block_index(function, dominator);
     int b = opt_function_block_index(function, block);
-    return a >= 0 && b >= 0 && dom[a * function->blocks.count + b];
+    return a >= 0 && b >= 0 && dom[b * function->blocks.count + a];
 }
 
 static bool rv_value_is_loop_invariant_candidate(IRFunction *function, bool *dom, bool *in_loop,
@@ -8386,6 +9512,9 @@ static bool rv_phi_update_coalesce_safe(IRFunction *function, bool *dom,
 }
 
 static void rv_plan_loop_reg_homes(RVFrame *frame, IRFunction *function) {
+    if (rv_function_has_non_tail_self_call(function)) {
+        return;
+    }
     RVLoopRegCandidate *candidates = NULL;
     int candidate_count = 0;
     int candidate_capacity = 0;
@@ -8496,17 +9625,27 @@ static void rv_plan_loop_reg_homes(RVFrame *frame, IRFunction *function) {
                             continue;
                         }
                         int loop_uses = rv_count_loop_uses(function, in_loop, &inst->result);
-                        if (loop_uses < 2) {
+                        bool preheader_single_use_hot_value =
+                            block == preheader &&
+                            (inst->kind == IR_INST_LOAD ||
+                             inst->kind == IR_INST_ADD ||
+                             inst->kind == IR_INST_SUB ||
+                             inst->kind == IR_INST_MUL ||
+                             inst->kind == IR_INST_GETELEMENTPTR ||
+                             inst->kind == IR_INST_BITCAST);
+                        if (loop_uses < (preheader_single_use_hot_value ? 1 : 2)) {
                             continue;
                         }
                         int score = loop_uses * 12 + loop_blocks * 3;
                         if (block == preheader) {
-                            score += 12;
+                            score += preheader_single_use_hot_value ? 40 : 12;
                         }
                         if (inst->kind == IR_INST_GETELEMENTPTR || inst->kind == IR_INST_BITCAST) {
-                            score += 10;
+                            score += 18;
                         } else if (inst->kind == IR_INST_LOAD) {
-                            score += 6;
+                            score += 48;
+                        } else if (inst->kind == IR_INST_ADD || inst->kind == IR_INST_SUB || inst->kind == IR_INST_MUL) {
+                            score += 20;
                         }
                         rv_candidate_list_push(&candidates, &candidate_count, &candidate_capacity,
                                                &inst->result, NULL, NULL, NULL, score);
@@ -8514,6 +9653,54 @@ static void rv_plan_loop_reg_homes(RVFrame *frame, IRFunction *function) {
                 }
             }
             free(in_loop);
+        }
+    }
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *phi = block->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+            if (!rv_value_can_have_persistent_reg_home(&phi->result)) {
+                continue;
+            }
+            int uses = rv_count_function_uses(function, &phi->result);
+            if (uses < 3) {
+                continue;
+            }
+            int score = uses * 18 + block->pred_count * 3;
+            rv_candidate_list_push(&candidates, &candidate_count, &candidate_capacity,
+                                   &phi->result, phi, NULL, NULL, score);
+        }
+    }
+    for (int i = 0; i < function->params.count; ++i) {
+        IRValue *value = &function->params.items[i]->value;
+        if (!rv_value_can_have_persistent_reg_home(value)) {
+            continue;
+        }
+        int uses = rv_count_function_uses(function, value);
+        if (uses >= 6) {
+            rv_candidate_list_push(&candidates, &candidate_count, &candidate_capacity,
+                                   value, NULL, NULL, NULL, uses * 12 + 8);
+        }
+    }
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            if (!rv_value_can_have_persistent_reg_home(&inst->result)) {
+                continue;
+            }
+            int uses = rv_count_function_uses(function, &inst->result);
+            if (uses < 5) {
+                continue;
+            }
+            int score = uses * 14;
+            if (inst->kind == IR_INST_LOAD) {
+                score += 48;
+            } else if (inst->kind == IR_INST_GETELEMENTPTR || inst->kind == IR_INST_BITCAST) {
+                score += 20;
+            } else if (inst->kind == IR_INST_MUL || inst->kind == IR_INST_ADD || inst->kind == IR_INST_SUB) {
+                score += 8;
+            }
+            rv_candidate_list_push(&candidates, &candidate_count, &candidate_capacity,
+                                   &inst->result, NULL, NULL, NULL, score);
         }
     }
     for (int i = 0; i < candidate_count; ++i) {
@@ -8525,7 +9712,7 @@ static void rv_plan_loop_reg_homes(RVFrame *frame, IRFunction *function) {
             }
         }
     }
-    int assign_count = candidate_count < 6 ? candidate_count : 6;
+    int assign_count = candidate_count < RV_LOOP_REG_COUNT ? candidate_count : RV_LOOP_REG_COUNT;
     for (int i = 0; i < assign_count; ++i) {
         const char *reg = g_rv_loop_regs[i];
         rv_add_persistent_reg_home(frame, candidates[i].value, reg);
@@ -8549,12 +9736,23 @@ static void rv_plan_reg_temps(RVFrame *frame, IRFunction *function) {
     }
 }
 
+static bool rv_gep_is_folded_into_memory(RVFrame *frame, IRInstruction *gep);
+static bool rv_gep_recomputable_for_memory(IRFunction *function, IRInstruction *gep);
+static bool rv_icmp_only_feeds_own_branch(IRFunction *function, IRInstruction *inst);
+
 static bool rv_inst_needs_result_slot(RVFrame *frame, IRInstruction *inst) {
-    (void)frame;
     if (inst->result_type == NULL || inst->result_type->kind == IR_TYPE_VOID) {
         return false;
     }
     if (rv_find_reg_temp(frame, &inst->result) != NULL) {
+        return false;
+    }
+    if (inst->kind == IR_INST_GETELEMENTPTR
+            && (rv_gep_is_folded_into_memory(frame, inst)
+                || rv_gep_recomputable_for_memory(frame->function, inst))) {
+        return false;
+    }
+    if (inst->kind == IR_INST_ICMP && rv_icmp_only_feeds_own_branch(frame->function, inst)) {
         return false;
     }
     return true;
@@ -8592,6 +9790,8 @@ static void rv_store_float_slot(RVFrame *frame, IRValue *value, const char *reg)
         rv_emit_mem(frame->out, "fsw", reg, slot->offset, "s0");
     }
 }
+
+static void rv_load_float_value(RVFrame *frame, IRValue *value, const char *freg);
 
 static void rv_load_int_value(RVFrame *frame, IRValue *value, const char *reg) {
     FILE *out = frame->out;
@@ -8644,6 +9844,28 @@ static void rv_load_int_value(RVFrame *frame, IRValue *value, const char *reg) {
     fprintf(out, "  li %s, 0\n", reg);
 }
 
+static const char *rv_int_value_read_reg(RVFrame *frame, IRValue *value, const char *scratch) {
+    int const_value = 0;
+    if (rv_const_i32_value(value, &const_value) && const_value == 0) {
+        return "zero";
+    }
+    RVRegTemp *temp = rv_find_reg_temp(frame, value);
+    if (temp != NULL) {
+        return temp->reg;
+    }
+    rv_load_int_value(frame, value, scratch);
+    return scratch;
+}
+
+static const char *rv_float_value_read_reg(RVFrame *frame, IRValue *value, const char *scratch) {
+    RVRegTemp *temp = rv_find_reg_temp(frame, value);
+    if (temp != NULL) {
+        return temp->reg;
+    }
+    rv_load_float_value(frame, value, scratch);
+    return scratch;
+}
+
 static void rv_load_float_value(RVFrame *frame, IRValue *value, const char *freg) {
     FILE *out = frame->out;
     if (value == NULL) {
@@ -8660,8 +9882,12 @@ static void rv_load_float_value(RVFrame *frame, IRValue *value, const char *freg
         return;
     }
     if (value->kind == IR_VALUE_CONST_INT) {
-        fprintf(out, "  li t6, %d\n", value->data.int_value);
-        fprintf(out, "  fcvt.s.w %s, t6\n", freg);
+        if (value->data.int_value == 0) {
+            fprintf(out, "  fmv.w.x %s, zero\n", freg);
+        } else {
+            fprintf(out, "  li t6, %d\n", value->data.int_value);
+            fprintf(out, "  fcvt.s.w %s, t6\n", freg);
+        }
         return;
     }
     RVRegTemp *temp = rv_find_reg_temp(frame, value);
@@ -8743,14 +9969,58 @@ static int rv_block_phi_count(RVFrame *frame, IRBasicBlock *block) {
     return count;
 }
 
+static int rv_param_incoming_stack_offset(IRFunction *function, int param_index) {
+    int int_regs = 0;
+    int float_regs = 0;
+    int stack_slots = 0;
+    for (int i = 0; i <= param_index; ++i) {
+        IRParameter *param = function->params.items[i];
+        bool is_float = param->type != NULL && param->type->kind == IR_TYPE_FLOAT;
+        if (is_float) {
+            if (float_regs < 8) {
+                float_regs++;
+            } else {
+                if (i == param_index) {
+                    return stack_slots * 8;
+                }
+                stack_slots++;
+            }
+        } else {
+            if (int_regs < 8) {
+                int_regs++;
+            } else {
+                if (i == param_index) {
+                    return stack_slots * 8;
+                }
+                stack_slots++;
+            }
+        }
+    }
+    return INT_MIN;
+}
+
+static bool rv_slot_is_incoming_stack_param(RVFrame *frame, IRValue *value) {
+    if (value == NULL || value->kind != IR_VALUE_PARAM) {
+        return false;
+    }
+    RVSlot *slot = rv_find_slot(frame, value);
+    return slot != NULL && slot->offset >= 0;
+}
+
 static void rv_prepare_frame(RVFrame *frame, IRFunction *function) {
     memset(frame, 0, sizeof(RVFrame));
     frame->function = function;
     frame->has_call = rv_function_has_call(function);
     frame->next_offset = frame->has_call ? -16 : -8;
     rv_plan_reg_temps(frame, function);
+    bool self_tail_params_need_local_slots = rv_function_all_self_calls_are_tail(function);
     for (int i = 0; i < function->params.count; ++i) {
-        rv_add_value_slot(frame, &function->params.items[i]->value);
+        int stack_offset = rv_param_incoming_stack_offset(function, i);
+        if (stack_offset != INT_MIN) {
+            rv_add_incoming_stack_param_slot(frame, &function->params.items[i]->value, stack_offset);
+        } else {
+            rv_add_value_slot(frame, &function->params.items[i]->value);
+        }
     }
     for (int bi = 0; bi < function->blocks.count; ++bi) {
         IRBasicBlock *block = function->blocks.items[bi];
@@ -8766,7 +10036,7 @@ static void rv_prepare_frame(RVFrame *frame, IRFunction *function) {
                     slot->object_offset = rv_alloc_frame_bytes(frame, slot->object_size);
                 }
             }
-            if (inst->kind == IR_INST_CALL) {
+            if (inst->kind == IR_INST_CALL && !rv_self_tail_call_shape(function, inst)) {
                 int outgoing = rv_call_stack_slots(inst) * 8;
                 if (outgoing > frame->max_outgoing_args) {
                     frame->max_outgoing_args = outgoing;
@@ -8777,13 +10047,19 @@ static void rv_prepare_frame(RVFrame *frame, IRFunction *function) {
     if (frame->phi_scratch_slots > 0) {
         frame->phi_scratch_offset = rv_alloc_frame_bytes(frame, frame->phi_scratch_slots * 8);
     }
-    for (int i = 0; i < 6; ++i) {
+    if (self_tail_params_need_local_slots && function->params.count > 0) {
+        frame->tail_scratch_slots = function->params.count;
+        frame->tail_scratch_offset = rv_alloc_frame_bytes(frame, frame->tail_scratch_slots * 8);
+    }
+    for (int i = 0; i < RV_LOOP_REG_COUNT; ++i) {
         if (frame->used_saved_regs[i]) {
             frame->saved_reg_offsets[i] = rv_alloc_frame_bytes(frame, 8);
         }
     }
     frame->frame_size = align_to(-frame->next_offset + frame->max_outgoing_args, 16);
 }
+
+static bool rv_initializer_is_zero(IRInitializer *init);
 
 static void rv_emit_global_init(FILE *out, IRInitializer *init, IRType *type) {
     if (init == NULL || init->kind == IR_INIT_ZERO) {
@@ -8797,12 +10073,26 @@ static void rv_emit_global_init(FILE *out, IRInitializer *init, IRType *type) {
         case IR_INIT_FLOAT:
             fprintf(out, "  .word %d\n", init->data.float_bits);
             return;
-        case IR_INIT_ARRAY:
+        case IR_INIT_ARRAY: {
+            int zero_bytes = 0;
             for (int i = 0; i < init->data.array.count; ++i) {
-                rv_emit_global_init(out, init->data.array.items[i],
-                                    init->data.array.items[i]->type);
+                IRInitializer *item = init->data.array.items[i];
+                int item_size = rv_type_size(item->type);
+                if (rv_initializer_is_zero(item)) {
+                    zero_bytes += item_size;
+                    continue;
+                }
+                if (zero_bytes > 0) {
+                    fprintf(out, "  .zero %d\n", zero_bytes);
+                    zero_bytes = 0;
+                }
+                rv_emit_global_init(out, item, item->type);
+            }
+            if (zero_bytes > 0) {
+                fprintf(out, "  .zero %d\n", zero_bytes);
             }
             return;
+        }
         case IR_INIT_STRING:
             fprintf(out, "  .zero %d\n", init->data.string.length);
             return;
@@ -8853,7 +10143,11 @@ static void rv_emit_globals(IRModule *module, FILE *out) {
         }
         fprintf(out, "  .globl %s\n  .align 3\n%s:\n",
                 rv_symbol_name(global->name), rv_symbol_name(global->name));
-        rv_emit_global_init(out, global->initializer, global->type);
+        if (is_zero) {
+            fprintf(out, "  .zero %d\n", rv_type_size(global->type));
+        } else {
+            rv_emit_global_init(out, global->initializer, global->type);
+        }
     }
 }
 
@@ -8882,34 +10176,153 @@ static void rv_emit_memo_globals(IRModule *module, FILE *out) {
     }
 }
 
+static bool rv_memory_inst_uses_ptr(IRInstruction *inst, IRValue *ptr) {
+    if (inst == NULL || ptr == NULL) {
+        return false;
+    }
+    if (inst->kind == IR_INST_LOAD) {
+        return inst->data.load_inst.ptr == ptr;
+    }
+    if (inst->kind == IR_INST_STORE) {
+        return inst->data.store_inst.ptr == ptr;
+    }
+    return false;
+}
+
+static IRInstruction *rv_single_memory_user_of_value(IRFunction *function, IRValue *value) {
+    IRInstruction *user = NULL;
+    int total_uses = 0;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            int uses = rv_count_instruction_uses(inst, value);
+            if (uses == 0) {
+                continue;
+            }
+            total_uses += uses;
+            if (uses == 1 && rv_memory_inst_uses_ptr(inst, value)) {
+                user = inst;
+            } else {
+                return NULL;
+            }
+            if (total_uses > 1) {
+                return NULL;
+            }
+        }
+    }
+    return total_uses == 1 ? user : NULL;
+}
+
+static bool rv_can_fold_gep_into_user(RVFrame *frame, IRInstruction *gep, IRInstruction *user) {
+    if (frame == NULL || gep == NULL || user == NULL || gep->kind != IR_INST_GETELEMENTPTR) {
+        return false;
+    }
+    if (!rv_memory_inst_uses_ptr(user, &gep->result)) {
+        return false;
+    }
+    if (gep->parent != user->parent || !opt_inst_before_in_block(gep, user)) {
+        return false;
+    }
+    return rv_single_memory_user_of_value(frame->function, &gep->result) == user;
+}
+
+static bool rv_gep_is_folded_into_memory(RVFrame *frame, IRInstruction *gep) {
+    IRInstruction *user = rv_single_memory_user_of_value(frame->function, &gep->result);
+    return user != NULL && rv_can_fold_gep_into_user(frame, gep, user);
+}
+
+static IRInstruction *rv_unique_user_of_value(IRFunction *function, IRValue *value) {
+    IRInstruction *user = NULL;
+    int total_uses = 0;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            int uses = rv_count_instruction_uses(inst, value);
+            if (uses == 0) {
+                continue;
+            }
+            total_uses += uses;
+            user = inst;
+            if (total_uses > 1) {
+                return NULL;
+            }
+        }
+    }
+    return total_uses == 1 ? user : NULL;
+}
+
+static bool rv_icmp_only_feeds_own_branch(IRFunction *function, IRInstruction *inst) {
+    if (function == NULL || inst == NULL || inst->kind != IR_INST_ICMP
+            || inst->result_type == NULL || inst->next == NULL
+            || inst->next->kind != IR_INST_BR
+            || !inst->next->data.br_inst.is_conditional
+            || inst->next->data.br_inst.condition != &inst->result) {
+        return false;
+    }
+    /* Only rematerialize the compare at its immediately following branch.
+       This preserves operand liveness for short-lived register temporaries and
+       avoids allocating/spilling a boolean just to branch on it. */
+    return rv_count_function_uses(function, &inst->result) == 1;
+}
+
+static const char *rv_emit_address_value_reg(RVFrame *frame, IRInstruction *user,
+                                                IRValue *ptr, const char *scratch) {
+    if (ptr != NULL && ptr->kind == IR_VALUE_INSTRUCTION) {
+        IRInstruction *def = ptr->data.instruction;
+        if (rv_can_fold_gep_into_user(frame, def, user)
+                || rv_gep_recomputable_for_memory(frame->function, def)) {
+            rv_emit_gep_to_reg(frame, def, scratch);
+            return scratch;
+        }
+    }
+    RVRegTemp *temp = rv_find_reg_temp(frame, ptr);
+    if (temp != NULL) {
+        return temp->reg;
+    }
+    rv_load_int_value(frame, ptr, scratch);
+    return scratch;
+}
+
+static void rv_emit_address_value(RVFrame *frame, IRInstruction *user, IRValue *ptr, const char *reg) {
+    const char *actual = rv_emit_address_value_reg(frame, user, ptr, reg);
+    if (strcmp(actual, reg) != 0) {
+        fprintf(frame->out, "  mv %s, %s\n", reg, actual);
+    }
+}
+
 static void rv_emit_load_inst(RVFrame *frame, IRInstruction *inst) {
     FILE *out = frame->out;
-    rv_load_int_value(frame, inst->data.load_inst.ptr, "t0");
+    const char *addr = rv_emit_address_value_reg(frame, inst, inst->data.load_inst.ptr, "t0");
     if (rv_value_is_float(&inst->result)) {
-        rv_emit_mem(out, "flw", "ft0", 0, "t0");
-        rv_store_float_slot(frame, &inst->result, "ft0");
-    } else if (rv_value_is_pointer(&inst->result)) {
-        rv_emit_mem(out, "ld", "t1", 0, "t0");
-        rv_store_int_slot(frame, &inst->result, "t1");
+        const char *dst = rv_value_reg_home(frame, &inst->result);
+        if (dst == NULL) {
+            dst = "ft0";
+        }
+        rv_emit_mem(out, "flw", dst, 0, addr);
+        rv_store_float_slot(frame, &inst->result, dst);
     } else {
-        rv_emit_mem(out, "lw", "t1", 0, "t0");
-        rv_store_int_slot(frame, &inst->result, "t1");
+        const char *dst = rv_value_reg_home(frame, &inst->result);
+        if (dst == NULL) {
+            dst = "t1";
+        }
+        rv_emit_mem(out, rv_value_is_pointer(&inst->result) ? "ld" : "lw", dst, 0, addr);
+        rv_store_int_slot(frame, &inst->result, dst);
     }
 }
 
 static void rv_emit_store_inst(RVFrame *frame, IRInstruction *inst) {
     FILE *out = frame->out;
     IRValue *value = inst->data.store_inst.value;
-    rv_load_int_value(frame, inst->data.store_inst.ptr, "t0");
+    const char *addr = rv_emit_address_value_reg(frame, inst, inst->data.store_inst.ptr, "t0");
     if (rv_value_is_float(value)) {
-        rv_load_float_value(frame, value, "ft0");
-        rv_emit_mem(out, "fsw", "ft0", 0, "t0");
+        const char *src = rv_float_value_read_reg(frame, value, "ft0");
+        rv_emit_mem(out, "fsw", src, 0, addr);
     } else if (rv_value_is_pointer(value)) {
-        rv_load_int_value(frame, value, "t1");
-        rv_emit_mem(out, "sd", "t1", 0, "t0");
+        const char *src = rv_int_value_read_reg(frame, value, "t1");
+        rv_emit_mem(out, "sd", src, 0, addr);
     } else {
-        rv_load_int_value(frame, value, "t1");
-        rv_emit_mem(out, "sw", "t1", 0, "t0");
+        const char *src = rv_int_value_read_reg(frame, value, "t1");
+        rv_emit_mem(out, "sw", src, 0, addr);
     }
 }
 
@@ -8918,34 +10331,34 @@ static void rv_emit_int_binary_to_reg(RVFrame *frame, IRInstruction *inst, const
     int rhs_const = 0;
     int lhs_const = 0;
     if (inst->kind == IR_INST_ADD && rv_const_i32_value(inst->data.binary_inst.rhs, &rhs_const) && rv_imm12(rhs_const)) {
-        rv_load_int_value(frame, inst->data.binary_inst.lhs, dst);
-        fprintf(out, "  addiw %s, %s, %d\n", dst, dst, rhs_const);
+        const char *src = rv_int_value_read_reg(frame, inst->data.binary_inst.lhs, dst);
+        fprintf(out, "  addiw %s, %s, %d\n", dst, src, rhs_const);
         return;
     }
     if (inst->kind == IR_INST_ADD && rv_const_i32_value(inst->data.binary_inst.lhs, &lhs_const) && rv_imm12(lhs_const)) {
-        rv_load_int_value(frame, inst->data.binary_inst.rhs, dst);
-        fprintf(out, "  addiw %s, %s, %d\n", dst, dst, lhs_const);
+        const char *src = rv_int_value_read_reg(frame, inst->data.binary_inst.rhs, dst);
+        fprintf(out, "  addiw %s, %s, %d\n", dst, src, lhs_const);
         return;
     }
     if (inst->kind == IR_INST_SUB && rv_const_i32_value(inst->data.binary_inst.rhs, &rhs_const)
             && rhs_const != INT_MIN && rv_imm12(-rhs_const)) {
-        rv_load_int_value(frame, inst->data.binary_inst.lhs, dst);
-        fprintf(out, "  addiw %s, %s, %d\n", dst, dst, -rhs_const);
+        const char *src = rv_int_value_read_reg(frame, inst->data.binary_inst.lhs, dst);
+        fprintf(out, "  addiw %s, %s, %d\n", dst, src, -rhs_const);
         return;
     }
     if (inst->kind == IR_INST_MUL && rv_const_i32_value(inst->data.binary_inst.rhs, &rhs_const)) {
         int shift = rv_pow2_shift(rhs_const);
         if (shift >= 0) {
-            rv_load_int_value(frame, inst->data.binary_inst.lhs, dst);
-            fprintf(out, "  slliw %s, %s, %d\n", dst, dst, shift);
+            const char *src = rv_int_value_read_reg(frame, inst->data.binary_inst.lhs, dst);
+            fprintf(out, "  slliw %s, %s, %d\n", dst, src, shift);
             return;
         }
     }
     if (inst->kind == IR_INST_MUL && rv_const_i32_value(inst->data.binary_inst.lhs, &lhs_const)) {
         int shift = rv_pow2_shift(lhs_const);
         if (shift >= 0) {
-            rv_load_int_value(frame, inst->data.binary_inst.rhs, dst);
-            fprintf(out, "  slliw %s, %s, %d\n", dst, dst, shift);
+            const char *src = rv_int_value_read_reg(frame, inst->data.binary_inst.rhs, dst);
+            fprintf(out, "  slliw %s, %s, %d\n", dst, src, shift);
             return;
         }
     }
@@ -8956,7 +10369,9 @@ static void rv_emit_int_binary_to_reg(RVFrame *frame, IRInstruction *inst, const
             rv_load_int_value(frame, inst->data.binary_inst.lhs, "t0");
             if (shift == 0) {
                 if (rhs_const > 0) {
-                    fprintf(out, "  mv %s, t0\n", dst);
+                    if (strcmp(dst, "t0") != 0) {
+                        fprintf(out, "  mv %s, t0\n", dst);
+                    }
                 } else {
                     fprintf(out, "  negw %s, t0\n", dst);
                 }
@@ -8967,7 +10382,9 @@ static void rv_emit_int_binary_to_reg(RVFrame *frame, IRInstruction *inst, const
             fprintf(out, "  addw t0, t0, t1\n");
             fprintf(out, "  sraiw t0, t0, %d\n", shift);
             if (rhs_const > 0) {
-                fprintf(out, "  mv %s, t0\n", dst);
+                if (strcmp(dst, "t0") != 0) {
+                    fprintf(out, "  mv %s, t0\n", dst);
+                }
             } else {
                 fprintf(out, "  negw %s, t0\n", dst);
             }
@@ -9004,25 +10421,35 @@ static void rv_emit_int_binary_to_reg(RVFrame *frame, IRInstruction *inst, const
             return;
         }
     }
-    rv_load_int_value(frame, inst->data.binary_inst.lhs, "t0");
-    rv_load_int_value(frame, inst->data.binary_inst.rhs, "t1");
-    fprintf(out, "  %s %s, t0, t1\n", op, dst);
+    const char *lhs_reg = rv_int_value_read_reg(frame, inst->data.binary_inst.lhs, "t0");
+    const char *rhs_scratch = strcmp(lhs_reg, "t1") == 0 ? "t0" : "t1";
+    const char *rhs_reg = rv_int_value_read_reg(frame, inst->data.binary_inst.rhs, rhs_scratch);
+    fprintf(out, "  %s %s, %s, %s\n", op, dst, lhs_reg, rhs_reg);
 }
 
 static void rv_emit_int_binary(RVFrame *frame, IRInstruction *inst, const char *op) {
     if (!rv_inst_has_result_home(frame, inst)) {
         return;
     }
-    rv_emit_int_binary_to_reg(frame, inst, op, "t2");
-    rv_store_int_slot(frame, &inst->result, "t2");
+    const char *dst = rv_value_reg_home(frame, &inst->result);
+    if (dst == NULL) {
+        dst = "t2";
+    }
+    rv_emit_int_binary_to_reg(frame, inst, op, dst);
+    rv_store_int_slot(frame, &inst->result, dst);
 }
 
 static void rv_emit_float_binary(RVFrame *frame, IRInstruction *inst, const char *op) {
     FILE *out = frame->out;
-    rv_load_float_value(frame, inst->data.binary_inst.lhs, "ft0");
-    rv_load_float_value(frame, inst->data.binary_inst.rhs, "ft1");
-    fprintf(out, "  %s ft2, ft0, ft1\n", op);
-    rv_store_float_slot(frame, &inst->result, "ft2");
+    const char *dst = rv_value_reg_home(frame, &inst->result);
+    if (dst == NULL) {
+        dst = "ft2";
+    }
+    const char *lhs = rv_float_value_read_reg(frame, inst->data.binary_inst.lhs, "ft0");
+    const char *rhs_scratch = strcmp(lhs, "ft1") == 0 ? "ft0" : "ft1";
+    const char *rhs = rv_float_value_read_reg(frame, inst->data.binary_inst.rhs, rhs_scratch);
+    fprintf(out, "  %s %s, %s, %s\n", op, dst, lhs, rhs);
+    rv_store_float_slot(frame, &inst->result, dst);
 }
 
 static void rv_emit_icmp_to_reg(RVFrame *frame, IRInstruction *inst, const char *dst) {
@@ -9030,67 +10457,68 @@ static void rv_emit_icmp_to_reg(RVFrame *frame, IRInstruction *inst, const char 
     int rhs_const = 0;
     if (rv_const_i32_value(inst->data.icmp_inst.rhs, &rhs_const)) {
         if (rhs_const == 0) {
-            rv_load_int_value(frame, inst->data.icmp_inst.lhs, "t0");
+            const char *src = rv_int_value_read_reg(frame, inst->data.icmp_inst.lhs, "t0");
             switch (inst->data.icmp_inst.pred) {
                 case IR_ICMP_EQ:
-                    fprintf(out, "  seqz %s, t0\n", dst);
+                    fprintf(out, "  seqz %s, %s\n", dst, src);
                     return;
                 case IR_ICMP_NE:
-                    fprintf(out, "  snez %s, t0\n", dst);
+                    fprintf(out, "  snez %s, %s\n", dst, src);
                     return;
                 default:
                     break;
             }
         }
         if (rv_imm12(rhs_const)) {
-            rv_load_int_value(frame, inst->data.icmp_inst.lhs, "t0");
+            const char *src = rv_int_value_read_reg(frame, inst->data.icmp_inst.lhs, "t0");
             switch (inst->data.icmp_inst.pred) {
                 case IR_ICMP_SLT:
-                    fprintf(out, "  slti %s, t0, %d\n", dst, rhs_const);
+                    fprintf(out, "  slti %s, %s, %d\n", dst, src, rhs_const);
                     return;
                 case IR_ICMP_SGE:
-                    fprintf(out, "  slti %s, t0, %d\n  xori %s, %s, 1\n",
-                            dst, rhs_const, dst, dst);
+                    fprintf(out, "  slti %s, %s, %d\n  xori %s, %s, 1\n",
+                            dst, src, rhs_const, dst, dst);
                     return;
                 default:
                     break;
             }
         }
         if (rhs_const < INT_MAX && rv_imm12(rhs_const + 1)) {
-            rv_load_int_value(frame, inst->data.icmp_inst.lhs, "t0");
+            const char *src = rv_int_value_read_reg(frame, inst->data.icmp_inst.lhs, "t0");
             switch (inst->data.icmp_inst.pred) {
                 case IR_ICMP_SLE:
-                    fprintf(out, "  slti %s, t0, %d\n", dst, rhs_const + 1);
+                    fprintf(out, "  slti %s, %s, %d\n", dst, src, rhs_const + 1);
                     return;
                 case IR_ICMP_SGT:
-                    fprintf(out, "  slti %s, t0, %d\n  xori %s, %s, 1\n",
-                            dst, rhs_const + 1, dst, dst);
+                    fprintf(out, "  slti %s, %s, %d\n  xori %s, %s, 1\n",
+                            dst, src, rhs_const + 1, dst, dst);
                     return;
                 default:
                     break;
             }
         }
     }
-    rv_load_int_value(frame, inst->data.icmp_inst.lhs, "t0");
-    rv_load_int_value(frame, inst->data.icmp_inst.rhs, "t1");
+    const char *lhs = rv_int_value_read_reg(frame, inst->data.icmp_inst.lhs, "t0");
+    const char *rhs_scratch = strcmp(lhs, "t1") == 0 ? "t0" : "t1";
+    const char *rhs = rv_int_value_read_reg(frame, inst->data.icmp_inst.rhs, rhs_scratch);
     switch (inst->data.icmp_inst.pred) {
         case IR_ICMP_EQ:
-            fprintf(out, "  subw %s, t0, t1\n  seqz %s, %s\n", dst, dst, dst);
+            fprintf(out, "  subw %s, %s, %s\n  seqz %s, %s\n", dst, lhs, rhs, dst, dst);
             break;
         case IR_ICMP_NE:
-            fprintf(out, "  subw %s, t0, t1\n  snez %s, %s\n", dst, dst, dst);
+            fprintf(out, "  subw %s, %s, %s\n  snez %s, %s\n", dst, lhs, rhs, dst, dst);
             break;
         case IR_ICMP_SLT:
-            fprintf(out, "  slt %s, t0, t1\n", dst);
+            fprintf(out, "  slt %s, %s, %s\n", dst, lhs, rhs);
             break;
         case IR_ICMP_SLE:
-            fprintf(out, "  slt %s, t1, t0\n  xori %s, %s, 1\n", dst, dst, dst);
+            fprintf(out, "  slt %s, %s, %s\n  xori %s, %s, 1\n", dst, rhs, lhs, dst, dst);
             break;
         case IR_ICMP_SGT:
-            fprintf(out, "  slt %s, t1, t0\n", dst);
+            fprintf(out, "  slt %s, %s, %s\n", dst, rhs, lhs);
             break;
         case IR_ICMP_SGE:
-            fprintf(out, "  slt %s, t0, t1\n  xori %s, %s, 1\n", dst, dst, dst);
+            fprintf(out, "  slt %s, %s, %s\n  xori %s, %s, 1\n", dst, lhs, rhs, dst, dst);
             break;
     }
 }
@@ -9099,35 +10527,43 @@ static void rv_emit_icmp(RVFrame *frame, IRInstruction *inst) {
     if (!rv_inst_has_result_home(frame, inst)) {
         return;
     }
-    rv_emit_icmp_to_reg(frame, inst, "t2");
-    rv_store_int_slot(frame, &inst->result, "t2");
+    const char *dst = rv_value_reg_home(frame, &inst->result);
+    if (dst == NULL) {
+        dst = "t2";
+    }
+    rv_emit_icmp_to_reg(frame, inst, dst);
+    rv_store_int_slot(frame, &inst->result, dst);
 }
 
 static void rv_emit_fcmp(RVFrame *frame, IRInstruction *inst) {
     FILE *out = frame->out;
+    const char *dst = rv_value_reg_home(frame, &inst->result);
+    if (dst == NULL) {
+        dst = "t2";
+    }
     rv_load_float_value(frame, inst->data.fcmp_inst.lhs, "ft0");
     rv_load_float_value(frame, inst->data.fcmp_inst.rhs, "ft1");
     switch (inst->data.fcmp_inst.pred) {
         case IR_FCMP_OEQ:
-            fputs("  feq.s t2, ft0, ft1\n", out);
+            fprintf(out, "  feq.s %s, ft0, ft1\n", dst);
             break;
         case IR_FCMP_ONE:
-            fputs("  feq.s t2, ft0, ft1\n  xori t2, t2, 1\n", out);
+            fprintf(out, "  feq.s %s, ft0, ft1\n  xori %s, %s, 1\n", dst, dst, dst);
             break;
         case IR_FCMP_OLT:
-            fputs("  flt.s t2, ft0, ft1\n", out);
+            fprintf(out, "  flt.s %s, ft0, ft1\n", dst);
             break;
         case IR_FCMP_OLE:
-            fputs("  fle.s t2, ft0, ft1\n", out);
+            fprintf(out, "  fle.s %s, ft0, ft1\n", dst);
             break;
         case IR_FCMP_OGT:
-            fputs("  flt.s t2, ft1, ft0\n", out);
+            fprintf(out, "  flt.s %s, ft1, ft0\n", dst);
             break;
         case IR_FCMP_OGE:
-            fputs("  fle.s t2, ft1, ft0\n", out);
+            fprintf(out, "  fle.s %s, ft1, ft0\n", dst);
             break;
     }
-    rv_store_int_slot(frame, &inst->result, "t2");
+    rv_store_int_slot(frame, &inst->result, dst);
 }
 
 static int rv_count_value_ref(IRValue *candidate, IRValue *value) {
@@ -9199,6 +10635,65 @@ static int rv_count_function_uses(IRFunction *function, IRValue *value) {
         }
     }
     return count;
+}
+
+static bool rv_icmp_invert_pred(IRIcmpPredicate pred, IRIcmpPredicate *inverted) {
+    switch (pred) {
+        case IR_ICMP_EQ:  *inverted = IR_ICMP_NE;  return true;
+        case IR_ICMP_NE:  *inverted = IR_ICMP_EQ;  return true;
+        case IR_ICMP_SLT: *inverted = IR_ICMP_SGE; return true;
+        case IR_ICMP_SLE: *inverted = IR_ICMP_SGT; return true;
+        case IR_ICMP_SGT: *inverted = IR_ICMP_SLE; return true;
+        case IR_ICMP_SGE: *inverted = IR_ICMP_SLT; return true;
+    }
+    return false;
+}
+
+static IRInstruction *rv_branch_direct_icmp(RVFrame *frame, IRInstruction *br) {
+    if (br == NULL || br->kind != IR_INST_BR || !br->data.br_inst.is_conditional) {
+        return NULL;
+    }
+    IRValue *cond = br->data.br_inst.condition;
+    if (cond == NULL || cond->kind != IR_VALUE_INSTRUCTION) {
+        return NULL;
+    }
+    IRInstruction *cmp = cond->data.instruction;
+    if (!rv_icmp_only_feeds_own_branch(frame->function, cmp)) {
+        return NULL;
+    }
+    return cmp;
+}
+
+static void rv_emit_icmp_branch_label(RVFrame *frame, IRInstruction *cmp,
+                                      const char *label, bool branch_on_true) {
+    FILE *out = frame->out;
+    IRIcmpPredicate pred = cmp->data.icmp_inst.pred;
+    if (!branch_on_true && !rv_icmp_invert_pred(pred, &pred)) {
+        pred = cmp->data.icmp_inst.pred;
+    }
+    const char *lhs = rv_int_value_read_reg(frame, cmp->data.icmp_inst.lhs, "t0");
+    const char *rhs_scratch = strcmp(lhs, "t1") == 0 ? "t0" : "t1";
+    const char *rhs = rv_int_value_read_reg(frame, cmp->data.icmp_inst.rhs, rhs_scratch);
+    switch (pred) {
+        case IR_ICMP_EQ:
+            fprintf(out, "  beq %s, %s, %s\n", lhs, rhs, label);
+            return;
+        case IR_ICMP_NE:
+            fprintf(out, "  bne %s, %s, %s\n", lhs, rhs, label);
+            return;
+        case IR_ICMP_SLT:
+            fprintf(out, "  blt %s, %s, %s\n", lhs, rhs, label);
+            return;
+        case IR_ICMP_SLE:
+            fprintf(out, "  bge %s, %s, %s\n", rhs, lhs, label);
+            return;
+        case IR_ICMP_SGT:
+            fprintf(out, "  blt %s, %s, %s\n", rhs, lhs, label);
+            return;
+        case IR_ICMP_SGE:
+            fprintf(out, "  bge %s, %s, %s\n", lhs, rhs, label);
+            return;
+    }
 }
 
 static bool rv_block_has_phi(IRBasicBlock *block) {
@@ -9277,8 +10772,57 @@ static void rv_emit_phi_reg_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlo
     }
 }
 
-static void rv_emit_phi_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *to) {
-    rv_emit_phi_reg_moves(frame, from, to);
+static bool rv_phi_direct_stack_moves_safe(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *to) {
+    const char *reg_phi_dsts[16] = {0};
+    int reg_phi_count = 0;
+    for (IRInstruction *phi = to->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (!rv_phi_needs_scratch(frame, phi)) {
+            const char *dst = rv_value_reg_home(frame, &phi->result);
+            if (dst != NULL && reg_phi_count < 16) {
+                reg_phi_dsts[reg_phi_count++] = dst;
+            }
+        }
+    }
+    for (IRInstruction *phi = to->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (!rv_phi_needs_scratch(frame, phi)) {
+            continue;
+        }
+        IRValue *incoming = opt_phi_incoming_value(phi, from);
+        const char *src_reg = rv_value_reg_home(frame, incoming);
+        if (src_reg != NULL) {
+            for (int i = 0; i < reg_phi_count; ++i) {
+                if (strcmp(src_reg, reg_phi_dsts[i]) == 0) {
+                    return false;
+                }
+            }
+        }
+        if (incoming != NULL && incoming->kind == IR_VALUE_INSTRUCTION) {
+            IRInstruction *src = incoming->data.instruction;
+            if (src != NULL && src->kind == IR_INST_PHI && src->parent == to) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static void rv_emit_phi_direct_stack_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *to) {
+    for (IRInstruction *phi = to->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (!rv_phi_needs_scratch(frame, phi)) {
+            continue;
+        }
+        IRValue *incoming = opt_phi_incoming_value(phi, from);
+        if (rv_value_is_float(&phi->result)) {
+            rv_load_float_value(frame, incoming, "ft0");
+            rv_store_float_slot(frame, &phi->result, "ft0");
+        } else {
+            rv_load_int_value(frame, incoming, "t6");
+            rv_store_int_slot(frame, &phi->result, "t6");
+        }
+    }
+}
+
+static void rv_emit_phi_scratch_capture(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *to) {
     int scratch_index = 0;
     for (IRInstruction *phi = to->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
         if (!rv_phi_needs_scratch(frame, phi)) {
@@ -9295,7 +10839,10 @@ static void rv_emit_phi_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *
         }
         ++scratch_index;
     }
-    scratch_index = 0;
+}
+
+static void rv_emit_phi_scratch_commit(RVFrame *frame, IRBasicBlock *to) {
+    int scratch_index = 0;
     for (IRInstruction *phi = to->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
         if (!rv_phi_needs_scratch(frame, phi)) {
             continue;
@@ -9312,119 +10859,165 @@ static void rv_emit_phi_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *
     }
 }
 
+static void rv_emit_phi_moves(RVFrame *frame, IRBasicBlock *from, IRBasicBlock *to) {
+    bool direct_stack_safe = rv_phi_direct_stack_moves_safe(frame, from, to);
+    if (!direct_stack_safe) {
+        /* Capture stack-resident phi inputs before register-resident phi moves.
+           Otherwise a stack phi whose incoming value lives in a register can
+           read the already-updated value during a parallel-copy cycle. */
+        rv_emit_phi_scratch_capture(frame, from, to);
+    }
+    rv_emit_phi_reg_moves(frame, from, to);
+    if (direct_stack_safe) {
+        rv_emit_phi_direct_stack_moves(frame, from, to);
+    } else {
+        rv_emit_phi_scratch_commit(frame, to);
+    }
+}
+
 static void rv_emit_icmp_branch(RVFrame *frame, IRInstruction *cmp, IRInstruction *br) {
     FILE *out = frame->out;
     IRBasicBlock *true_block = rv_resolve_jump_block(br->data.br_inst.true_block);
-    char *true_label = rv_block_label(frame->function, true_block);
+    IRBasicBlock *false_block = rv_resolve_jump_block(br->data.br_inst.false_block);
+    IRIcmpPredicate pred = cmp->data.icmp_inst.pred;
+    IRValue *lhs_value = cmp->data.icmp_inst.lhs;
+    IRValue *rhs_value = cmp->data.icmp_inst.rhs;
+    IRBasicBlock *branch_target = true_block;
+    IRBasicBlock *fallthrough_target = false_block;
+
+    if (rv_block_is_fallthrough(br->parent, true_block)
+            && !rv_block_is_fallthrough(br->parent, false_block)) {
+        IRIcmpPredicate inverted;
+        if (rv_icmp_invert_pred(pred, &inverted)) {
+            pred = inverted;
+            branch_target = false_block;
+            fallthrough_target = true_block;
+        }
+    }
+
+    char *target_label = rv_block_label(frame->function, branch_target);
     int const_value = 0;
-    if (rv_const_i32_value(cmp->data.icmp_inst.rhs, &const_value) && const_value == 0) {
-        rv_load_int_value(frame, cmp->data.icmp_inst.lhs, "t0");
-        switch (cmp->data.icmp_inst.pred) {
+    if (rv_const_i32_value(rhs_value, &const_value) && const_value == 0) {
+        const char *lhs_reg = rv_int_value_read_reg(frame, lhs_value, "t0");
+        switch (pred) {
             case IR_ICMP_EQ:
-                fprintf(out, "  beqz t0, %s\n", true_label);
+                fprintf(out, "  beqz %s, %s\n", lhs_reg, target_label);
                 break;
             case IR_ICMP_NE:
-                fprintf(out, "  bnez t0, %s\n", true_label);
+                fprintf(out, "  bnez %s, %s\n", lhs_reg, target_label);
                 break;
             case IR_ICMP_SLT:
-                fprintf(out, "  blt t0, zero, %s\n", true_label);
+                fprintf(out, "  blt %s, zero, %s\n", lhs_reg, target_label);
                 break;
             case IR_ICMP_SLE:
-                fprintf(out, "  bge zero, t0, %s\n", true_label);
+                fprintf(out, "  bge zero, %s, %s\n", lhs_reg, target_label);
                 break;
             case IR_ICMP_SGT:
-                fprintf(out, "  blt zero, t0, %s\n", true_label);
+                fprintf(out, "  blt zero, %s, %s\n", lhs_reg, target_label);
                 break;
             case IR_ICMP_SGE:
-                fprintf(out, "  bge t0, zero, %s\n", true_label);
+                fprintf(out, "  bge %s, zero, %s\n", lhs_reg, target_label);
                 break;
         }
-        rv_emit_jump_to_block(frame, br->parent, br->data.br_inst.false_block);
+        rv_emit_jump_to_block(frame, br->parent, fallthrough_target);
         return;
     }
-    if (rv_const_i32_value(cmp->data.icmp_inst.lhs, &const_value) && const_value == 0) {
-        rv_load_int_value(frame, cmp->data.icmp_inst.rhs, "t0");
-        switch (cmp->data.icmp_inst.pred) {
+    if (rv_const_i32_value(lhs_value, &const_value) && const_value == 0) {
+        const char *rhs_reg = rv_int_value_read_reg(frame, rhs_value, "t0");
+        switch (pred) {
             case IR_ICMP_EQ:
-                fprintf(out, "  beqz t0, %s\n", true_label);
+                fprintf(out, "  beqz %s, %s\n", rhs_reg, target_label);
                 break;
             case IR_ICMP_NE:
-                fprintf(out, "  bnez t0, %s\n", true_label);
+                fprintf(out, "  bnez %s, %s\n", rhs_reg, target_label);
                 break;
             case IR_ICMP_SLT:
-                fprintf(out, "  blt zero, t0, %s\n", true_label);
+                fprintf(out, "  blt zero, %s, %s\n", rhs_reg, target_label);
                 break;
             case IR_ICMP_SLE:
-                fprintf(out, "  bge t0, zero, %s\n", true_label);
+                fprintf(out, "  bge %s, zero, %s\n", rhs_reg, target_label);
                 break;
             case IR_ICMP_SGT:
-                fprintf(out, "  blt t0, zero, %s\n", true_label);
+                fprintf(out, "  blt %s, zero, %s\n", rhs_reg, target_label);
                 break;
             case IR_ICMP_SGE:
-                fprintf(out, "  bge zero, t0, %s\n", true_label);
+                fprintf(out, "  bge zero, %s, %s\n", rhs_reg, target_label);
                 break;
         }
-        rv_emit_jump_to_block(frame, br->parent, br->data.br_inst.false_block);
+        rv_emit_jump_to_block(frame, br->parent, fallthrough_target);
         return;
     }
-    rv_load_int_value(frame, cmp->data.icmp_inst.lhs, "t0");
-    rv_load_int_value(frame, cmp->data.icmp_inst.rhs, "t1");
-    switch (cmp->data.icmp_inst.pred) {
+    const char *lhs_reg = rv_int_value_read_reg(frame, lhs_value, "t0");
+    const char *rhs_scratch = strcmp(lhs_reg, "t1") == 0 ? "t0" : "t1";
+    const char *rhs_reg = rv_int_value_read_reg(frame, rhs_value, rhs_scratch);
+    switch (pred) {
         case IR_ICMP_EQ:
-            fprintf(out, "  beq t0, t1, %s\n", true_label);
+            fprintf(out, "  beq %s, %s, %s\n", lhs_reg, rhs_reg, target_label);
             break;
         case IR_ICMP_NE:
-            fprintf(out, "  bne t0, t1, %s\n", true_label);
+            fprintf(out, "  bne %s, %s, %s\n", lhs_reg, rhs_reg, target_label);
             break;
         case IR_ICMP_SLT:
-            fprintf(out, "  blt t0, t1, %s\n", true_label);
+            fprintf(out, "  blt %s, %s, %s\n", lhs_reg, rhs_reg, target_label);
             break;
         case IR_ICMP_SLE:
-            fprintf(out, "  bge t1, t0, %s\n", true_label);
+            fprintf(out, "  bge %s, %s, %s\n", rhs_reg, lhs_reg, target_label);
             break;
         case IR_ICMP_SGT:
-            fprintf(out, "  blt t1, t0, %s\n", true_label);
+            fprintf(out, "  blt %s, %s, %s\n", rhs_reg, lhs_reg, target_label);
             break;
         case IR_ICMP_SGE:
-            fprintf(out, "  bge t0, t1, %s\n", true_label);
+            fprintf(out, "  bge %s, %s, %s\n", lhs_reg, rhs_reg, target_label);
             break;
     }
-    rv_emit_jump_to_block(frame, br->parent, br->data.br_inst.false_block);
+    rv_emit_jump_to_block(frame, br->parent, fallthrough_target);
 }
 
 static void rv_emit_fcmp_branch(RVFrame *frame, IRInstruction *cmp, IRInstruction *br) {
     FILE *out = frame->out;
     IRBasicBlock *true_block = rv_resolve_jump_block(br->data.br_inst.true_block);
-    char *true_label = rv_block_label(frame->function, true_block);
+    IRBasicBlock *false_block = rv_resolve_jump_block(br->data.br_inst.false_block);
+    IRBasicBlock *branch_target = true_block;
+    IRBasicBlock *fallthrough_target = false_block;
+    bool branch_when_cmp_true = true;
+
+    if (rv_block_is_fallthrough(br->parent, true_block)
+            && !rv_block_is_fallthrough(br->parent, false_block)) {
+        branch_target = false_block;
+        fallthrough_target = true_block;
+        branch_when_cmp_true = false;
+    }
+
+    char *target_label = rv_block_label(frame->function, branch_target);
     rv_load_float_value(frame, cmp->data.fcmp_inst.lhs, "ft0");
     rv_load_float_value(frame, cmp->data.fcmp_inst.rhs, "ft1");
     switch (cmp->data.fcmp_inst.pred) {
         case IR_FCMP_OEQ:
             fputs("  feq.s t0, ft0, ft1\n", out);
-            fprintf(out, "  bnez t0, %s\n", true_label);
+            fprintf(out, branch_when_cmp_true ? "  bnez t0, %s\n" : "  beqz t0, %s\n", target_label);
             break;
         case IR_FCMP_ONE:
             fputs("  feq.s t0, ft0, ft1\n", out);
-            fprintf(out, "  beqz t0, %s\n", true_label);
+            fprintf(out, branch_when_cmp_true ? "  beqz t0, %s\n" : "  bnez t0, %s\n", target_label);
             break;
         case IR_FCMP_OLT:
             fputs("  flt.s t0, ft0, ft1\n", out);
-            fprintf(out, "  bnez t0, %s\n", true_label);
+            fprintf(out, branch_when_cmp_true ? "  bnez t0, %s\n" : "  beqz t0, %s\n", target_label);
             break;
         case IR_FCMP_OLE:
             fputs("  fle.s t0, ft0, ft1\n", out);
-            fprintf(out, "  bnez t0, %s\n", true_label);
+            fprintf(out, branch_when_cmp_true ? "  bnez t0, %s\n" : "  beqz t0, %s\n", target_label);
             break;
         case IR_FCMP_OGT:
             fputs("  flt.s t0, ft1, ft0\n", out);
-            fprintf(out, "  bnez t0, %s\n", true_label);
+            fprintf(out, branch_when_cmp_true ? "  bnez t0, %s\n" : "  beqz t0, %s\n", target_label);
             break;
         case IR_FCMP_OGE:
             fputs("  fle.s t0, ft1, ft0\n", out);
-            fprintf(out, "  bnez t0, %s\n", true_label);
+            fprintf(out, branch_when_cmp_true ? "  bnez t0, %s\n" : "  beqz t0, %s\n", target_label);
             break;
     }
-    rv_emit_jump_to_block(frame, br->parent, br->data.br_inst.false_block);
+    rv_emit_jump_to_block(frame, br->parent, fallthrough_target);
 }
 
 static bool rv_can_fuse_compare_branch(IRFunction *function, IRInstruction *cmp) {
@@ -9449,10 +11042,105 @@ static void rv_emit_compare_branch(RVFrame *frame, IRInstruction *cmp, IRInstruc
     }
 }
 
+static bool rv_gep_has_const_indices(IRInstruction *gep) {
+    if (gep == NULL || gep->kind != IR_INST_GETELEMENTPTR) {
+        return false;
+    }
+    for (int i = 0; i < gep->data.gep_inst.indices.count; ++i) {
+        int unused = 0;
+        if (!rv_const_i32_value(gep->data.gep_inst.indices.items[i], &unused)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static long long rv_gep_const_offset(IRInstruction *gep) {
+    long long total = 0;
+    IRType *current = gep->data.gep_inst.source_element_type;
+    for (int i = 0; i < gep->data.gep_inst.indices.count; ++i) {
+        int index = 0;
+        (void)rv_const_i32_value(gep->data.gep_inst.indices.items[i], &index);
+        int stride = 0;
+        if (i == 0) {
+            stride = rv_type_size(current);
+        } else {
+            if (current != NULL && current->kind == IR_TYPE_ARRAY) {
+                current = current->data.array.element;
+            }
+            stride = rv_type_size(current);
+        }
+        total += (long long)index * (long long)stride;
+    }
+    return total;
+}
+
+static bool rv_emit_const_gep_to_reg(RVFrame *frame, IRInstruction *inst, const char *dst) {
+    if (!rv_gep_has_const_indices(inst)) {
+        return false;
+    }
+    long long offset = rv_gep_const_offset(inst);
+    IRValue *base = inst->data.gep_inst.base_ptr;
+    if (base != NULL && base->kind == IR_VALUE_INSTRUCTION) {
+        IRInstruction *base_inst = base->data.instruction;
+        if (base_inst != NULL && base_inst->kind == IR_INST_ALLOCA) {
+            RVSlot *slot = rv_find_slot(frame, base);
+            if (slot != NULL) {
+                offset += slot->object_offset;
+                if (offset >= INT_MIN && offset <= INT_MAX) {
+                    rv_emit_addi(frame->out, dst, "s0", (int)offset);
+                    return true;
+                }
+            }
+        }
+    }
+    rv_load_int_value(frame, base, dst);
+    if (offset != 0) {
+        if (offset >= INT_MIN && offset <= INT_MAX) {
+            rv_emit_addi(frame->out, dst, dst, (int)offset);
+        } else {
+            fprintf(frame->out, "  li t5, %lld\n", offset);
+            fprintf(frame->out, "  add %s, %s, t5\n", dst, dst);
+        }
+    }
+    return true;
+}
+
+static bool rv_gep_recomputable_for_memory(IRFunction *function, IRInstruction *gep) {
+    if (function == NULL || !rv_gep_has_const_indices(gep)) {
+        return false;
+    }
+    IRValue *base = gep->data.gep_inst.base_ptr;
+    if (base != NULL && base->kind == IR_VALUE_INSTRUCTION) {
+        IRInstruction *base_inst = base->data.instruction;
+        if (base_inst == NULL || base_inst->kind != IR_INST_ALLOCA) {
+            return false;
+        }
+    }
+    int total_uses = 0;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            int uses = rv_count_instruction_uses(inst, &gep->result);
+            if (uses == 0) {
+                continue;
+            }
+            total_uses += uses;
+            if (uses != 1 || !rv_memory_inst_uses_ptr(inst, &gep->result)) {
+                return false;
+            }
+        }
+    }
+    return total_uses > 0;
+}
+
 static void rv_emit_gep_to_reg(RVFrame *frame, IRInstruction *inst, const char *dst) {
+    if (rv_emit_const_gep_to_reg(frame, inst, dst)) {
+        return;
+    }
     FILE *out = frame->out;
     IRType *current = inst->data.gep_inst.source_element_type;
-    rv_load_int_value(frame, inst->data.gep_inst.base_ptr, "t0");
+    const char *addr_reg = rv_int_value_read_reg(frame, inst->data.gep_inst.base_ptr, "t0");
     for (int i = 0; i < inst->data.gep_inst.indices.count; ++i) {
         IRValue *index = inst->data.gep_inst.indices.items[i];
         int stride = 0;
@@ -9469,32 +11157,38 @@ static void rv_emit_gep_to_reg(RVFrame *frame, IRInstruction *inst, const char *
             long long offset = (long long)const_index * (long long)stride;
             if (offset != 0) {
                 if (offset >= -2048 && offset <= 2047) {
-                    fprintf(out, "  addi t0, t0, %lld\n", offset);
+                    fprintf(out, "  addi t0, %s, %lld\n", addr_reg, offset);
                 } else {
                     fprintf(out, "  li t1, %lld\n", offset);
-                    fputs("  add t0, t0, t1\n", out);
+                    fprintf(out, "  add t0, %s, t1\n", addr_reg);
                 }
+                addr_reg = "t0";
             }
             continue;
         }
-        rv_load_int_value(frame, index, "t1");
+        const char *index_reg = rv_int_value_read_reg(frame, index, "t1");
         if (stride != 1) {
             int shift = rv_pow2_shift(stride);
             if (shift >= 0) {
-                fprintf(out, "  slli t1, t1, %d\n", shift);
+                fprintf(out, "  slli t1, %s, %d\n", index_reg, shift);
             } else {
                 fprintf(out, "  li t2, %d\n", stride);
-                fputs("  mul t1, t1, t2\n", out);
+                fprintf(out, "  mul t1, %s, t2\n", index_reg);
             }
+            index_reg = "t1";
         }
-        fputs("  add t0, t0, t1\n", out);
+        fprintf(out, "  add t0, %s, %s\n", addr_reg, index_reg);
+        addr_reg = "t0";
     }
-    if (strcmp(dst, "t0") != 0) {
-        fprintf(out, "  mv %s, t0\n", dst);
+    if (strcmp(dst, addr_reg) != 0) {
+        fprintf(out, "  mv %s, %s\n", dst, addr_reg);
     }
 }
 
 static void rv_emit_gep(RVFrame *frame, IRInstruction *inst) {
+    if (rv_gep_is_folded_into_memory(frame, inst)) {
+        return;
+    }
     if (!rv_inst_has_result_home(frame, inst)) {
         return;
     }
@@ -9635,11 +11329,11 @@ static bool rv_can_emit_self_tail_call(RVFrame *frame, IRInstruction *inst) {
     if (!rv_self_tail_call_shape(frame->function, inst)) {
         return false;
     }
+    if (inst->data.call_inst.args.count != frame->function->params.count) {
+        return false;
+    }
     for (int i = 0; i < frame->function->params.count; ++i) {
-        IRParameter *param = frame->function->params.items[i];
-        if (rv_value_is_float(&param->value)
-                || rv_find_slot(frame, &param->value) == NULL
-                || rv_value_is_float(inst->data.call_inst.args.items[i])) {
+        if (rv_find_slot(frame, &frame->function->params.items[i]->value) == NULL) {
             return false;
         }
     }
@@ -9647,14 +11341,31 @@ static bool rv_can_emit_self_tail_call(RVFrame *frame, IRInstruction *inst) {
 }
 
 static void rv_emit_self_tail_call(RVFrame *frame, IRInstruction *inst) {
-    static const char *regs[] = {"t0", "t1", "t2", "t3", "t4", "t5", "t6"};
     FILE *out = frame->out;
     int count = inst->data.call_inst.args.count;
     for (int i = 0; i < count; ++i) {
-        rv_load_int_value(frame, inst->data.call_inst.args.items[i], regs[i]);
+        IRParameter *param = frame->function->params.items[i];
+        int scratch = frame->tail_scratch_offset + i * 8;
+        if (rv_value_is_float(&param->value)) {
+            rv_load_float_value(frame, inst->data.call_inst.args.items[i], "ft0");
+            rv_emit_mem(out, "fsw", "ft0", scratch, "s0");
+        } else {
+            rv_load_int_value(frame, inst->data.call_inst.args.items[i], "t0");
+            RVSlot *slot = rv_find_slot(frame, &param->value);
+            rv_emit_mem(out, slot != NULL && slot->value_size == 8 ? "sd" : "sw", "t0", scratch, "s0");
+        }
     }
     for (int i = 0; i < count; ++i) {
-        rv_store_int_slot(frame, &frame->function->params.items[i]->value, regs[i]);
+        IRParameter *param = frame->function->params.items[i];
+        int scratch = frame->tail_scratch_offset + i * 8;
+        if (rv_value_is_float(&param->value)) {
+            rv_emit_mem(out, "flw", "ft0", scratch, "s0");
+            rv_store_float_slot(frame, &param->value, "ft0");
+        } else {
+            RVSlot *slot = rv_find_slot(frame, &param->value);
+            rv_emit_mem(out, slot != NULL && slot->value_size == 8 ? "ld" : "lw", "t0", scratch, "s0");
+            rv_store_int_slot(frame, &param->value, "t0");
+        }
     }
     fprintf(out, "  j .L_%s_entry\n", rv_symbol_name(frame->function->name));
 }
@@ -9700,29 +11411,47 @@ static void rv_emit_instruction(RVFrame *frame, IRInstruction *inst) {
             rv_emit_float_binary(frame, inst, "fdiv.s");
             return;
         case IR_INST_ICMP:
+            if (rv_icmp_only_feeds_own_branch(frame->function, inst)) {
+                return;
+            }
             rv_emit_icmp(frame, inst);
             return;
         case IR_INST_FCMP:
             rv_emit_fcmp(frame, inst);
             return;
-        case IR_INST_ZEXT:
+        case IR_INST_ZEXT: {
             if (!rv_inst_has_result_home(frame, inst)) {
                 return;
             }
-            rv_load_int_value(frame, inst->data.cast_inst.value, "t0");
-            fputs("  andi t0, t0, 1\n", out);
-            rv_store_int_slot(frame, &inst->result, "t0");
+            const char *dst = rv_value_reg_home(frame, &inst->result);
+            if (dst == NULL) {
+                dst = "t0";
+            }
+            rv_load_int_value(frame, inst->data.cast_inst.value, dst);
+            fprintf(out, "  andi %s, %s, 1\n", dst, dst);
+            rv_store_int_slot(frame, &inst->result, dst);
             return;
-        case IR_INST_SITOFP:
+        }
+        case IR_INST_SITOFP: {
+            const char *dst = rv_value_reg_home(frame, &inst->result);
+            if (dst == NULL) {
+                dst = "ft0";
+            }
             rv_load_int_value(frame, inst->data.cast_inst.value, "t0");
-            fputs("  fcvt.s.w ft0, t0\n", out);
-            rv_store_float_slot(frame, &inst->result, "ft0");
+            fprintf(out, "  fcvt.s.w %s, t0\n", dst);
+            rv_store_float_slot(frame, &inst->result, dst);
             return;
-        case IR_INST_FPTOSI:
+        }
+        case IR_INST_FPTOSI: {
+            const char *dst = rv_value_reg_home(frame, &inst->result);
+            if (dst == NULL) {
+                dst = "t0";
+            }
             rv_load_float_value(frame, inst->data.cast_inst.value, "ft0");
-            fputs("  fcvt.w.s t0, ft0, rtz\n", out);
-            rv_store_int_slot(frame, &inst->result, "t0");
+            fprintf(out, "  fcvt.w.s %s, ft0, rtz\n", dst);
+            rv_store_int_slot(frame, &inst->result, dst);
             return;
+        }
         case IR_INST_BR: {
             if (inst->data.br_inst.is_conditional) {
                 int cond_const = 0;
@@ -9734,25 +11463,62 @@ static void rv_emit_instruction(RVFrame *frame, IRInstruction *inst) {
                     rv_emit_jump_to_block(frame, inst->parent, target);
                     return;
                 }
-                rv_load_int_value(frame, inst->data.br_inst.condition, "t0");
-                if (rv_block_has_phi(inst->data.br_inst.true_block) ||
-                        rv_block_has_phi(inst->data.br_inst.false_block)) {
-                    char *true_label = rv_block_label(frame->function, inst->data.br_inst.true_block);
-                    char *false_label = rv_block_label(frame->function, inst->data.br_inst.false_block);
-                    char *copy_true = str_printf(".L_%s_phi_%d",
-                                                 rv_symbol_name(frame->function->name),
-                                                 frame->phi_label_id++);
-                    fprintf(out, "  bnez t0, %s\n", copy_true);
-                    rv_emit_phi_moves(frame, inst->parent, inst->data.br_inst.false_block);
-                    fprintf(out, "  j %s\n", false_label);
-                    fprintf(out, "%s:\n", copy_true);
-                    rv_emit_phi_moves(frame, inst->parent, inst->data.br_inst.true_block);
-                    fprintf(out, "  j %s\n", true_label);
+                IRInstruction *direct_cmp = rv_branch_direct_icmp(frame, inst);
+                if (direct_cmp != NULL) {
+                    if (rv_block_has_phi(inst->data.br_inst.true_block) ||
+                            rv_block_has_phi(inst->data.br_inst.false_block)) {
+                        char *true_label = rv_block_label(frame->function, inst->data.br_inst.true_block);
+                        char *false_label = rv_block_label(frame->function, inst->data.br_inst.false_block);
+                        char *copy_true = str_printf(".L_%s_phi_%d",
+                                                     rv_symbol_name(frame->function->name),
+                                                     frame->phi_label_id++);
+                        rv_emit_icmp_branch_label(frame, direct_cmp, copy_true, true);
+                        rv_emit_phi_moves(frame, inst->parent, inst->data.br_inst.false_block);
+                        fprintf(out, "  j %s\n", false_label);
+                        fprintf(out, "%s:\n", copy_true);
+                        rv_emit_phi_moves(frame, inst->parent, inst->data.br_inst.true_block);
+                        fprintf(out, "  j %s\n", true_label);
+                    } else {
+                        IRBasicBlock *true_block = rv_resolve_jump_block(inst->data.br_inst.true_block);
+                        IRBasicBlock *false_block = rv_resolve_jump_block(inst->data.br_inst.false_block);
+                        if (rv_block_is_fallthrough(inst->parent, true_block)
+                                && !rv_block_is_fallthrough(inst->parent, false_block)) {
+                            char *false_label = rv_block_label(frame->function, false_block);
+                            rv_emit_icmp_branch_label(frame, direct_cmp, false_label, false);
+                        } else {
+                            char *true_label = rv_block_label(frame->function, true_block);
+                            rv_emit_icmp_branch_label(frame, direct_cmp, true_label, true);
+                            rv_emit_jump_to_block(frame, inst->parent, false_block);
+                        }
+                    }
                 } else {
-                    IRBasicBlock *true_block = rv_resolve_jump_block(inst->data.br_inst.true_block);
-                    char *true_label = rv_block_label(frame->function, true_block);
-                    fprintf(out, "  bnez t0, %s\n", true_label);
-                    rv_emit_jump_to_block(frame, inst->parent, inst->data.br_inst.false_block);
+                    const char *cond_reg = rv_int_value_read_reg(frame, inst->data.br_inst.condition, "t0");
+                    if (rv_block_has_phi(inst->data.br_inst.true_block) ||
+                            rv_block_has_phi(inst->data.br_inst.false_block)) {
+                        char *true_label = rv_block_label(frame->function, inst->data.br_inst.true_block);
+                        char *false_label = rv_block_label(frame->function, inst->data.br_inst.false_block);
+                        char *copy_true = str_printf(".L_%s_phi_%d",
+                                                     rv_symbol_name(frame->function->name),
+                                                     frame->phi_label_id++);
+                        fprintf(out, "  bnez %s, %s\n", cond_reg, copy_true);
+                        rv_emit_phi_moves(frame, inst->parent, inst->data.br_inst.false_block);
+                        fprintf(out, "  j %s\n", false_label);
+                        fprintf(out, "%s:\n", copy_true);
+                        rv_emit_phi_moves(frame, inst->parent, inst->data.br_inst.true_block);
+                        fprintf(out, "  j %s\n", true_label);
+                    } else {
+                        IRBasicBlock *true_block = rv_resolve_jump_block(inst->data.br_inst.true_block);
+                        IRBasicBlock *false_block = rv_resolve_jump_block(inst->data.br_inst.false_block);
+                        if (rv_block_is_fallthrough(inst->parent, true_block)
+                                && !rv_block_is_fallthrough(inst->parent, false_block)) {
+                            char *false_label = rv_block_label(frame->function, false_block);
+                            fprintf(out, "  beqz %s, %s\n", cond_reg, false_label);
+                        } else {
+                            char *true_label = rv_block_label(frame->function, true_block);
+                            fprintf(out, "  bnez %s, %s\n", cond_reg, true_label);
+                            rv_emit_jump_to_block(frame, inst->parent, false_block);
+                        }
+                    }
                 }
             } else {
                 rv_emit_phi_moves(frame, inst->parent, inst->data.br_inst.true_block);
@@ -9800,7 +11566,20 @@ static void rv_store_incoming_params(RVFrame *frame) {
     for (int i = 0; i < frame->function->params.count; ++i) {
         IRParameter *param = frame->function->params.items[i];
         RVSlot *slot = rv_find_slot(frame, &param->value);
-        if (slot == NULL) {
+        if (slot == NULL || rv_slot_is_incoming_stack_param(frame, &param->value)) {
+            if (rv_value_is_float(&param->value)) {
+                if (float_regs < 8) {
+                    float_regs++;
+                } else {
+                    stack_slots++;
+                }
+            } else {
+                if (int_regs < 8) {
+                    int_regs++;
+                } else {
+                    stack_slots++;
+                }
+            }
             continue;
         }
         if (rv_value_is_float(&param->value)) {
@@ -9962,7 +11741,7 @@ static void rv_emit_function(IRFunction *function, FILE *out) {
     }
     rv_emit_mem(out, "sd", "s0", frame.frame_size - (frame.has_call ? 16 : 8), "sp");
     rv_emit_addi(out, "s0", "sp", frame.frame_size);
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < RV_LOOP_REG_COUNT; ++i) {
         if (frame.used_saved_regs[i]) {
             rv_emit_mem(out, "sd", g_rv_loop_regs[i], frame.saved_reg_offsets[i], "s0");
         }
@@ -9986,7 +11765,7 @@ static void rv_emit_function(IRFunction *function, FILE *out) {
     if (memoize) {
         rv_emit_memo_return_update(&frame);
     }
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < RV_LOOP_REG_COUNT; ++i) {
         if (frame.used_saved_regs[i]) {
             rv_emit_mem(out, "ld", g_rv_loop_regs[i], frame.saved_reg_offsets[i], "s0");
         }
@@ -10014,10 +11793,193 @@ void emit_riscv_from_ir(IRModule *module, FILE *out) {
     }
 }
 
+static bool asm_parse_mem_line(const char *line, char *op, char *reg, int *offset, char *base) {
+    return sscanf(line, "  %7s %15[^,], %d(%15[^)])", op, reg, offset, base) == 4;
+}
+
+static bool asm_parse_jump_line(const char *line, char *label) {
+    return sscanf(line, "  j %127s", label) == 1;
+}
+
+static bool asm_parse_shift_imm_line(const char *line, char *op, char *rd, char *rs, int *imm) {
+    return sscanf(line, "  %7s %15[^,], %15[^,], %d", op, rd, rs, imm) == 4
+        && strcmp(op, "slli") == 0;
+}
+
+static bool asm_line_is_control_or_label(const char *line) {
+    if (line == NULL || line[0] == '\0') {
+        return false;
+    }
+    if (line[0] != ' ') {
+        return true;
+    }
+    char op[16];
+    if (sscanf(line, "  %15s", op) != 1) {
+        return false;
+    }
+    return op[0] == 'b' || strcmp(op, "j") == 0 || strcmp(op, "jal") == 0
+        || strcmp(op, "jalr") == 0 || strcmp(op, "ret") == 0 || strcmp(op, "call") == 0;
+}
+
+static bool asm_line_writes_reg(const char *line, const char *reg) {
+    if (line == NULL || reg == NULL || line[0] != ' ') {
+        return false;
+    }
+    char op[16];
+    char dst[16];
+    if (sscanf(line, "  %15s %15[^,]", op, dst) != 2) {
+        return false;
+    }
+    if (strcmp(op, "sw") == 0 || strcmp(op, "sd") == 0 || strcmp(op, "fsw") == 0
+            || op[0] == 'b' || strcmp(op, "j") == 0 || strcmp(op, "ret") == 0) {
+        return false;
+    }
+    if (strcmp(op, "call") == 0) {
+        return reg[0] == 'a' || reg[0] == 't' || strcmp(reg, "ra") == 0;
+    }
+    return strcmp(dst, reg) == 0;
+}
+
+static bool asm_duplicate_slli_recomputes_same_value(char **lines, int index) {
+    char op[8], rd[16], rs[16];
+    int imm = 0;
+    if (!asm_parse_shift_imm_line(lines[index], op, rd, rs, &imm) || strcmp(rd, rs) == 0) {
+        return false;
+    }
+    for (int j = index - 1; j >= 0 && index - j <= 8; --j) {
+        if (asm_line_is_control_or_label(lines[j])) {
+            return false;
+        }
+        char pop[8], prd[16], prs[16];
+        int pimm = 0;
+        if (asm_parse_shift_imm_line(lines[j], pop, prd, prs, &pimm)
+                && strcmp(prd, rd) == 0 && strcmp(prs, rs) == 0 && pimm == imm) {
+            return true;
+        }
+        if (asm_line_writes_reg(lines[j], rd) || asm_line_writes_reg(lines[j], rs)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool asm_line_is_label(const char *line, const char *label) {
+    size_t n = strlen(label);
+    return strncmp(line, label, n) == 0 && line[n] == ':' && line[n + 1] == '\0';
+}
+
+static bool asm_matching_int_mem_pair(const char *store_op, const char *load_op) {
+    return (strcmp(store_op, "sw") == 0 && strcmp(load_op, "lw") == 0)
+        || (strcmp(store_op, "sd") == 0 && strcmp(load_op, "ld") == 0);
+}
+
+static bool asm_matching_float_mem_pair(const char *store_op, const char *load_op) {
+    return strcmp(store_op, "fsw") == 0 && strcmp(load_op, "flw") == 0;
+}
+
+static void asm_append_store_load_forward(StrBuf *out, const char *store_line,
+                                          const char *store_op, const char *src,
+                                          const char *load_op, const char *dst) {
+    sb_append(out, store_line);
+    sb_append(out, "\n");
+    if (strcmp(store_op, "sw") == 0 && strcmp(load_op, "lw") == 0) {
+        if (strcmp(dst, "zero") != 0) {
+            if (strcmp(src, "zero") == 0) {
+                sb_appendf(out, "  li %s, 0\n", dst);
+            } else {
+                sb_appendf(out, "  addiw %s, %s, 0\n", dst, src);
+            }
+        }
+    } else if (strcmp(store_op, "sd") == 0 && strcmp(load_op, "ld") == 0) {
+        if (strcmp(dst, src) != 0) {
+            sb_appendf(out, "  mv %s, %s\n", dst, src);
+        }
+    } else if (strcmp(store_op, "fsw") == 0 && strcmp(load_op, "flw") == 0) {
+        if (strcmp(dst, src) != 0) {
+            sb_appendf(out, "  fmv.s %s, %s\n", dst, src);
+        }
+    }
+}
+
+static void asm_peephole_text(const char *text, FILE *out_file) {
+    if (text == NULL) {
+        return;
+    }
+    char **lines = NULL;
+    int count = 0;
+    int capacity = 0;
+    const char *start = text;
+    for (const char *p = text;; ++p) {
+        if (*p == '\n' || *p == '\0') {
+            size_t len = (size_t)(p - start);
+            if (*p == '\0' && len == 0) {
+                break;
+            }
+            char *line = (char *)xmalloc(len + 1);
+            memcpy(line, start, len);
+            line[len] = '\0';
+            ensure_capacity((void **)&lines, &capacity, sizeof(char *), count + 1);
+            lines[count++] = line;
+            if (*p == '\0') {
+                break;
+            }
+            start = p + 1;
+        }
+    }
+    StrBuf out;
+    sb_init(&out);
+    for (int i = 0; i < count; ++i) {
+        char jlabel[128];
+        if (i + 1 < count && asm_parse_jump_line(lines[i], jlabel)
+                && asm_line_is_label(lines[i + 1], jlabel)) {
+            continue;
+        }
+        if (asm_duplicate_slli_recomputes_same_value(lines, i)) {
+            continue;
+        }
+        char op1[8], reg1[16], base1[16];
+        char op2[8], reg2[16], base2[16];
+        int off1 = 0, off2 = 0;
+        if (i + 1 < count
+                && asm_parse_mem_line(lines[i], op1, reg1, &off1, base1)
+                && asm_parse_mem_line(lines[i + 1], op2, reg2, &off2, base2)
+                && off1 == off2 && strcmp(base1, base2) == 0) {
+            if ((asm_matching_int_mem_pair(op1, op2) || asm_matching_float_mem_pair(op1, op2))
+                    && op1[0] == 's') {
+                asm_append_store_load_forward(&out, lines[i], op1, reg1, op2, reg2);
+                ++i;
+                continue;
+            }
+            if (((strcmp(op1, "lw") == 0 && strcmp(op2, "sw") == 0)
+                        || (strcmp(op1, "ld") == 0 && strcmp(op2, "sd") == 0)
+                        || (strcmp(op1, "flw") == 0 && strcmp(op2, "fsw") == 0))
+                    && strcmp(reg1, reg2) == 0) {
+                sb_append(&out, lines[i]);
+                sb_append(&out, "\n");
+                ++i;
+                continue;
+            }
+        }
+        sb_append(&out, lines[i]);
+        sb_append(&out, "\n");
+    }
+    fputs(out.data ? out.data : "", out_file);
+}
+
 static void generate_program_asm(Program *program, FILE *out) {
     IRModule *module = ast_to_ir(program);
     optimize_ir_basic_blocks(module);
-    emit_riscv_from_ir(module, out);
+    char *buffer = NULL;
+    size_t size = 0;
+    FILE *mem = open_memstream(&buffer, &size);
+    if (mem == NULL) {
+        emit_riscv_from_ir(module, out);
+        return;
+    }
+    emit_riscv_from_ir(module, mem);
+    fclose(mem);
+    asm_peephole_text(buffer, out);
+    free(buffer);
 }
 
 int main(int argc, char **argv) {
