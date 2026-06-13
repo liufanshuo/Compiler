@@ -3057,7 +3057,7 @@ static bool mem_decl_has_only_scalar_items(Decl *decl) {
 
 static Expr *mem_straightline_return_expr(FuncDef *func) {
     if (func == NULL || func->ret_type == TYPE_VOID || func->block == NULL ||
-        func->block->items.count < 2 || func->block->items.count > 8) {
+        func->block->items.count < 2 || func->block->items.count > 12) {
         return NULL;
     }
     int last = func->block->items.count - 1;
@@ -3620,7 +3620,7 @@ static bool mem_build_inline_plan(FuncDef *func, MemInlinePlan *plan) {
     memset(plan, 0, sizeof(MemInlinePlan));
     plan->kind = MEM_INLINE_NONE;
     if (func == NULL || func->ret_type == TYPE_VOID || func->block == NULL
-            || func->block->items.count <= 0 || func->block->items.count > 12) {
+            || func->block->items.count <= 0 || func->block->items.count > 16) {
         return false;
     }
     int last = func->block->items.count - 1;
@@ -3659,7 +3659,7 @@ static bool mem_build_inline_plan(FuncDef *func, MemInlinePlan *plan) {
         plan->kind = MEM_INLINE_IF_RETURN;
         plan->if_stmt = tail_stmt;
     }
-    if (total_cost > 32) {
+    if (total_cost > 64) {
         return false;
     }
     plan->prefix_count = last;
@@ -5599,6 +5599,24 @@ static bool opt_is_scalar_alloca_inst(IRInstruction *inst) {
         && opt_is_scalar_type(inst->data.alloca_inst.allocated_type);
 }
 
+static bool opt_is_scalar_array_alloca_inst(IRInstruction *inst, IRType **element_type, int *length) {
+    if (inst == NULL || inst->kind != IR_INST_ALLOCA) {
+        return false;
+    }
+    IRType *type = inst->data.alloca_inst.allocated_type;
+    if (type == NULL || type->kind != IR_TYPE_ARRAY || !opt_is_scalar_type(type->data.array.element)
+            || type->data.array.length <= 0) {
+        return false;
+    }
+    if (element_type != NULL) {
+        *element_type = type->data.array.element;
+    }
+    if (length != NULL) {
+        *length = type->data.array.length;
+    }
+    return true;
+}
+
 static IRInstruction *opt_scalar_alloca_from_value(IRValue *value) {
     if (value == NULL || value->kind != IR_VALUE_INSTRUCTION) {
         return NULL;
@@ -5801,6 +5819,241 @@ static IRInstruction *opt_find_phi_for_alloca(IRBasicBlock *block, IRInstruction
 }
 
 static void opt_insert_inst_before(IRBasicBlock *block, IRInstruction *before, IRInstruction *inst);
+static IRInstruction *opt_new_inst(IRInstructionKind kind, IRType *result_type);
+
+#define OPT_SROA_MAX_SLOTS_PER_ARRAY 128
+#define OPT_SROA_MAX_SLOTS_PER_FUNCTION 256
+
+typedef struct {
+    int slot;
+    IRInstruction *alloca_inst;
+} OptSROASlot;
+
+typedef struct {
+    OptSROASlot *items;
+    int count;
+    int capacity;
+} OptSROASlotList;
+
+typedef struct {
+    IRInstruction *gep;
+    int slot;
+} OptSROAGep;
+
+typedef struct {
+    OptSROAGep *items;
+    int count;
+    int capacity;
+} OptSROAGepList;
+
+static int opt_sroa_find_slot(OptSROASlotList *list, int slot) {
+    for (int i = 0; i < list->count; ++i) {
+        if (list->items[i].slot == slot) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool opt_sroa_note_slot(OptSROASlotList *list, int slot) {
+    if (opt_sroa_find_slot(list, slot) >= 0) {
+        return true;
+    }
+    if (list->count >= OPT_SROA_MAX_SLOTS_PER_ARRAY) {
+        return false;
+    }
+    ensure_capacity((void **)&list->items, &list->capacity, sizeof(OptSROASlot), list->count + 1);
+    list->items[list->count].slot = slot;
+    list->items[list->count].alloca_inst = NULL;
+    list->count++;
+    return true;
+}
+
+static void opt_sroa_note_gep(OptSROAGepList *list, IRInstruction *gep, int slot) {
+    ensure_capacity((void **)&list->items, &list->capacity, sizeof(OptSROAGep), list->count + 1);
+    list->items[list->count].gep = gep;
+    list->items[list->count].slot = slot;
+    list->count++;
+}
+
+static bool opt_sroa_gep_slot(IRInstruction *alloca_inst, IRInstruction *gep, int *slot) {
+    IRType *element_type = NULL;
+    int length = 0;
+    if (!opt_is_scalar_array_alloca_inst(alloca_inst, &element_type, &length)
+            || gep == NULL || gep->kind != IR_INST_GETELEMENTPTR
+            || gep->data.gep_inst.base_ptr != &alloca_inst->result
+            || !opt_type_equal(gep->data.gep_inst.source_element_type,
+                               alloca_inst->data.alloca_inst.allocated_type)
+            || gep->data.gep_inst.indices.count != 2
+            || gep->result_type == NULL
+            || gep->result_type->kind != IR_TYPE_POINTER
+            || !opt_type_equal(gep->result_type->data.pointer.pointee, element_type)) {
+        return false;
+    }
+    int zero_index = 0;
+    int element_index = 0;
+    if (!opt_const_int_value(gep->data.gep_inst.indices.items[0], &zero_index)
+            || zero_index != 0
+            || !opt_const_int_value(gep->data.gep_inst.indices.items[1], &element_index)
+            || element_index < 0 || element_index >= length) {
+        return false;
+    }
+    *slot = element_index;
+    return true;
+}
+
+static bool opt_sroa_gep_uses_are_direct_memory(IRFunction *function, IRInstruction *gep,
+                                                IRType *element_type, bool *has_memory_use) {
+    IRValue *ptr = &gep->result;
+    *has_memory_use = false;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            if (inst == gep) {
+                continue;
+            }
+            switch (inst->kind) {
+                case IR_INST_LOAD:
+                    if (inst->data.load_inst.ptr == ptr
+                            && opt_type_equal(inst->data.load_inst.value_type, element_type)) {
+                        *has_memory_use = true;
+                        continue;
+                    }
+                    break;
+                case IR_INST_STORE:
+                    if (inst->data.store_inst.ptr == ptr && inst->data.store_inst.value != ptr
+                            && opt_type_equal(inst->data.store_inst.value->type, element_type)) {
+                        *has_memory_use = true;
+                        continue;
+                    }
+                    break;
+                default:
+                    break;
+            }
+            if (opt_count_uses_in_inst(inst, ptr) != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool opt_sroa_collect_array_uses(IRFunction *function, IRInstruction *alloca_inst,
+                                        IRType *element_type, OptSROAGepList *geps,
+                                        OptSROASlotList *slots) {
+    IRValue *array_ptr = &alloca_inst->result;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            if (inst == alloca_inst) {
+                continue;
+            }
+            int array_uses = opt_count_uses_in_inst(inst, array_ptr);
+            if (array_uses == 0) {
+                continue;
+            }
+            int slot = 0;
+            if (array_uses != 1 || !opt_sroa_gep_slot(alloca_inst, inst, &slot)) {
+                return false;
+            }
+            bool has_memory_use = false;
+            if (!opt_sroa_gep_uses_are_direct_memory(function, inst, element_type, &has_memory_use)) {
+                return false;
+            }
+            opt_sroa_note_gep(geps, inst, slot);
+            if (has_memory_use && !opt_sroa_note_slot(slots, slot)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static IRInstruction *opt_sroa_create_slot_alloca(IRInstruction *array_alloca, IRType *element_type) {
+    IRInstruction *slot = opt_new_inst(IR_INST_ALLOCA, mem_pointer_type(element_type));
+    slot->data.alloca_inst.allocated_type = element_type;
+    slot->data.alloca_inst.alignment = array_alloca->data.alloca_inst.alignment;
+    opt_insert_inst_before(array_alloca->parent, array_alloca->next, slot);
+    return slot;
+}
+
+static bool opt_sroa_rewrite_array(IRFunction *function, IRInstruction *alloca_inst,
+                                   int *function_slot_count) {
+    IRType *element_type = NULL;
+    int length = 0;
+    if (!opt_is_scalar_array_alloca_inst(alloca_inst, &element_type, &length)) {
+        return false;
+    }
+
+    OptSROAGepList geps = {0};
+    OptSROASlotList slots = {0};
+    bool ok = opt_sroa_collect_array_uses(function, alloca_inst, element_type, &geps, &slots);
+    if (ok && *function_slot_count + slots.count > OPT_SROA_MAX_SLOTS_PER_FUNCTION) {
+        ok = false;
+    }
+    if (!ok) {
+        free(geps.items);
+        free(slots.items);
+        return false;
+    }
+
+    for (int i = 0; i < slots.count; ++i) {
+        slots.items[i].alloca_inst = opt_sroa_create_slot_alloca(alloca_inst, element_type);
+    }
+    *function_slot_count += slots.count;
+
+    for (int gi = 0; gi < geps.count; ++gi) {
+        IRInstruction *gep = geps.items[gi].gep;
+        int slot_index = opt_sroa_find_slot(&slots, geps.items[gi].slot);
+        if (slot_index < 0) {
+            continue;
+        }
+        IRValue *replacement = &slots.items[slot_index].alloca_inst->result;
+        for (int bi = 0; bi < function->blocks.count; ++bi) {
+            IRBasicBlock *block = function->blocks.items[bi];
+            for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+                if (inst->kind == IR_INST_LOAD && inst->data.load_inst.ptr == &gep->result) {
+                    inst->data.load_inst.ptr = replacement;
+                } else if (inst->kind == IR_INST_STORE && inst->data.store_inst.ptr == &gep->result) {
+                    inst->data.store_inst.ptr = replacement;
+                }
+            }
+        }
+    }
+
+    bool changed = false;
+    for (int gi = 0; gi < geps.count; ++gi) {
+        IRInstruction *gep = geps.items[gi].gep;
+        if (gep->parent != NULL && opt_count_uses(function, &gep->result) == 0) {
+            opt_remove_inst(gep->parent, gep);
+            changed = true;
+        }
+    }
+    if (alloca_inst->parent != NULL && opt_count_uses(function, &alloca_inst->result) == 0) {
+        opt_remove_inst(alloca_inst->parent, alloca_inst);
+        changed = true;
+    }
+    changed = changed || slots.count > 0;
+    free(geps.items);
+    free(slots.items);
+    return changed;
+}
+
+static bool opt_local_array_sroa(IRFunction *function) {
+    bool changed = false;
+    int function_slot_count = 0;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL;) {
+            IRInstruction *next = inst->next;
+            if (opt_is_scalar_array_alloca_inst(inst, NULL, NULL)) {
+                changed = opt_sroa_rewrite_array(function, inst, &function_slot_count) || changed;
+            }
+            inst = next;
+        }
+    }
+    return changed;
+}
 
 static IRInstruction *opt_insert_phi_for_alloca(IRBasicBlock *block, IRInstruction *alloca_inst) {
     IRInstruction *existing = opt_find_phi_for_alloca(block, alloca_inst);
@@ -6387,6 +6640,7 @@ static bool opt_block_local_load_cse(IRFunction *function, IRBasicBlock *block) 
 
 static bool opt_global_memory_pass(IRFunction *function) {
     bool changed = false;
+    changed = opt_local_array_sroa(function) || changed;
     changed = opt_mem2reg(function) || changed;
     changed = opt_promote_single_store_allocas(function) || changed;
     changed = opt_global_cse(function) || changed;
@@ -6416,6 +6670,393 @@ static bool opt_delete_after_terminator(IRFunction *function) {
             inst = next;
         }
     }
+    return changed;
+}
+
+static bool opt_block_has_phi(IRBasicBlock *block) {
+    return block != NULL && block->first_inst != NULL && block->first_inst->kind == IR_INST_PHI;
+}
+
+static IRBasicBlock *opt_unconditional_branch_target(IRBasicBlock *block) {
+    if (block == NULL || block->last_inst == NULL || block->last_inst->kind != IR_INST_BR
+            || block->last_inst->data.br_inst.is_conditional) {
+        return NULL;
+    }
+    return block->last_inst->data.br_inst.true_block;
+}
+
+static bool opt_block_is_jump_only(IRBasicBlock *block) {
+    return block != NULL && !opt_block_has_phi(block)
+        && block->first_inst != NULL && block->first_inst == block->last_inst
+        && opt_unconditional_branch_target(block) != NULL;
+}
+
+static int opt_cfg_phi_incoming_index(IRInstruction *phi, IRBasicBlock *block) {
+    if (phi == NULL || phi->kind != IR_INST_PHI) {
+        return -1;
+    }
+    for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+        if (phi->data.phi_inst.blocks[i] == block) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool opt_phi_can_replace_incoming_block(IRInstruction *phi,
+                                               IRBasicBlock *old_block,
+                                               IRBasicBlock *new_block) {
+    bool saw_old = false;
+    for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+        if (phi->data.phi_inst.blocks[i] != old_block) {
+            continue;
+        }
+        saw_old = true;
+        IRValue *old_value = phi->data.phi_inst.values.items[i];
+        for (int j = 0; j < phi->data.phi_inst.count; ++j) {
+            if (i != j && phi->data.phi_inst.blocks[j] == new_block
+                    && !opt_value_equal(old_value, phi->data.phi_inst.values.items[j])) {
+                return false;
+            }
+        }
+    }
+    return saw_old;
+}
+
+static bool opt_phi_replace_incoming_block(IRInstruction *phi,
+                                           IRBasicBlock *old_block,
+                                           IRBasicBlock *new_block) {
+    if (!opt_phi_can_replace_incoming_block(phi, old_block, new_block)) {
+        return false;
+    }
+    bool changed = false;
+    int out = 0;
+    for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+        IRBasicBlock *block = phi->data.phi_inst.blocks[i];
+        IRValue *value = phi->data.phi_inst.values.items[i];
+        if (block == old_block) {
+            block = new_block;
+            changed = true;
+        }
+        bool duplicate = false;
+        for (int j = 0; j < out; ++j) {
+            if (phi->data.phi_inst.blocks[j] == block
+                    && opt_value_equal(phi->data.phi_inst.values.items[j], value)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            changed = true;
+            continue;
+        }
+        phi->data.phi_inst.blocks[out] = block;
+        phi->data.phi_inst.values.items[out] = value;
+        ++out;
+    }
+    phi->data.phi_inst.count = out;
+    phi->data.phi_inst.values.count = out;
+    return changed;
+}
+
+static bool opt_block_can_replace_phi_incoming(IRBasicBlock *block,
+                                               IRBasicBlock *old_block,
+                                               IRBasicBlock *new_block) {
+    for (IRInstruction *phi = block != NULL ? block->first_inst : NULL;
+            phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (!opt_phi_can_replace_incoming_block(phi, old_block, new_block)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool opt_block_replace_phi_incoming(IRBasicBlock *block,
+                                           IRBasicBlock *old_block,
+                                           IRBasicBlock *new_block) {
+    bool changed = false;
+    for (IRInstruction *phi = block != NULL ? block->first_inst : NULL;
+            phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        changed = opt_phi_replace_incoming_block(phi, old_block, new_block) || changed;
+    }
+    return changed;
+}
+
+static bool opt_phi_can_expand_jump_incoming(IRInstruction *phi,
+                                             IRBasicBlock *jump_block,
+                                             IRBasicBlock **preds,
+                                             int pred_count) {
+    int old_index = opt_cfg_phi_incoming_index(phi, jump_block);
+    if (old_index < 0) {
+        return false;
+    }
+    IRValue *value = phi->data.phi_inst.values.items[old_index];
+    for (int i = 0; i < pred_count; ++i) {
+        int pred_index = opt_cfg_phi_incoming_index(phi, preds[i]);
+        if (pred_index >= 0 && !opt_value_equal(value, phi->data.phi_inst.values.items[pred_index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool opt_block_can_expand_jump_incoming(IRBasicBlock *target,
+                                               IRBasicBlock *jump_block,
+                                               IRBasicBlock **preds,
+                                               int pred_count) {
+    if (!opt_block_has_phi(target)) {
+        return true;
+    }
+    if (pred_count != 1) {
+        return false;
+    }
+    for (IRInstruction *phi = target->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (!opt_phi_can_expand_jump_incoming(phi, jump_block, preds, pred_count)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void opt_phi_expand_jump_incoming(IRInstruction *phi,
+                                         IRBasicBlock *jump_block,
+                                         IRBasicBlock **preds,
+                                         int pred_count) {
+    int old_index = opt_cfg_phi_incoming_index(phi, jump_block);
+    if (old_index < 0) {
+        return;
+    }
+    IRValue *value = phi->data.phi_inst.values.items[old_index];
+    int out = 0;
+    for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+        if (phi->data.phi_inst.blocks[i] == jump_block) {
+            continue;
+        }
+        phi->data.phi_inst.blocks[out] = phi->data.phi_inst.blocks[i];
+        phi->data.phi_inst.values.items[out] = phi->data.phi_inst.values.items[i];
+        ++out;
+    }
+    ensure_capacity((void **)&phi->data.phi_inst.blocks, &phi->data.phi_inst.capacity,
+                    sizeof(IRBasicBlock *), out + pred_count);
+    ensure_capacity((void **)&phi->data.phi_inst.values.items, &phi->data.phi_inst.values.capacity,
+                    sizeof(IRValue *), out + pred_count);
+    for (int i = 0; i < pred_count; ++i) {
+        bool exists = false;
+        for (int j = 0; j < out; ++j) {
+            if (phi->data.phi_inst.blocks[j] == preds[i]) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            phi->data.phi_inst.blocks[out] = preds[i];
+            phi->data.phi_inst.values.items[out] = value;
+            ++out;
+        }
+    }
+    phi->data.phi_inst.count = out;
+    phi->data.phi_inst.values.count = out;
+}
+
+static void opt_block_expand_jump_incoming(IRBasicBlock *target,
+                                           IRBasicBlock *jump_block,
+                                           IRBasicBlock **preds,
+                                           int pred_count) {
+    for (IRInstruction *phi = target != NULL ? target->first_inst : NULL;
+            phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        opt_phi_expand_jump_incoming(phi, jump_block, preds, pred_count);
+    }
+}
+
+static bool opt_redirect_branch_target(IRBasicBlock *block,
+                                       IRBasicBlock *old_target,
+                                       IRBasicBlock *new_target) {
+    IRInstruction *term = block != NULL ? block->last_inst : NULL;
+    if (term == NULL || term->kind != IR_INST_BR) {
+        return false;
+    }
+    bool changed = false;
+    if (term->data.br_inst.true_block == old_target) {
+        term->data.br_inst.true_block = new_target;
+        changed = true;
+    }
+    if (term->data.br_inst.is_conditional && term->data.br_inst.false_block == old_target) {
+        term->data.br_inst.false_block = new_target;
+        changed = true;
+    }
+    if (term->data.br_inst.is_conditional
+            && term->data.br_inst.true_block == term->data.br_inst.false_block) {
+        term->data.br_inst.is_conditional = false;
+        term->data.br_inst.condition = NULL;
+        term->data.br_inst.false_block = NULL;
+        changed = true;
+    }
+    return changed;
+}
+
+static bool opt_remove_block_from_function(IRFunction *function, IRBasicBlock *remove_block) {
+    if (function == NULL || remove_block == NULL || function->entry == remove_block) {
+        return false;
+    }
+    bool removed = false;
+    int out = 0;
+    IRBasicBlock *prev = NULL;
+    for (int i = 0; i < function->blocks.count; ++i) {
+        IRBasicBlock *block = function->blocks.items[i];
+        if (block == remove_block) {
+            removed = true;
+            continue;
+        }
+        function->blocks.items[out++] = block;
+        if (prev != NULL) {
+            prev->next = block;
+        }
+        prev = block;
+    }
+    if (prev != NULL) {
+        prev->next = NULL;
+    }
+    function->blocks.count = out;
+    remove_block->next = NULL;
+    return removed;
+}
+
+static bool opt_thread_jump_only_blocks(IRFunction *function) {
+    opt_rebuild_cfg(function);
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *jump = function->blocks.items[bi];
+        if (jump == function->entry || !opt_block_is_jump_only(jump) || jump->pred_count <= 0) {
+            continue;
+        }
+        IRBasicBlock *target = opt_unconditional_branch_target(jump);
+        if (target == NULL || target == jump) {
+            continue;
+        }
+        bool self_edge = false;
+        for (int pi = 0; pi < jump->pred_count; ++pi) {
+            if (jump->preds[pi] == target) {
+                self_edge = true;
+                break;
+            }
+        }
+        if (self_edge || !opt_block_can_expand_jump_incoming(target, jump, jump->preds, jump->pred_count)) {
+            continue;
+        }
+        opt_block_expand_jump_incoming(target, jump, jump->preds, jump->pred_count);
+        for (int pi = 0; pi < jump->pred_count; ++pi) {
+            opt_redirect_branch_target(jump->preds[pi], jump, target);
+        }
+        opt_rebuild_cfg(function);
+        return true;
+    }
+    return false;
+}
+
+static bool opt_branch_targets_block(IRInstruction *term, IRBasicBlock *block) {
+    if (term == NULL || term->kind != IR_INST_BR) {
+        return false;
+    }
+    return term->data.br_inst.true_block == block
+        || (term->data.br_inst.is_conditional && term->data.br_inst.false_block == block);
+}
+
+static bool opt_block_successors_can_replace_phi_incoming(IRBasicBlock *block,
+                                                          IRBasicBlock *old_block,
+                                                          IRBasicBlock *new_block) {
+    IRInstruction *term = block != NULL ? block->last_inst : NULL;
+    if (term == NULL || term->kind != IR_INST_BR) {
+        return true;
+    }
+    IRBasicBlock *true_block = term->data.br_inst.true_block;
+    IRBasicBlock *false_block = term->data.br_inst.is_conditional ? term->data.br_inst.false_block : NULL;
+    if (true_block != NULL && !opt_block_can_replace_phi_incoming(true_block, old_block, new_block)) {
+        return false;
+    }
+    if (false_block != NULL && false_block != true_block
+            && !opt_block_can_replace_phi_incoming(false_block, old_block, new_block)) {
+        return false;
+    }
+    return true;
+}
+
+static void opt_block_successors_replace_phi_incoming(IRBasicBlock *block,
+                                                      IRBasicBlock *old_block,
+                                                      IRBasicBlock *new_block) {
+    IRInstruction *term = block != NULL ? block->last_inst : NULL;
+    if (term == NULL || term->kind != IR_INST_BR) {
+        return;
+    }
+    IRBasicBlock *true_block = term->data.br_inst.true_block;
+    IRBasicBlock *false_block = term->data.br_inst.is_conditional ? term->data.br_inst.false_block : NULL;
+    if (true_block != NULL) {
+        opt_block_replace_phi_incoming(true_block, old_block, new_block);
+    }
+    if (false_block != NULL && false_block != true_block) {
+        opt_block_replace_phi_incoming(false_block, old_block, new_block);
+    }
+}
+
+static void opt_append_block_instructions(IRBasicBlock *target, IRBasicBlock *source) {
+    if (target == NULL || source == NULL || source->first_inst == NULL) {
+        return;
+    }
+    for (IRInstruction *inst = source->first_inst; inst != NULL; inst = inst->next) {
+        inst->parent = target;
+    }
+    if (target->last_inst != NULL) {
+        target->last_inst->next = source->first_inst;
+        source->first_inst->prev = target->last_inst;
+    } else {
+        target->first_inst = source->first_inst;
+        source->first_inst->prev = NULL;
+    }
+    target->last_inst = source->last_inst;
+    source->first_inst = NULL;
+    source->last_inst = NULL;
+}
+
+static bool opt_merge_linear_blocks(IRFunction *function) {
+    opt_rebuild_cfg(function);
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        IRInstruction *term = block->last_inst;
+        IRBasicBlock *succ = opt_unconditional_branch_target(block);
+        if (succ == NULL || succ == block || succ == function->entry || opt_block_has_phi(succ)
+                || succ->pred_count != 1 || succ->preds[0] != block
+                || succ->first_inst == NULL || succ->last_inst == NULL) {
+            continue;
+        }
+        if (opt_branch_targets_block(succ->last_inst, block)
+                || !opt_block_successors_can_replace_phi_incoming(succ, succ, block)) {
+            continue;
+        }
+        opt_block_successors_replace_phi_incoming(succ, succ, block);
+        opt_remove_inst(block, term);
+        opt_append_block_instructions(block, succ);
+        opt_remove_block_from_function(function, succ);
+        opt_rebuild_cfg(function);
+        return true;
+    }
+    return false;
+}
+
+static bool opt_simplify_cfg(IRFunction *function) {
+    bool changed = false;
+    int max_iterations = function != NULL ? function->blocks.count * 2 + 8 : 0;
+    for (int iter = 0; iter < max_iterations; ++iter) {
+        bool local = false;
+        local = opt_simplify_const_branches(function) || local;
+        local = opt_remove_unreachable_blocks(function) || local;
+        local = opt_thread_jump_only_blocks(function) || local;
+        local = opt_merge_linear_blocks(function) || local;
+        local = opt_simplify_phi_nodes(function) || local;
+        local = opt_delete_after_terminator(function) || local;
+        changed = local || changed;
+        if (!local) {
+            break;
+        }
+    }
+    opt_rebuild_cfg(function);
     return changed;
 }
 
@@ -7527,9 +8168,198 @@ static IRInstruction *opt_clone_inst_with_map(IRBasicBlock *block, IRInstruction
     }
 }
 
+static bool opt_value_defined_in_deleted_loop(IRFunction *function, bool *in_loop, IRValue *value) {
+    if (value == NULL || value->kind != IR_VALUE_INSTRUCTION) {
+        return false;
+    }
+    IRInstruction *inst = value->data.instruction;
+    int block_index = opt_function_block_index(function, inst != NULL ? inst->parent : NULL);
+    return block_index >= 0 && in_loop[block_index];
+}
+
+static bool opt_loop_defs_safe_to_delete_after_unroll(IRFunction *function, bool *in_loop,
+                                                      IRBasicBlock *header,
+                                                      IRBasicBlock *preheader) {
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        if (!in_loop[bi]) {
+            continue;
+        }
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->result_type == NULL || inst->result_type->kind == IR_TYPE_VOID) {
+                continue;
+            }
+            bool header_phi = inst->kind == IR_INST_PHI && inst->parent == header;
+            for (int bj = 0; bj < function->blocks.count; ++bj) {
+                if (in_loop[bj]) {
+                    continue;
+                }
+                IRBasicBlock *use_block = function->blocks.items[bj];
+                for (IRInstruction *use = use_block->first_inst; use != NULL; use = use->next) {
+                    if (opt_count_uses_in_inst(use, &inst->result) == 0) {
+                        continue;
+                    }
+                    if (use_block == preheader || !header_phi) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static IRValue *opt_remap_loop_exit_value_after_unroll(IRFunction *function, bool *in_loop,
+                                                       OptValueMap *final_state,
+                                                       IRValue *value,
+                                                       bool *ok) {
+    *ok = true;
+    if (!opt_value_defined_in_deleted_loop(function, in_loop, value)) {
+        return value;
+    }
+    IRValue *mapped = opt_value_map_get(final_state, value);
+    if (mapped == value || opt_value_defined_in_deleted_loop(function, in_loop, mapped)) {
+        *ok = false;
+        return value;
+    }
+    return mapped;
+}
+
+static bool opt_exit_phi_can_update_after_unroll(IRFunction *function, bool *in_loop,
+                                                 IRInstruction *phi,
+                                                 IRBasicBlock *header,
+                                                 IRBasicBlock *preheader,
+                                                 OptValueMap *final_state) {
+    bool saw_header = false;
+    IRValue *replacement = NULL;
+    for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+        if (phi->data.phi_inst.blocks[i] != header) {
+            continue;
+        }
+        bool ok = true;
+        IRValue *value = opt_remap_loop_exit_value_after_unroll(function, in_loop, final_state,
+                                                               phi->data.phi_inst.values.items[i], &ok);
+        if (!ok) {
+            return false;
+        }
+        if (replacement != NULL && !opt_value_equal(replacement, value)) {
+            return false;
+        }
+        replacement = value;
+        saw_header = true;
+    }
+    if (!saw_header || replacement == NULL) {
+        return false;
+    }
+    for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+        if (phi->data.phi_inst.blocks[i] == preheader
+                && !opt_value_equal(phi->data.phi_inst.values.items[i], replacement)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool opt_exit_phis_can_update_after_unroll(IRFunction *function, bool *in_loop,
+                                                  IRBasicBlock *exit_block,
+                                                  IRBasicBlock *header,
+                                                  IRBasicBlock *preheader,
+                                                  OptValueMap *final_state) {
+    for (IRInstruction *phi = exit_block != NULL ? exit_block->first_inst : NULL;
+            phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        if (!opt_exit_phi_can_update_after_unroll(function, in_loop, phi, header, preheader, final_state)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void opt_exit_phi_update_after_unroll(IRFunction *function, bool *in_loop,
+                                             IRInstruction *phi,
+                                             IRBasicBlock *header,
+                                             IRBasicBlock *preheader,
+                                             OptValueMap *final_state) {
+    IRValue *replacement = NULL;
+    for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+        if (phi->data.phi_inst.blocks[i] == header) {
+            bool ok = true;
+            replacement = opt_remap_loop_exit_value_after_unroll(function, in_loop, final_state,
+                                                                phi->data.phi_inst.values.items[i], &ok);
+            (void)ok;
+            break;
+        }
+    }
+    int out = 0;
+    bool wrote_preheader = false;
+    for (int i = 0; i < phi->data.phi_inst.count; ++i) {
+        IRBasicBlock *block = phi->data.phi_inst.blocks[i];
+        IRValue *value = phi->data.phi_inst.values.items[i];
+        if (block == header) {
+            continue;
+        }
+        if (block == preheader) {
+            value = replacement;
+            wrote_preheader = true;
+        }
+        phi->data.phi_inst.blocks[out] = block;
+        phi->data.phi_inst.values.items[out] = value;
+        ++out;
+    }
+    if (!wrote_preheader && replacement != NULL) {
+        ensure_capacity((void **)&phi->data.phi_inst.blocks, &phi->data.phi_inst.capacity,
+                        sizeof(IRBasicBlock *), out + 1);
+        ensure_capacity((void **)&phi->data.phi_inst.values.items, &phi->data.phi_inst.values.capacity,
+                        sizeof(IRValue *), out + 1);
+        phi->data.phi_inst.blocks[out] = preheader;
+        phi->data.phi_inst.values.items[out] = replacement;
+        ++out;
+    }
+    phi->data.phi_inst.count = out;
+    phi->data.phi_inst.values.count = out;
+}
+
+static void opt_update_exit_phis_after_unroll(IRFunction *function, bool *in_loop,
+                                              IRBasicBlock *exit_block,
+                                              IRBasicBlock *header,
+                                              IRBasicBlock *preheader,
+                                              OptValueMap *final_state) {
+    for (IRInstruction *phi = exit_block != NULL ? exit_block->first_inst : NULL;
+            phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+        opt_exit_phi_update_after_unroll(function, in_loop, phi, header, preheader, final_state);
+    }
+}
+
+static void opt_replace_uses_outside_loop(IRFunction *function, bool *in_loop,
+                                          IRBasicBlock *skip_block,
+                                          IRValue *old_value,
+                                          IRValue *new_value) {
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        if (in_loop[bi] || function->blocks.items[bi] == skip_block) {
+            continue;
+        }
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            opt_replace_value_in_inst(inst, old_value, new_value);
+        }
+    }
+}
+
+static bool opt_final_state_available_after_unroll(IRFunction *function, bool *in_loop,
+                                                   OptValueMap *final_state) {
+    for (int i = 0; i < final_state->count; ++i) {
+        if (opt_value_defined_in_deleted_loop(function, in_loop, final_state->to[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool opt_try_unroll_small_loop(IRFunction *function, bool *in_loop,
                                       IRBasicBlock *header, IRBasicBlock *preheader,
-                                      IRBasicBlock *latch) {
+                                      IRBasicBlock *latch, bool *deleted_loop) {
+    if (deleted_loop != NULL) {
+        *deleted_loop = false;
+    }
     if (opt_loop_block_count(function, in_loop) != 2 || latch == NULL || latch == header) {
         return false;
     }
@@ -7650,8 +8480,26 @@ static bool opt_try_unroll_small_loop(IRFunction *function, bool *in_loop,
         IRValue *final_value = opt_value_map_get(&state, &phi->result);
         opt_phi_incoming_push(phi, preheader, final_value);
     }
+    bool can_delete_loop = opt_loop_defs_safe_to_delete_after_unroll(function, in_loop, header, preheader)
+        && opt_final_state_available_after_unroll(function, in_loop, &state)
+        && opt_exit_phis_can_update_after_unroll(function, in_loop, exit_block, header, preheader, &state)
+        && preheader->last_inst != NULL
+        && preheader->last_inst->kind == IR_INST_BR
+        && !preheader->last_inst->data.br_inst.is_conditional
+        && preheader->last_inst->data.br_inst.true_block == header;
+    if (can_delete_loop) {
+        opt_update_exit_phis_after_unroll(function, in_loop, exit_block, header, preheader, &state);
+        for (IRInstruction *phi = header->first_inst; phi != NULL && phi->kind == IR_INST_PHI; phi = phi->next) {
+            IRValue *final_value = opt_value_map_get(&state, &phi->result);
+            opt_replace_uses_outside_loop(function, in_loop, preheader, &phi->result, final_value);
+        }
+        preheader->last_inst->data.br_inst.true_block = exit_block;
+        opt_rebuild_cfg(function);
+        if (deleted_loop != NULL) {
+            *deleted_loop = true;
+        }
+    }
     opt_value_map_reset(&state);
-    (void)exit_block;
     return true;
 }
 
@@ -7735,7 +8583,14 @@ static bool opt_loop_pass(IRFunction *function) {
             if (preheader != NULL) {
                 IRBasicBlock *unique_latch = opt_find_unique_loop_latch(function, in_loop, header);
                 if (unique_latch != NULL) {
-                    changed = opt_try_unroll_small_loop(function, in_loop, header, preheader, unique_latch) || changed;
+                    bool deleted_loop = false;
+                    changed = opt_try_unroll_small_loop(function, in_loop, header, preheader,
+                                                        unique_latch, &deleted_loop) || changed;
+                    if (deleted_loop) {
+                        free(in_loop);
+                        free(dom);
+                        return true;
+                    }
                     changed = opt_loop_strength_reduction(function, in_loop, header, preheader, unique_latch) || changed;
                     changed = opt_loop_pointer_induction(function, in_loop, header, preheader, unique_latch) || changed;
                 }
@@ -7754,10 +8609,9 @@ static bool opt_simplify_function(IRFunction *function) {
     for (int bi = 0; bi < function->blocks.count; ++bi) {
         changed = opt_basic_block(function, function->blocks.items[bi]) || changed;
     }
-    changed = opt_simplify_const_branches(function) || changed;
-    changed = opt_remove_unreachable_blocks(function) || changed;
+    changed = opt_simplify_cfg(function) || changed;
     changed = opt_delete_dead_pure_insts(function) || changed;
-    changed = opt_delete_after_terminator(function) || changed;
+    changed = opt_simplify_cfg(function) || changed;
     return changed;
 }
 
@@ -8289,13 +9143,25 @@ typedef struct RVRegTemp {
     IRInstruction *use_inst;
     const char *reg;
     bool persistent;
+    bool linear_scan;
+    int start_pos;
+    int end_pos;
     struct RVRegTemp *next;
 } RVRegTemp;
+
+typedef struct {
+    IRInstruction *inst;
+    int pos;
+} RVInstPosition;
 
 typedef struct {
     IRFunction *function;
     RVSlot *slots;
     RVRegTemp *reg_temps;
+    RVInstPosition *inst_positions;
+    int inst_position_count;
+    int inst_position_capacity;
+    int linear_end_pos;
     int next_offset;
     int frame_size;
     int max_outgoing_args;
@@ -8320,6 +9186,8 @@ typedef struct {
 
 static const char *g_rv_loop_regs[] = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
 #define RV_LOOP_REG_COUNT ((int)(sizeof(g_rv_loop_regs) / sizeof(g_rv_loop_regs[0])))
+
+static int rv_saved_reg_index(const char *reg);
 
 static const char *rv_symbol_name(const char *name) {
     if (name == NULL) {
@@ -8409,6 +9277,7 @@ static bool rv_function_all_self_calls_are_tail(IRFunction *function) {
 
 static bool rv_block_has_phi(IRBasicBlock *block);
 static bool rv_const_i32_value(IRValue *value, int *out_value);
+static int rv_param_incoming_stack_offset(IRFunction *function, int param_index);
 static void rv_emit_gep_to_reg(RVFrame *frame, IRInstruction *inst, const char *dst);
 
 static char *rv_block_label(IRFunction *function, IRBasicBlock *block) {
@@ -8489,6 +9358,34 @@ static RVRegTemp *rv_find_reg_temp(RVFrame *frame, IRValue *value) {
     return NULL;
 }
 
+static void rv_build_inst_positions(RVFrame *frame, IRFunction *function) {
+    int pos = 2;
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            ensure_capacity((void **)&frame->inst_positions, &frame->inst_position_capacity,
+                            sizeof(RVInstPosition), frame->inst_position_count + 1);
+            frame->inst_positions[frame->inst_position_count].inst = inst;
+            frame->inst_positions[frame->inst_position_count].pos = pos;
+            frame->inst_position_count++;
+            pos += 2;
+        }
+    }
+    frame->linear_end_pos = pos + 2;
+}
+
+static int rv_inst_position(RVFrame *frame, IRInstruction *inst) {
+    if (frame == NULL || inst == NULL) {
+        return frame != NULL ? frame->linear_end_pos : 0;
+    }
+    for (int i = 0; i < frame->inst_position_count; ++i) {
+        if (frame->inst_positions[i].inst == inst) {
+            return frame->inst_positions[i].pos;
+        }
+    }
+    return frame->linear_end_pos;
+}
+
 static void rv_add_reg_temp(RVFrame *frame, IRValue *value,
                             IRInstruction *def_inst, IRInstruction *use_inst,
                             const char *reg, bool persistent) {
@@ -8502,6 +9399,30 @@ static void rv_add_reg_temp(RVFrame *frame, IRValue *value,
     temp->use_inst = use_inst;
     temp->reg = reg;
     temp->persistent = persistent;
+    temp->linear_scan = false;
+    temp->start_pos = -1;
+    temp->end_pos = -1;
+    temp->next = frame->reg_temps;
+    frame->reg_temps = temp;
+}
+
+static void rv_add_linear_scan_reg_home(RVFrame *frame, IRValue *value, const char *reg,
+                                        int start_pos, int end_pos) {
+    if (rv_find_reg_temp(frame, value) != NULL) {
+        return;
+    }
+    int index = rv_saved_reg_index(reg);
+    if (index >= 0) {
+        frame->used_saved_regs[index] = true;
+    }
+    RVRegTemp *temp = (RVRegTemp *)xmalloc(sizeof(RVRegTemp));
+    memset(temp, 0, sizeof(RVRegTemp));
+    temp->value = value;
+    temp->reg = reg;
+    temp->persistent = true;
+    temp->linear_scan = true;
+    temp->start_pos = start_pos;
+    temp->end_pos = end_pos;
     temp->next = frame->reg_temps;
     frame->reg_temps = temp;
 }
@@ -8521,6 +9442,9 @@ static const char *rv_value_reg_home(RVFrame *frame, IRValue *value) {
 }
 
 static void rv_add_persistent_reg_home(RVFrame *frame, IRValue *value, const char *reg) {
+    if (rv_find_reg_temp(frame, value) != NULL) {
+        return;
+    }
     int index = rv_saved_reg_index(reg);
     if (index >= 0) {
         frame->used_saved_regs[index] = true;
@@ -8528,9 +9452,22 @@ static void rv_add_persistent_reg_home(RVFrame *frame, IRValue *value, const cha
     rv_add_reg_temp(frame, value, NULL, NULL, reg, true);
 }
 
-static bool rv_reg_reserved_by_persistent_home(RVFrame *frame, const char *reg) {
+static bool rv_reg_reserved_by_persistent_home_between(RVFrame *frame, const char *reg,
+                                                       int start_pos, int end_pos) {
+    (void)start_pos;
+    (void)end_pos;
     for (RVRegTemp *temp = frame->reg_temps; temp != NULL; temp = temp->next) {
-        if (temp->persistent && strcmp(temp->reg, reg) == 0) {
+        if (!temp->persistent || strcmp(temp->reg, reg) != 0) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool rv_reg_reserved_by_infinite_home(RVFrame *frame, const char *reg) {
+    for (RVRegTemp *temp = frame->reg_temps; temp != NULL; temp = temp->next) {
+        if (temp->persistent && !temp->linear_scan && strcmp(temp->reg, reg) == 0) {
             return true;
         }
     }
@@ -8708,6 +9645,9 @@ static void rv_emit_and_i32_const(FILE *out, const char *dst, const char *src, i
 
 static int rv_count_instruction_uses(IRInstruction *inst, IRValue *value);
 static int rv_count_function_uses(IRFunction *function, IRValue *value);
+static bool rv_gep_is_folded_into_memory(RVFrame *frame, IRInstruction *gep);
+static bool rv_gep_recomputable_for_memory(IRFunction *function, IRInstruction *gep);
+static bool rv_icmp_only_feeds_own_branch(IRFunction *function, IRInstruction *inst);
 
 static bool rv_inst_reg_temp_supported(IRInstruction *inst) {
     if (inst == NULL || inst->result_type == NULL ||
@@ -8908,14 +9848,327 @@ static void rv_plan_reg_temps_for_block(RVFrame *frame, IRBasicBlock *block) {
             }
             reg_count = reg_count < 2 ? reg_count : 2;
         }
+        int start_pos = rv_inst_position(frame, inst);
+        int end_pos = rv_inst_position(frame, use_inst);
+        if (end_pos < start_pos) {
+            end_pos = start_pos;
+        }
         for (int i = 0; i < reg_count; ++i) {
-            if (active[i] == NULL && !rv_reg_reserved_by_persistent_home(frame, regs[i])) {
+            if (active[i] == NULL
+                    && !rv_reg_reserved_by_persistent_home_between(frame, regs[i], start_pos, end_pos)) {
                 active[i] = &inst->result;
                 rv_add_reg_temp(frame, &inst->result, inst, use_inst, regs[i], false);
                 break;
             }
         }
     }
+}
+
+typedef struct {
+    IRValue *value;
+    IRInstruction *def_inst;
+    IRBasicBlock *def_block;
+    int start_pos;
+    int end_pos;
+    int use_count;
+    bool is_float;
+    bool crosses_call;
+    bool used_by_call;
+    bool used_outside_def_block;
+    const char *assigned_reg;
+} RVLiveInterval;
+
+typedef struct {
+    RVLiveInterval *items;
+    int count;
+    int capacity;
+    int *call_positions;
+    int call_count;
+    int call_capacity;
+} RVLiveIntervalList;
+
+static int rv_live_interval_find(RVLiveIntervalList *list, IRValue *value) {
+    for (int i = 0; i < list->count; ++i) {
+        if (list->items[i].value == value) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool rv_value_is_linear_scan_candidate(RVFrame *frame, IRValue *value) {
+    if (value == NULL || rv_find_reg_temp(frame, value) != NULL) {
+        return false;
+    }
+    if (value->kind == IR_VALUE_PARAM) {
+        return true;
+    }
+    if (value->kind != IR_VALUE_INSTRUCTION) {
+        return false;
+    }
+    IRInstruction *inst = value->data.instruction;
+    if (inst == NULL || inst->result_type == NULL || inst->result_type->kind == IR_TYPE_VOID) {
+        return false;
+    }
+    if (inst->kind == IR_INST_ALLOCA || inst->kind == IR_INST_PHI) {
+        return false;
+    }
+    if (inst->kind == IR_INST_GETELEMENTPTR
+            && (rv_gep_is_folded_into_memory(frame, inst)
+                || rv_gep_recomputable_for_memory(frame->function, inst))) {
+        return false;
+    }
+    if (inst->kind == IR_INST_ICMP && rv_icmp_only_feeds_own_branch(frame->function, inst)) {
+        return false;
+    }
+    IRInstruction *local_use = NULL;
+    if (inst->parent != NULL && rv_inst_can_be_reg_temp(frame->function, inst->parent, inst, &local_use)) {
+        (void)local_use;
+        return false;
+    }
+    return true;
+}
+
+static void rv_live_interval_add_value(RVFrame *frame, RVLiveIntervalList *list,
+                                       IRValue *value, int start_pos,
+                                       IRInstruction *def_inst) {
+    if (!rv_value_is_linear_scan_candidate(frame, value)
+            || rv_live_interval_find(list, value) >= 0) {
+        return;
+    }
+    ensure_capacity((void **)&list->items, &list->capacity,
+                    sizeof(RVLiveInterval), list->count + 1);
+    RVLiveInterval *interval = &list->items[list->count++];
+    memset(interval, 0, sizeof(*interval));
+    interval->value = value;
+    interval->def_inst = def_inst;
+    interval->def_block = def_inst != NULL ? def_inst->parent : NULL;
+    interval->start_pos = start_pos;
+    interval->end_pos = start_pos;
+    interval->is_float = rv_value_is_float(value);
+}
+
+static void rv_live_interval_note_use(RVFrame *frame, RVLiveIntervalList *list,
+                                      IRValue *value, int use_pos, IRBasicBlock *use_block,
+                                      bool used_by_call) {
+    int index = rv_live_interval_find(list, value);
+    if (index < 0) {
+        return;
+    }
+    RVLiveInterval *interval = &list->items[index];
+    interval->use_count++;
+    if (used_by_call) {
+        interval->used_by_call = true;
+    }
+    if (use_pos < interval->start_pos) {
+        interval->end_pos = frame->linear_end_pos;
+    } else if (use_pos > interval->end_pos) {
+        interval->end_pos = use_pos;
+    }
+    if (interval->def_block != NULL && use_block != NULL && interval->def_block != use_block) {
+        interval->used_outside_def_block = true;
+    }
+}
+
+static void rv_live_interval_note_value_list(RVFrame *frame, RVLiveIntervalList *list,
+                                             IRValueList *values, int use_pos,
+                                             IRBasicBlock *use_block, bool used_by_call) {
+    for (int i = 0; i < values->count; ++i) {
+        rv_live_interval_note_use(frame, list, values->items[i], use_pos, use_block, used_by_call);
+    }
+}
+
+static void rv_live_interval_note_inst_uses(RVFrame *frame, RVLiveIntervalList *list,
+                                            IRInstruction *inst, int use_pos) {
+    switch (inst->kind) {
+        case IR_INST_ALLOCA:
+            return;
+        case IR_INST_PHI:
+            for (int i = 0; i < inst->data.phi_inst.count; ++i) {
+                IRBasicBlock *pred = inst->data.phi_inst.blocks[i];
+                IRInstruction *term = pred != NULL ? pred->last_inst : NULL;
+                int pred_pos = term != NULL ? rv_inst_position(frame, term) : use_pos;
+                rv_live_interval_note_use(frame, list, inst->data.phi_inst.values.items[i],
+                                          pred_pos, pred, false);
+            }
+            return;
+        case IR_INST_LOAD:
+            rv_live_interval_note_use(frame, list, inst->data.load_inst.ptr, use_pos, inst->parent, false);
+            return;
+        case IR_INST_STORE:
+            rv_live_interval_note_use(frame, list, inst->data.store_inst.value, use_pos, inst->parent, false);
+            rv_live_interval_note_use(frame, list, inst->data.store_inst.ptr, use_pos, inst->parent, false);
+            return;
+        case IR_INST_ADD:
+        case IR_INST_SUB:
+        case IR_INST_MUL:
+        case IR_INST_SDIV:
+        case IR_INST_SREM:
+        case IR_INST_FADD:
+        case IR_INST_FSUB:
+        case IR_INST_FMUL:
+        case IR_INST_FDIV:
+            rv_live_interval_note_use(frame, list, inst->data.binary_inst.lhs, use_pos, inst->parent, false);
+            rv_live_interval_note_use(frame, list, inst->data.binary_inst.rhs, use_pos, inst->parent, false);
+            return;
+        case IR_INST_ICMP:
+            rv_live_interval_note_use(frame, list, inst->data.icmp_inst.lhs, use_pos, inst->parent, false);
+            rv_live_interval_note_use(frame, list, inst->data.icmp_inst.rhs, use_pos, inst->parent, false);
+            return;
+        case IR_INST_FCMP:
+            rv_live_interval_note_use(frame, list, inst->data.fcmp_inst.lhs, use_pos, inst->parent, false);
+            rv_live_interval_note_use(frame, list, inst->data.fcmp_inst.rhs, use_pos, inst->parent, false);
+            return;
+        case IR_INST_ZEXT:
+        case IR_INST_SITOFP:
+        case IR_INST_FPTOSI:
+            rv_live_interval_note_use(frame, list, inst->data.cast_inst.value, use_pos, inst->parent, false);
+            return;
+        case IR_INST_BR:
+            if (inst->data.br_inst.is_conditional) {
+                rv_live_interval_note_use(frame, list, inst->data.br_inst.condition, use_pos, inst->parent, false);
+            }
+            return;
+        case IR_INST_RET:
+            rv_live_interval_note_use(frame, list, inst->data.ret_inst.value, use_pos, inst->parent, false);
+            return;
+        case IR_INST_CALL:
+            rv_live_interval_note_value_list(frame, list, &inst->data.call_inst.args,
+                                             use_pos, inst->parent, true);
+            return;
+        case IR_INST_GETELEMENTPTR:
+            rv_live_interval_note_use(frame, list, inst->data.gep_inst.base_ptr, use_pos, inst->parent, false);
+            rv_live_interval_note_value_list(frame, list, &inst->data.gep_inst.indices,
+                                             use_pos, inst->parent, false);
+            return;
+        case IR_INST_BITCAST:
+            rv_live_interval_note_use(frame, list, inst->data.bitcast_inst.value, use_pos, inst->parent, false);
+            return;
+    }
+}
+
+static void rv_live_interval_note_call(RVLiveIntervalList *list, int pos) {
+    ensure_capacity((void **)&list->call_positions, &list->call_capacity,
+                    sizeof(int), list->call_count + 1);
+    list->call_positions[list->call_count++] = pos;
+}
+
+static void rv_collect_live_intervals(RVFrame *frame, IRFunction *function,
+                                      RVLiveIntervalList *list) {
+    for (int i = 0; i < function->params.count; ++i) {
+        rv_live_interval_add_value(frame, list, &function->params.items[i]->value, 0, NULL);
+    }
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            int pos = rv_inst_position(frame, inst);
+            if (inst->result_type != NULL && inst->result_type->kind != IR_TYPE_VOID) {
+                rv_live_interval_add_value(frame, list, &inst->result, pos, inst);
+            }
+            if (inst->kind == IR_INST_CALL && !rv_self_tail_call_shape(function, inst)) {
+                rv_live_interval_note_call(list, pos);
+            }
+        }
+    }
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            rv_live_interval_note_inst_uses(frame, list, inst, rv_inst_position(frame, inst));
+        }
+    }
+    for (int i = 0; i < list->count; ++i) {
+        RVLiveInterval *interval = &list->items[i];
+        for (int ci = 0; ci < list->call_count; ++ci) {
+            int call_pos = list->call_positions[ci];
+            if (call_pos > interval->start_pos && call_pos < interval->end_pos) {
+                interval->crosses_call = true;
+                break;
+            }
+        }
+        if (!interval->crosses_call && list->call_count > 0
+                && (interval->value->kind == IR_VALUE_PARAM || interval->used_outside_def_block)) {
+            interval->crosses_call = true;
+        }
+    }
+}
+
+static int rv_interval_ptr_compare_start(const void *a, const void *b) {
+    const RVLiveInterval *ia = *(const RVLiveInterval * const *)a;
+    const RVLiveInterval *ib = *(const RVLiveInterval * const *)b;
+    if (ia->start_pos != ib->start_pos) {
+        return ia->start_pos - ib->start_pos;
+    }
+    return ia->end_pos - ib->end_pos;
+}
+
+static void rv_linear_scan_assign_pool(RVFrame *frame,
+                                       RVLiveInterval **items, int count,
+                                       const char **regs, int reg_count) {
+    if (count <= 0 || reg_count <= 0) {
+        return;
+    }
+    qsort(items, (size_t)count, sizeof(RVLiveInterval *), rv_interval_ptr_compare_start);
+    bool *used_regs = (bool *)xmalloc(sizeof(bool) * (size_t)reg_count);
+    memset(used_regs, 0, sizeof(bool) * (size_t)reg_count);
+    for (int i = 0; i < count; ++i) {
+        RVLiveInterval *interval = items[i];
+        const char *chosen = NULL;
+        for (int ri = 0; ri < reg_count; ++ri) {
+            if (used_regs[ri]) {
+                continue;
+            }
+            const char *reg = regs[ri];
+            if (rv_reg_reserved_by_infinite_home(frame, reg)) {
+                continue;
+            }
+            chosen = reg;
+            used_regs[ri] = true;
+            break;
+        }
+        if (chosen == NULL) {
+            continue;
+        }
+        interval->assigned_reg = chosen;
+        rv_add_linear_scan_reg_home(frame, interval->value, chosen,
+                                    interval->start_pos, interval->end_pos);
+    }
+    free(used_regs);
+}
+
+static void rv_linear_pool_push(RVLiveInterval ***items, int *count, int *capacity,
+                                RVLiveInterval *interval) {
+    ensure_capacity((void **)items, capacity, sizeof(RVLiveInterval *), *count + 1);
+    (*items)[(*count)++] = interval;
+}
+
+static void rv_plan_linear_scan_reg_homes(RVFrame *frame, IRFunction *function) {
+    if (rv_function_has_non_tail_self_call(function)) {
+        return;
+    }
+
+    RVLiveIntervalList intervals = {0};
+    rv_collect_live_intervals(frame, function, &intervals);
+
+    RVLiveInterval **int_callee = NULL;
+    int int_callee_count = 0, int_callee_capacity = 0;
+
+    for (int i = 0; i < intervals.count; ++i) {
+        RVLiveInterval *interval = &intervals.items[i];
+        if (interval->use_count == 0 || interval->used_by_call) {
+            continue;
+        }
+        if (!interval->is_float && interval->crosses_call) {
+            rv_linear_pool_push(&int_callee, &int_callee_count,
+                                &int_callee_capacity, interval);
+        }
+    }
+
+    rv_linear_scan_assign_pool(frame, int_callee, int_callee_count,
+                               g_rv_loop_regs, RV_LOOP_REG_COUNT);
+
+    free(int_callee);
+    free(intervals.items);
+    free(intervals.call_positions);
 }
 
 static bool rv_match_loop_induction_candidate(IRBasicBlock *preheader, IRBasicBlock *latch,
@@ -8966,6 +10219,42 @@ static bool rv_value_can_have_persistent_reg_home(IRValue *value) {
     IRInstruction *inst = value->data.instruction;
     return inst != NULL && inst->kind != IR_INST_ALLOCA
         && inst->result_type != NULL && inst->result_type->kind != IR_TYPE_VOID;
+}
+
+static bool rv_param_is_incoming_stack_param(IRFunction *function, int param_index) {
+    return rv_param_incoming_stack_offset(function, param_index) != INT_MIN;
+}
+
+static bool rv_function_needs_tail_param_slots(IRFunction *function) {
+    return rv_function_all_self_calls_are_tail(function);
+}
+
+static void rv_plan_leaf_param_reg_homes(RVFrame *frame, IRFunction *function) {
+    if (function == NULL || frame->has_call || rv_function_needs_tail_param_slots(function)) {
+        return;
+    }
+    int int_regs = 0;
+    int float_regs = 0;
+    for (int i = 0; i < function->params.count; ++i) {
+        IRParameter *param = function->params.items[i];
+        bool is_float = param->type != NULL && param->type->kind == IR_TYPE_FLOAT;
+        bool used = opt_count_uses(function, &param->value) > 0;
+        if (is_float) {
+            if (float_regs < 8) {
+                if (used) {
+                    rv_add_persistent_reg_home(frame, &param->value, str_printf("fa%d", float_regs));
+                }
+                float_regs++;
+            }
+        } else {
+            if (int_regs < 8) {
+                if (used) {
+                    rv_add_persistent_reg_home(frame, &param->value, str_printf("a%d", int_regs));
+                }
+                int_regs++;
+            }
+        }
+    }
 }
 
 static int rv_count_loop_uses(IRFunction *function, bool *in_loop, IRValue *value) {
@@ -9180,6 +10469,9 @@ static void rv_plan_loop_reg_homes(RVFrame *frame, IRFunction *function) {
                                            &phi->result, phi, update, latch, score);
                 }
                 for (int i = 0; i < function->params.count; ++i) {
+                    if (rv_param_is_incoming_stack_param(function, i)) {
+                        continue;
+                    }
                     IRValue *param_value = &function->params.items[i]->value;
                     int loop_uses = rv_count_loop_uses(function, in_loop, param_value);
                     if (loop_uses < 2) {
@@ -9249,6 +10541,9 @@ static void rv_plan_loop_reg_homes(RVFrame *frame, IRFunction *function) {
         }
     }
     for (int i = 0; i < function->params.count; ++i) {
+        if (rv_param_is_incoming_stack_param(function, i)) {
+            continue;
+        }
         IRValue *value = &function->params.items[i]->value;
         if (!rv_value_can_have_persistent_reg_home(value)) {
             continue;
@@ -9308,7 +10603,9 @@ static void rv_plan_loop_reg_homes(RVFrame *frame, IRFunction *function) {
 }
 
 static void rv_plan_reg_temps(RVFrame *frame, IRFunction *function) {
+    rv_plan_leaf_param_reg_homes(frame, function);
     rv_plan_loop_reg_homes(frame, function);
+    rv_plan_linear_scan_reg_homes(frame, function);
     for (int bi = 0; bi < function->blocks.count; ++bi) {
         rv_plan_reg_temps_for_block(frame, function->blocks.items[bi]);
     }
@@ -9577,12 +10874,13 @@ static int rv_param_incoming_stack_offset(IRFunction *function, int param_index)
     return INT_MIN;
 }
 
-static bool rv_slot_is_incoming_stack_param(RVFrame *frame, IRValue *value) {
-    if (value == NULL || value->kind != IR_VALUE_PARAM) {
-        return false;
+static bool rv_frame_has_saved_regs(RVFrame *frame) {
+    for (int i = 0; i < RV_LOOP_REG_COUNT; ++i) {
+        if (frame->used_saved_regs[i]) {
+            return true;
+        }
     }
-    RVSlot *slot = rv_find_slot(frame, value);
-    return slot != NULL && slot->offset >= 0;
+    return false;
 }
 
 static void rv_prepare_frame(RVFrame *frame, IRFunction *function) {
@@ -9590,13 +10888,18 @@ static void rv_prepare_frame(RVFrame *frame, IRFunction *function) {
     frame->function = function;
     frame->has_call = rv_function_has_call(function);
     frame->next_offset = frame->has_call ? -16 : -8;
+    rv_build_inst_positions(frame, function);
     rv_plan_reg_temps(frame, function);
-    bool self_tail_params_need_local_slots = rv_function_all_self_calls_are_tail(function);
+    bool self_tail_params_need_local_slots = rv_function_needs_tail_param_slots(function);
     for (int i = 0; i < function->params.count; ++i) {
+        bool param_used = opt_count_uses(function, &function->params.items[i]->value) > 0;
+        bool has_reg_home = rv_find_reg_temp(frame, &function->params.items[i]->value) != NULL;
         int stack_offset = rv_param_incoming_stack_offset(function, i);
         if (stack_offset != INT_MIN) {
-            rv_add_incoming_stack_param_slot(frame, &function->params.items[i]->value, stack_offset);
-        } else {
+            if (self_tail_params_need_local_slots || param_used || has_reg_home) {
+                rv_add_incoming_stack_param_slot(frame, &function->params.items[i]->value, stack_offset);
+            }
+        } else if (self_tail_params_need_local_slots || (param_used && !has_reg_home)) {
             rv_add_value_slot(frame, &function->params.items[i]->value);
         }
     }
@@ -9634,7 +10937,13 @@ static void rv_prepare_frame(RVFrame *frame, IRFunction *function) {
             frame->saved_reg_offsets[i] = rv_alloc_frame_bytes(frame, 8);
         }
     }
-    frame->frame_size = align_to(-frame->next_offset + frame->max_outgoing_args, 16);
+    if (!frame->has_call && frame->slots == NULL && frame->max_outgoing_args == 0
+            && frame->phi_scratch_slots == 0 && frame->tail_scratch_slots == 0
+            && !rv_frame_has_saved_regs(frame)) {
+        frame->frame_size = 0;
+    } else {
+        frame->frame_size = align_to(-frame->next_offset + frame->max_outgoing_args, 16);
+    }
 }
 
 static bool rv_initializer_is_zero(IRInitializer *init);
@@ -11004,38 +12313,31 @@ static void rv_store_incoming_params(RVFrame *frame) {
     for (int i = 0; i < frame->function->params.count; ++i) {
         IRParameter *param = frame->function->params.items[i];
         RVSlot *slot = rv_find_slot(frame, &param->value);
-        if (slot == NULL || rv_slot_is_incoming_stack_param(frame, &param->value)) {
-            if (rv_value_is_float(&param->value)) {
-                if (float_regs < 8) {
-                    float_regs++;
-                } else {
-                    stack_slots++;
-                }
-            } else {
-                if (int_regs < 8) {
-                    int_regs++;
-                } else {
-                    stack_slots++;
-                }
-            }
-            continue;
-        }
+        RVRegTemp *temp = rv_find_reg_temp(frame, &param->value);
         if (rv_value_is_float(&param->value)) {
             if (float_regs < 8) {
-                rv_store_float_slot(frame, &param->value, str_printf("fa%d", float_regs));
+                if (slot != NULL || temp != NULL) {
+                    rv_store_float_slot(frame, &param->value, str_printf("fa%d", float_regs));
+                }
                 float_regs++;
             } else {
-                rv_emit_mem(out, "flw", "ft0", stack_slots * 8, "s0");
-                rv_store_float_slot(frame, &param->value, "ft0");
+                if (temp != NULL) {
+                    rv_emit_mem(out, "flw", "ft0", stack_slots * 8, "s0");
+                    rv_store_float_slot(frame, &param->value, "ft0");
+                }
                 stack_slots++;
             }
         } else {
             if (int_regs < 8) {
-                rv_store_int_slot(frame, &param->value, str_printf("a%d", int_regs));
+                if (slot != NULL || temp != NULL) {
+                    rv_store_int_slot(frame, &param->value, str_printf("a%d", int_regs));
+                }
                 int_regs++;
             } else {
-                rv_emit_mem(out, "ld", "t0", stack_slots * 8, "s0");
-                rv_store_int_slot(frame, &param->value, "t0");
+                if (temp != NULL) {
+                    rv_emit_mem(out, "ld", "t0", stack_slots * 8, "s0");
+                    rv_store_int_slot(frame, &param->value, "t0");
+                }
                 stack_slots++;
             }
         }
@@ -11048,15 +12350,17 @@ static void rv_emit_function(IRFunction *function, FILE *out) {
     frame.out = out;
     fprintf(out, "  .globl %s\n  .align 2\n%s:\n",
             rv_symbol_name(function->name), rv_symbol_name(function->name));
-    rv_emit_addi(out, "sp", "sp", -frame.frame_size);
-    if (frame.has_call) {
-        rv_emit_mem(out, "sd", "ra", frame.frame_size - 8, "sp");
-    }
-    rv_emit_mem(out, "sd", "s0", frame.frame_size - (frame.has_call ? 16 : 8), "sp");
-    rv_emit_addi(out, "s0", "sp", frame.frame_size);
-    for (int i = 0; i < RV_LOOP_REG_COUNT; ++i) {
-        if (frame.used_saved_regs[i]) {
-            rv_emit_mem(out, "sd", g_rv_loop_regs[i], frame.saved_reg_offsets[i], "s0");
+    if (frame.frame_size > 0) {
+        rv_emit_addi(out, "sp", "sp", -frame.frame_size);
+        if (frame.has_call) {
+            rv_emit_mem(out, "sd", "ra", frame.frame_size - 8, "sp");
+        }
+        rv_emit_mem(out, "sd", "s0", frame.frame_size - (frame.has_call ? 16 : 8), "sp");
+        rv_emit_addi(out, "s0", "sp", frame.frame_size);
+        for (int i = 0; i < RV_LOOP_REG_COUNT; ++i) {
+            if (frame.used_saved_regs[i]) {
+                rv_emit_mem(out, "sd", g_rv_loop_regs[i], frame.saved_reg_offsets[i], "s0");
+            }
         }
     }
     rv_store_incoming_params(&frame);
@@ -11075,17 +12379,74 @@ static void rv_emit_function(IRFunction *function, FILE *out) {
         }
     }
     fprintf(out, ".L_%s_return:\n", rv_symbol_name(function->name));
-    for (int i = 0; i < RV_LOOP_REG_COUNT; ++i) {
-        if (frame.used_saved_regs[i]) {
-            rv_emit_mem(out, "ld", g_rv_loop_regs[i], frame.saved_reg_offsets[i], "s0");
+    if (frame.frame_size > 0) {
+        for (int i = 0; i < RV_LOOP_REG_COUNT; ++i) {
+            if (frame.used_saved_regs[i]) {
+                rv_emit_mem(out, "ld", g_rv_loop_regs[i], frame.saved_reg_offsets[i], "s0");
+            }
+        }
+        if (frame.has_call) {
+            rv_emit_mem(out, "ld", "ra", frame.frame_size - 8, "sp");
+        }
+        rv_emit_mem(out, "ld", "s0", frame.frame_size - (frame.has_call ? 16 : 8), "sp");
+        rv_emit_addi(out, "sp", "sp", frame.frame_size);
+    }
+    fputs("  ret\n\n", out);
+}
+
+static int rv_function_index(IRModule *module, IRFunction *function) {
+    if (module == NULL || function == NULL) {
+        return -1;
+    }
+    for (int i = 0; i < module->functions.count; ++i) {
+        if (module->functions.items[i] == function) {
+            return i;
         }
     }
-    if (frame.has_call) {
-        rv_emit_mem(out, "ld", "ra", frame.frame_size - 8, "sp");
+    return -1;
+}
+
+static void rv_mark_reachable_function(IRModule *module, IRFunction *function, bool *reachable) {
+    int index = rv_function_index(module, function);
+    if (index < 0 || reachable[index]) {
+        return;
     }
-    rv_emit_mem(out, "ld", "s0", frame.frame_size - (frame.has_call ? 16 : 8), "sp");
-    rv_emit_addi(out, "sp", "sp", frame.frame_size);
-    fputs("  ret\n\n", out);
+    reachable[index] = true;
+    if (function->is_external) {
+        return;
+    }
+    for (int bi = 0; bi < function->blocks.count; ++bi) {
+        IRBasicBlock *block = function->blocks.items[bi];
+        for (IRInstruction *inst = block->first_inst; inst != NULL; inst = inst->next) {
+            if (inst->kind == IR_INST_CALL && inst->data.call_inst.callee != NULL) {
+                rv_mark_reachable_function(module, inst->data.call_inst.callee, reachable);
+            }
+        }
+    }
+}
+
+static bool *rv_compute_reachable_functions(IRModule *module) {
+    if (module == NULL || module->functions.count <= 0) {
+        return NULL;
+    }
+    bool *reachable = (bool *)xmalloc(sizeof(bool) * (size_t)module->functions.count);
+    memset(reachable, 0, sizeof(bool) * (size_t)module->functions.count);
+    IRFunction *main_function = NULL;
+    for (int i = 0; i < module->functions.count; ++i) {
+        IRFunction *function = module->functions.items[i];
+        if (function != NULL && strcmp(rv_symbol_name(function->name), "main") == 0) {
+            main_function = function;
+            break;
+        }
+    }
+    if (main_function == NULL) {
+        for (int i = 0; i < module->functions.count; ++i) {
+            reachable[i] = true;
+        }
+        return reachable;
+    }
+    rv_mark_reachable_function(module, main_function, reachable);
+    return reachable;
 }
 
 void emit_riscv_from_ir(IRModule *module, FILE *out) {
@@ -11094,12 +12455,14 @@ void emit_riscv_from_ir(IRModule *module, FILE *out) {
     fputs("  .option norelax\n", out);
     rv_emit_globals(module, out);
     fputs("  .text\n", out);
+    bool *reachable = rv_compute_reachable_functions(module);
     for (int i = 0; i < module->functions.count; ++i) {
         IRFunction *function = module->functions.items[i];
-        if (!function->is_external) {
+        if (!function->is_external && (reachable == NULL || reachable[i])) {
             rv_emit_function(function, out);
         }
     }
+    free(reachable);
 }
 
 static bool asm_parse_mem_line(const char *line, char *op, char *reg, int *offset, char *base) {
@@ -11151,6 +12514,26 @@ static bool asm_parse_binary_branch_line(const char *line, char *op,
         || strcmp(op, "bleu") == 0 || strcmp(op, "bgtu") == 0;
 }
 
+static bool asm_line_is_label(const char *line, const char *label);
+
+static bool asm_invert_branch_op(const char *op, const char **inverted) {
+    if (strcmp(op, "beq") == 0) { *inverted = "bne"; return true; }
+    if (strcmp(op, "bne") == 0) { *inverted = "beq"; return true; }
+    if (strcmp(op, "blt") == 0) { *inverted = "bge"; return true; }
+    if (strcmp(op, "bge") == 0) { *inverted = "blt"; return true; }
+    if (strcmp(op, "ble") == 0) { *inverted = "bgt"; return true; }
+    if (strcmp(op, "bgt") == 0) { *inverted = "ble"; return true; }
+    if (strcmp(op, "bltu") == 0) { *inverted = "bgeu"; return true; }
+    if (strcmp(op, "bgeu") == 0) { *inverted = "bltu"; return true; }
+    if (strcmp(op, "bleu") == 0) { *inverted = "bgtu"; return true; }
+    if (strcmp(op, "bgtu") == 0) { *inverted = "bleu"; return true; }
+    if (strcmp(op, "beqz") == 0) { *inverted = "bnez"; return true; }
+    if (strcmp(op, "bnez") == 0) { *inverted = "beqz"; return true; }
+    if (strcmp(op, "bltz") == 0) { *inverted = "bgez"; return true; }
+    if (strcmp(op, "bgez") == 0) { *inverted = "bltz"; return true; }
+    return false;
+}
+
 static bool asm_line_is_redundant_self_move(const char *line) {
     char dst[16], src[16];
     if (asm_parse_move_line(line, dst, src) || asm_parse_float_move_line(line, dst, src)) {
@@ -11169,40 +12552,31 @@ static bool asm_line_is_redundant_zero_imm_self_op(const char *line) {
         || strcmp(op, "srai") == 0 || strcmp(op, "ori") == 0 || strcmp(op, "xori") == 0;
 }
 
-static bool asm_append_folded_move_branch(StrBuf *out, char **lines, int *index, int count) {
-    char dst1[16], src1[16], dst2[16], src2[16];
-    char op[8], lhs[16], rhs[16], label[128];
+static bool asm_append_inverted_branch_jump(StrBuf *out, char **lines, int *index, int count) {
     int i = *index;
-    if (i + 2 < count
-            && asm_parse_move_line(lines[i], dst1, src1)
-            && asm_parse_move_line(lines[i + 1], dst2, src2)
-            && asm_parse_binary_branch_line(lines[i + 2], op, lhs, rhs, label)
-            && strcmp(dst1, dst2) != 0
-            && strcmp(src1, dst2) != 0
-            && strcmp(src2, dst1) != 0
-            && (strcmp(lhs, dst1) == 0 || strcmp(lhs, dst2) == 0)
-            && (strcmp(rhs, dst1) == 0 || strcmp(rhs, dst2) == 0)) {
-        const char *new_lhs = strcmp(lhs, dst1) == 0 ? src1 : src2;
-        const char *new_rhs = strcmp(rhs, dst1) == 0 ? src1 : src2;
-        sb_appendf(out, "  %s %s, %s, %s\n", op, new_lhs, new_rhs, label);
-        *index += 2;
-        return true;
+    if (i + 2 >= count) {
+        return false;
     }
-    if (i + 1 < count
-            && asm_parse_move_line(lines[i], dst1, src1)
-            && asm_parse_unary_branch_line(lines[i + 1], op, lhs, label)
-            && strcmp(lhs, dst1) == 0) {
-        sb_appendf(out, "  %s %s, %s\n", op, src1, label);
+    char jump_label[128];
+    if (!asm_parse_jump_line(lines[i + 1], jump_label)) {
+        return false;
+    }
+    const char *inverted = NULL;
+    char op[8], reg[16], true_label[128];
+    if (asm_parse_unary_branch_line(lines[i], op, reg, true_label)
+            && asm_line_is_label(lines[i + 2], true_label)
+            && strcmp(true_label, jump_label) != 0
+            && asm_invert_branch_op(op, &inverted)) {
+        sb_appendf(out, "  %s %s, %s\n", inverted, reg, jump_label);
         *index += 1;
         return true;
     }
-    if (i + 1 < count
-            && asm_parse_move_line(lines[i], dst1, src1)
-            && asm_parse_binary_branch_line(lines[i + 1], op, lhs, rhs, label)
-            && (strcmp(lhs, dst1) == 0 || strcmp(rhs, dst1) == 0)) {
-        const char *new_lhs = strcmp(lhs, dst1) == 0 ? src1 : lhs;
-        const char *new_rhs = strcmp(rhs, dst1) == 0 ? src1 : rhs;
-        sb_appendf(out, "  %s %s, %s, %s\n", op, new_lhs, new_rhs, label);
+    char lhs[16], rhs[16];
+    if (asm_parse_binary_branch_line(lines[i], op, lhs, rhs, true_label)
+            && asm_line_is_label(lines[i + 2], true_label)
+            && strcmp(true_label, jump_label) != 0
+            && asm_invert_branch_op(op, &inverted)) {
+        sb_appendf(out, "  %s %s, %s, %s\n", inverted, lhs, rhs, jump_label);
         *index += 1;
         return true;
     }
@@ -11243,6 +12617,19 @@ static bool asm_line_writes_reg(const char *line, const char *reg) {
     return strcmp(dst, reg) == 0;
 }
 
+static bool asm_line_is_store_op(const char *op);
+
+static bool asm_line_may_store_through_unknown_stack_alias(const char *line) {
+    char op[8], reg[16], base[16];
+    int offset = 0;
+    if (!asm_parse_mem_line(line, op, reg, &offset, base)) {
+        return false;
+    }
+    (void)reg;
+    (void)offset;
+    return asm_line_is_store_op(op) && strcmp(base, "s0") != 0;
+}
+
 static bool asm_duplicate_slli_recomputes_same_value(char **lines, int index) {
     char op[8], rd[16], rs[16];
     int imm = 0;
@@ -11280,12 +12667,227 @@ static bool asm_matching_float_mem_pair(const char *store_op, const char *load_o
     return strcmp(store_op, "fsw") == 0 && strcmp(load_op, "flw") == 0;
 }
 
-static void asm_append_store_load_forward(StrBuf *out, const char *store_line,
-                                          const char *store_op, const char *src,
-                                          const char *load_op, const char *dst) {
-    sb_append(out, store_line);
+static bool asm_line_is_load_op(const char *op) {
+    return strcmp(op, "lw") == 0 || strcmp(op, "ld") == 0 || strcmp(op, "flw") == 0;
+}
+
+static bool asm_line_is_store_op(const char *op) {
+    return strcmp(op, "sw") == 0 || strcmp(op, "sd") == 0 || strcmp(op, "fsw") == 0;
+}
+
+enum { ASM_RW_REG_LIMIT = 4 };
+
+typedef struct {
+    char reads[ASM_RW_REG_LIMIT][16];
+    int read_count;
+    char writes[ASM_RW_REG_LIMIT][16];
+    int write_count;
+    bool valid;
+    bool is_control;
+    bool is_memory;
+} AsmRWInfo;
+
+static bool asm_token_is_reg_name(const char *token) {
+    if (token == NULL || token[0] == '\0' || strcmp(token, "rtz") == 0) {
+        return false;
+    }
+    if (strcmp(token, "zero") == 0 || strcmp(token, "ra") == 0 || strcmp(token, "sp") == 0
+            || strcmp(token, "gp") == 0 || strcmp(token, "tp") == 0) {
+        return true;
+    }
+    if ((token[0] == 'a' || token[0] == 't' || token[0] == 's') && isdigit((unsigned char)token[1])) {
+        return token[2] == '\0' || (isdigit((unsigned char)token[2]) && token[3] == '\0');
+    }
+    if (token[0] == 'f' && (token[1] == 'a' || token[1] == 't' || token[1] == 's')
+            && isdigit((unsigned char)token[2])) {
+        return token[3] == '\0' || (isdigit((unsigned char)token[3]) && token[4] == '\0');
+    }
+    return false;
+}
+
+static void asm_rw_add_reg(char regs[ASM_RW_REG_LIMIT][16], int *count, const char *reg) {
+    if (!asm_token_is_reg_name(reg) || strcmp(reg, "zero") == 0) {
+        return;
+    }
+    for (int i = 0; i < *count; ++i) {
+        if (strcmp(regs[i], reg) == 0) {
+            return;
+        }
+    }
+    if (*count < ASM_RW_REG_LIMIT) {
+        snprintf(regs[*count], sizeof(regs[*count]), "%s", reg);
+        (*count)++;
+    }
+}
+
+static bool asm_rw_has_reg(const char regs[ASM_RW_REG_LIMIT][16], int count, const char *reg) {
+    for (int i = 0; i < count; ++i) {
+        if (strcmp(regs[i], reg) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool asm_rw_intersects(const char lhs[ASM_RW_REG_LIMIT][16], int lhs_count,
+                              const char rhs[ASM_RW_REG_LIMIT][16], int rhs_count) {
+    for (int i = 0; i < lhs_count; ++i) {
+        if (asm_rw_has_reg(rhs, rhs_count, lhs[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void asm_trim_token(char *token) {
+    char *start = token;
+    while (isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != token) {
+        memmove(token, start, strlen(start) + 1);
+    }
+    size_t len = strlen(token);
+    while (len > 0 && isspace((unsigned char)token[len - 1])) {
+        token[--len] = '\0';
+    }
+}
+
+static void asm_collect_generic_operands(const char *line, AsmRWInfo *info) {
+    const char *p = line;
+    while (isspace((unsigned char)*p)) {
+        p++;
+    }
+    while (*p != '\0' && !isspace((unsigned char)*p)) {
+        p++;
+    }
+    while (isspace((unsigned char)*p)) {
+        p++;
+    }
+    char operands[4][32];
+    int operand_count = 0;
+    while (*p != '\0' && *p != '#' && operand_count < 4) {
+        char token[32];
+        int len = 0;
+        while (*p != '\0' && *p != ',' && *p != '#') {
+            if (len + 1 < (int)sizeof(token)) {
+                token[len++] = *p;
+            }
+            p++;
+        }
+        token[len] = '\0';
+        asm_trim_token(token);
+        if (token[0] != '\0') {
+            snprintf(operands[operand_count], sizeof(operands[operand_count]), "%s", token);
+            operand_count++;
+        }
+        if (*p == ',') {
+            p++;
+        }
+    }
+    if (operand_count <= 0) {
+        info->valid = false;
+        return;
+    }
+    asm_rw_add_reg(info->writes, &info->write_count, operands[0]);
+    for (int i = 1; i < operand_count; ++i) {
+        asm_rw_add_reg(info->reads, &info->read_count, operands[i]);
+    }
+}
+
+static AsmRWInfo asm_line_rw_info(const char *line) {
+    AsmRWInfo info;
+    memset(&info, 0, sizeof(info));
+    if (line == NULL || line[0] != ' ') {
+        return info;
+    }
+    char op[16];
+    if (sscanf(line, "  %15s", op) != 1 || op[0] == '#' || op[0] == '.') {
+        return info;
+    }
+    info.valid = true;
+    if (op[0] == 'b' || strcmp(op, "j") == 0 || strcmp(op, "jal") == 0
+            || strcmp(op, "jalr") == 0 || strcmp(op, "ret") == 0 || strcmp(op, "call") == 0) {
+        info.is_control = true;
+        return info;
+    }
+    char mem_reg[16], base[16];
+    int offset = 0;
+    if (asm_parse_mem_line(line, op, mem_reg, &offset, base)) {
+        (void)offset;
+        info.is_memory = true;
+        asm_rw_add_reg(info.reads, &info.read_count, base);
+        if (asm_line_is_load_op(op)) {
+            asm_rw_add_reg(info.writes, &info.write_count, mem_reg);
+        } else if (asm_line_is_store_op(op)) {
+            asm_rw_add_reg(info.reads, &info.read_count, mem_reg);
+        } else {
+            info.valid = false;
+        }
+        return info;
+    }
+    asm_collect_generic_operands(line, &info);
+    return info;
+}
+
+static bool asm_rw_infos_can_swap(const AsmRWInfo *first, const AsmRWInfo *second) {
+    if (first == NULL || second == NULL || !first->valid || !second->valid) {
+        return false;
+    }
+    if (asm_rw_intersects(second->reads, second->read_count, first->writes, first->write_count)) {
+        return false;
+    }
+    if (asm_rw_intersects(first->reads, first->read_count, second->writes, second->write_count)) {
+        return false;
+    }
+    if (asm_rw_intersects(first->writes, first->write_count, second->writes, second->write_count)) {
+        return false;
+    }
+    return true;
+}
+
+static bool asm_append_scheduled_load_use(StrBuf *out, char **lines, int *index, int count) {
+    int i = *index;
+    if (i + 2 >= count) {
+        return false;
+    }
+    char load_op[8], load_dst[16], load_base[16];
+    int load_off = 0;
+    if (!asm_parse_mem_line(lines[i], load_op, load_dst, &load_off, load_base)
+            || !asm_line_is_load_op(load_op)) {
+        return false;
+    }
+    (void)load_off;
+    (void)load_base;
+    AsmRWInfo dep = asm_line_rw_info(lines[i + 1]);
+    AsmRWInfo candidate = asm_line_rw_info(lines[i + 2]);
+    if (!dep.valid || dep.is_control || !candidate.valid || candidate.is_control || candidate.is_memory) {
+        return false;
+    }
+    if (!asm_rw_has_reg(dep.reads, dep.read_count, load_dst)) {
+        return false;
+    }
+    if (asm_rw_has_reg(candidate.reads, candidate.read_count, load_dst)
+            || asm_rw_has_reg(candidate.writes, candidate.write_count, load_dst)) {
+        return false;
+    }
+    if (!asm_rw_infos_can_swap(&dep, &candidate)) {
+        return false;
+    }
+    sb_append(out, lines[i]);
     sb_append(out, "\n");
-    if (strcmp(store_op, "sw") == 0 && strcmp(load_op, "lw") == 0) {
+    sb_append(out, lines[i + 2]);
+    sb_append(out, "\n");
+    sb_append(out, lines[i + 1]);
+    sb_append(out, "\n");
+    *index += 2;
+    return true;
+}
+
+static void asm_append_load_value_from_reg(StrBuf *out, const char *value_op,
+                                           const char *src, const char *load_op,
+                                           const char *dst) {
+    if (strcmp(value_op, "sw") == 0 || strcmp(value_op, "lw") == 0) {
         if (strcmp(dst, "zero") != 0) {
             if (strcmp(src, "zero") == 0) {
                 sb_appendf(out, "  li %s, 0\n", dst);
@@ -11293,15 +12895,148 @@ static void asm_append_store_load_forward(StrBuf *out, const char *store_line,
                 sb_appendf(out, "  addiw %s, %s, 0\n", dst, src);
             }
         }
-    } else if (strcmp(store_op, "sd") == 0 && strcmp(load_op, "ld") == 0) {
+    } else if (strcmp(value_op, "sd") == 0 || strcmp(value_op, "ld") == 0) {
         if (strcmp(dst, src) != 0) {
             sb_appendf(out, "  mv %s, %s\n", dst, src);
         }
-    } else if (strcmp(store_op, "fsw") == 0 && strcmp(load_op, "flw") == 0) {
+    } else if (strcmp(value_op, "fsw") == 0 || strcmp(value_op, "flw") == 0) {
         if (strcmp(dst, src) != 0) {
             sb_appendf(out, "  fmv.s %s, %s\n", dst, src);
         }
+    } else {
+        sb_appendf(out, "  %s %s, 0(%s)\n", load_op, dst, src);
     }
+}
+
+static void asm_append_store_load_forward(StrBuf *out, const char *store_line,
+                                          const char *store_op, const char *src,
+                                          const char *load_op, const char *dst) {
+    sb_append(out, store_line);
+    sb_append(out, "\n");
+    asm_append_load_value_from_reg(out, store_op, src, load_op, dst);
+}
+
+static bool asm_reg_is_unchanged_between(char **lines, int begin, int end, const char *reg) {
+    for (int i = begin; i < end; ++i) {
+        if (asm_line_writes_reg(lines[i], reg)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool asm_append_recent_stack_load_forward(StrBuf *out, char **lines, int index) {
+    enum { ASM_STACK_FORWARD_WINDOW = 96 };
+    char load_op[8], load_dst[16], load_base[16];
+    int load_off = 0;
+    if (!asm_parse_mem_line(lines[index], load_op, load_dst, &load_off, load_base)
+            || !asm_line_is_load_op(load_op)
+            || strcmp(load_base, "s0") != 0) {
+        return false;
+    }
+    for (int j = index - 1; j >= 0 && index - j <= ASM_STACK_FORWARD_WINDOW; --j) {
+        if (asm_line_is_control_or_label(lines[j]) || asm_line_writes_reg(lines[j], load_base)
+                || asm_line_may_store_through_unknown_stack_alias(lines[j])) {
+            return false;
+        }
+        char prev_op[8], prev_reg[16], prev_base[16];
+        int prev_off = 0;
+        if (!asm_parse_mem_line(lines[j], prev_op, prev_reg, &prev_off, prev_base)) {
+            continue;
+        }
+        if (prev_off != load_off || strcmp(prev_base, load_base) != 0) {
+            continue;
+        }
+        if (asm_line_is_store_op(prev_op)) {
+            if ((asm_matching_int_mem_pair(prev_op, load_op) || asm_matching_float_mem_pair(prev_op, load_op))
+                    && asm_reg_is_unchanged_between(lines, j + 1, index, prev_reg)) {
+                asm_append_load_value_from_reg(out, prev_op, prev_reg, load_op, load_dst);
+                return true;
+            }
+            return false;
+        }
+        if (asm_line_is_load_op(prev_op)) {
+            bool same_kind = (strcmp(prev_op, "lw") == 0 && strcmp(load_op, "lw") == 0)
+                || (strcmp(prev_op, "ld") == 0 && strcmp(load_op, "ld") == 0)
+                || (strcmp(prev_op, "flw") == 0 && strcmp(load_op, "flw") == 0);
+            if (same_kind && asm_reg_is_unchanged_between(lines, j + 1, index, prev_reg)) {
+                asm_append_load_value_from_reg(out, prev_op, prev_reg, load_op, load_dst);
+                return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool asm_stack_store_dead_before_overwrite(char **lines, int index, int count) {
+    enum { ASM_STACK_FORWARD_WINDOW = 96 };
+    char store_op[8], store_reg[16], store_base[16];
+    int store_off = 0;
+    if (!asm_parse_mem_line(lines[index], store_op, store_reg, &store_off, store_base)
+            || !asm_line_is_store_op(store_op)
+            || strcmp(store_base, "s0") != 0) {
+        return false;
+    }
+    for (int j = index + 1; j < count && j - index <= ASM_STACK_FORWARD_WINDOW; ++j) {
+        if (asm_line_is_control_or_label(lines[j]) || asm_line_writes_reg(lines[j], store_base)
+                || asm_line_may_store_through_unknown_stack_alias(lines[j])) {
+            return false;
+        }
+        char op[8], reg[16], base[16];
+        int off = 0;
+        if (!asm_parse_mem_line(lines[j], op, reg, &off, base)
+                || off != store_off || strcmp(base, store_base) != 0) {
+            continue;
+        }
+        if (asm_line_is_load_op(op)) {
+            return false;
+        }
+        if (asm_line_is_store_op(op)) {
+            return strcmp(op, store_op) == 0;
+        }
+    }
+    return false;
+}
+
+static bool asm_mem_load_matches_store_value(const char *load_op, const char *store_op) {
+    return (strcmp(load_op, "lw") == 0 && strcmp(store_op, "sw") == 0)
+        || (strcmp(load_op, "ld") == 0 && strcmp(store_op, "sd") == 0)
+        || (strcmp(load_op, "flw") == 0 && strcmp(store_op, "fsw") == 0);
+}
+
+static bool asm_stack_store_redundant_after_same_value(char **lines, int index) {
+    enum { ASM_STACK_FORWARD_WINDOW = 96 };
+    char store_op[8], store_reg[16], store_base[16];
+    int store_off = 0;
+    if (!asm_parse_mem_line(lines[index], store_op, store_reg, &store_off, store_base)
+            || !asm_line_is_store_op(store_op)
+            || strcmp(store_base, "s0") != 0) {
+        return false;
+    }
+    for (int j = index - 1; j >= 0 && index - j <= ASM_STACK_FORWARD_WINDOW; --j) {
+        if (asm_line_is_control_or_label(lines[j]) || asm_line_writes_reg(lines[j], store_base)
+                || asm_line_may_store_through_unknown_stack_alias(lines[j])) {
+            return false;
+        }
+        char op[8], reg[16], base[16];
+        int off = 0;
+        if (!asm_parse_mem_line(lines[j], op, reg, &off, base)
+                || off != store_off || strcmp(base, store_base) != 0) {
+            continue;
+        }
+        if (asm_line_is_load_op(op)) {
+            return asm_mem_load_matches_store_value(op, store_op)
+                && strcmp(reg, store_reg) == 0
+                && asm_reg_is_unchanged_between(lines, j + 1, index, store_reg);
+        }
+        if (asm_line_is_store_op(op)) {
+            return strcmp(op, store_op) == 0
+                && strcmp(reg, store_reg) == 0
+                && asm_reg_is_unchanged_between(lines, j + 1, index, store_reg);
+        }
+    }
+    return false;
 }
 
 static void asm_peephole_text(const char *text, FILE *out_file) {
@@ -11346,7 +13081,7 @@ static void asm_peephole_text(const char *text, FILE *out_file) {
             (void)li_value2;
             continue;
         }
-        if (asm_append_folded_move_branch(&out, lines, &i, count)) {
+        if (asm_append_inverted_branch_jump(&out, lines, &i, count)) {
             continue;
         }
         char jlabel[128];
@@ -11355,6 +13090,18 @@ static void asm_peephole_text(const char *text, FILE *out_file) {
             continue;
         }
         if (asm_duplicate_slli_recomputes_same_value(lines, i)) {
+            continue;
+        }
+        if (asm_stack_store_redundant_after_same_value(lines, i)) {
+            continue;
+        }
+        if (asm_stack_store_dead_before_overwrite(lines, i, count)) {
+            continue;
+        }
+        if (asm_append_recent_stack_load_forward(&out, lines, i)) {
+            continue;
+        }
+        if (asm_append_scheduled_load_use(&out, lines, &i, count)) {
             continue;
         }
         char op1[8], reg1[16], base1[16];
@@ -11398,7 +13145,30 @@ static void generate_program_asm(Program *program, FILE *out) {
     }
     emit_riscv_from_ir(module, mem);
     fclose(mem);
-    asm_peephole_text(buffer, out);
+    char *peephole_buffer = NULL;
+    size_t peephole_size = 0;
+    FILE *peephole_mem = open_memstream(&peephole_buffer, &peephole_size);
+    if (peephole_mem == NULL) {
+        asm_peephole_text(buffer, out);
+        free(buffer);
+        return;
+    }
+    asm_peephole_text(buffer, peephole_mem);
+    fclose(peephole_mem);
+    char *second_buffer = NULL;
+    size_t second_size = 0;
+    FILE *second_mem = open_memstream(&second_buffer, &second_size);
+    if (second_mem == NULL) {
+        asm_peephole_text(peephole_buffer, out);
+        free(peephole_buffer);
+        free(buffer);
+        return;
+    }
+    asm_peephole_text(peephole_buffer, second_mem);
+    fclose(second_mem);
+    asm_peephole_text(second_buffer, out);
+    free(second_buffer);
+    free(peephole_buffer);
     free(buffer);
 }
 
