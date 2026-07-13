@@ -9647,6 +9647,8 @@ static int rv_count_instruction_uses(IRInstruction *inst, IRValue *value);
 static int rv_count_function_uses(IRFunction *function, IRValue *value);
 static bool rv_gep_is_folded_into_memory(RVFrame *frame, IRInstruction *gep);
 static bool rv_gep_recomputable_for_memory(IRFunction *function, IRInstruction *gep);
+static bool rv_gep_has_const_indices(IRInstruction *gep);
+static long long rv_gep_const_offset(IRInstruction *gep);
 static bool rv_icmp_only_feeds_own_branch(IRFunction *function, IRInstruction *inst);
 
 static bool rv_inst_reg_temp_supported(IRInstruction *inst) {
@@ -11107,40 +11109,91 @@ static bool rv_icmp_only_feeds_own_branch(IRFunction *function, IRInstruction *i
     return rv_count_function_uses(function, &inst->result) == 1;
 }
 
-static const char *rv_emit_address_value_reg(RVFrame *frame, IRInstruction *user,
-                                                IRValue *ptr, const char *scratch) {
+typedef struct {
+    const char *base;
+    int offset;
+} RVAddress;
+
+static RVAddress rv_make_address(const char *base, int offset) {
+    RVAddress addr;
+    addr.base = base;
+    addr.offset = offset;
+    return addr;
+}
+
+static bool rv_emit_const_gep_address(RVFrame *frame, IRInstruction *gep,
+                                      const char *scratch, RVAddress *addr) {
+    if (!rv_gep_has_const_indices(gep)) {
+        return false;
+    }
+    long long offset = rv_gep_const_offset(gep);
+    if (offset < INT_MIN || offset > INT_MAX) {
+        return false;
+    }
+    IRValue *base = gep->data.gep_inst.base_ptr;
+    if (base != NULL && base->kind == IR_VALUE_INSTRUCTION) {
+        IRInstruction *base_inst = base->data.instruction;
+        if (base_inst != NULL && base_inst->kind == IR_INST_ALLOCA) {
+            RVSlot *slot = rv_find_slot(frame, base);
+            if (slot != NULL) {
+                long long total = (long long)slot->object_offset + offset;
+                if (total >= INT_MIN && total <= INT_MAX) {
+                    *addr = rv_make_address("s0", (int)total);
+                    return true;
+                }
+            }
+        }
+    }
+    const char *base_reg = rv_int_value_read_reg(frame, base, scratch);
+    *addr = rv_make_address(base_reg, (int)offset);
+    return true;
+}
+
+static RVAddress rv_emit_address_value(RVFrame *frame, IRInstruction *user,
+                                       IRValue *ptr, const char *scratch) {
     if (ptr != NULL && ptr->kind == IR_VALUE_INSTRUCTION) {
         IRInstruction *def = ptr->data.instruction;
+        if (def != NULL && def->kind == IR_INST_ALLOCA) {
+            RVSlot *slot = rv_find_slot(frame, ptr);
+            if (slot != NULL) {
+                return rv_make_address("s0", slot->object_offset);
+            }
+        }
         if (rv_can_fold_gep_into_user(frame, def, user)
                 || rv_gep_recomputable_for_memory(frame->function, def)) {
+            RVAddress addr;
+            if (def != NULL && def->kind == IR_INST_GETELEMENTPTR
+                    && rv_emit_const_gep_address(frame, def, scratch, &addr)) {
+                return addr;
+            }
             rv_emit_gep_to_reg(frame, def, scratch);
-            return scratch;
+            return rv_make_address(scratch, 0);
         }
     }
     RVRegTemp *temp = rv_find_reg_temp(frame, ptr);
     if (temp != NULL) {
-        return temp->reg;
+        return rv_make_address(temp->reg, 0);
     }
     rv_load_int_value(frame, ptr, scratch);
-    return scratch;
+    return rv_make_address(scratch, 0);
 }
 
 static void rv_emit_load_inst(RVFrame *frame, IRInstruction *inst) {
     FILE *out = frame->out;
-    const char *addr = rv_emit_address_value_reg(frame, inst, inst->data.load_inst.ptr, "t0");
+    RVAddress addr = rv_emit_address_value(frame, inst, inst->data.load_inst.ptr, "t0");
     if (rv_value_is_float(&inst->result)) {
         const char *dst = rv_value_reg_home(frame, &inst->result);
         if (dst == NULL) {
             dst = "ft0";
         }
-        rv_emit_mem(out, "flw", dst, 0, addr);
+        rv_emit_mem(out, "flw", dst, addr.offset, addr.base);
         rv_store_float_slot(frame, &inst->result, dst);
     } else {
         const char *dst = rv_value_reg_home(frame, &inst->result);
         if (dst == NULL) {
             dst = "t1";
         }
-        rv_emit_mem(out, rv_value_is_pointer(&inst->result) ? "ld" : "lw", dst, 0, addr);
+        rv_emit_mem(out, rv_value_is_pointer(&inst->result) ? "ld" : "lw", dst, addr.offset, addr.base);
         rv_store_int_slot(frame, &inst->result, dst);
     }
 }
@@ -11148,16 +11201,16 @@ static void rv_emit_load_inst(RVFrame *frame, IRInstruction *inst) {
 static void rv_emit_store_inst(RVFrame *frame, IRInstruction *inst) {
     FILE *out = frame->out;
     IRValue *value = inst->data.store_inst.value;
-    const char *addr = rv_emit_address_value_reg(frame, inst, inst->data.store_inst.ptr, "t0");
+    RVAddress addr = rv_emit_address_value(frame, inst, inst->data.store_inst.ptr, "t0");
     if (rv_value_is_float(value)) {
         const char *src = rv_float_value_read_reg(frame, value, "ft0");
-        rv_emit_mem(out, "fsw", src, 0, addr);
+        rv_emit_mem(out, "fsw", src, addr.offset, addr.base);
     } else if (rv_value_is_pointer(value)) {
         const char *src = rv_int_value_read_reg(frame, value, "t1");
-        rv_emit_mem(out, "sd", src, 0, addr);
+        rv_emit_mem(out, "sd", src, addr.offset, addr.base);
     } else {
         const char *src = rv_int_value_read_reg(frame, value, "t1");
-        rv_emit_mem(out, "sw", src, 0, addr);
+        rv_emit_mem(out, "sw", src, addr.offset, addr.base);
     }
 }
 
